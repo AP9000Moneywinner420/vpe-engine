@@ -992,8 +992,15 @@ def cmd_lines(a):
             k, n = int(ok[g.index].sum()), len(g)
             if k < n:
                 print(f"  ! SLATE GUARD {mk}: dropped {n - k} of {n} rows not on the {date.date()} schedule"
-                      + (" -> page shows another slate, re-fetch it with ?date=" + str(date.date()) if k == 0 else ""))
+                      + (" -> page is still on another night (props pages roll over on their own): wait ~5 min, re-fetch" if k == 0 else ""))
         df = df[ok]
+        # coverage: how many of tonight's games each market has lines for (stale page = 0)
+        cov = {mk: len({frozenset(parse_matchup(m)[:2]) for m in g["matchup"]}) for mk, g in df.groupby("market")}
+        srcs = [s.split("=", 1)[0] for s in a.src]
+        print(f"COVERAGE ({len(games)} games on {date.date()}): "
+              + " | ".join(f"{mk} {cov.get(canon_market(mk) or mk, 0)}/{len(games)}" for mk in srcs)
+              + ("  -> STALE: " + ", ".join(mk for mk in srcs if not cov.get(canon_market(mk) or mk))
+                 + " (re-fetch; if still stale, leave out and say so)" if any(not cov.get(canon_market(mk) or mk) for mk in srcs) else ""))
     df.to_csv(a.out, index=False)
     print(f"LINES: {len(df)} rows -> {a.out} | " + ", ".join(f"{k} {v}" for k, v in df["market"].value_counts().items()))
 
@@ -1006,6 +1013,14 @@ def cmd_check(a):
     props = _read_props(a.props)
     inj = parse_injuries(a.injuries)
     games = load_games_file(a.games)
+    day = sched[sched["date"] == date] if len(sched) else sched
+    if len(day):
+        tonight = {frozenset((h, w)) for h, w in zip(day["home"], day["away"])}
+        have = {frozenset((h, w)) for h, w in zip(games["home"], games["away"])} if games is not None else set()
+        n = len(tonight & have)
+        print(f"SPREADS: {n}/{len(tonight)} of tonight's games have a spread"
+              + ("" if n == len(tonight) else " -> missing games get no blowout adjustment"
+                 + (" (spreads page looks stale: re-fetch with ?date=D)" if n == 0 else "")))
     proj, overrides, outs = _prepare(state, sched, date, list(zip(props["player"], props["team"])), inj, games, cfg)
     props["pid"] = [state.find(n) for n in props["player"]]
     print(f"USAGE MODEL: {len(outs)} players Out/Doubtful with a role -> minutes and usage redistributed"
@@ -1496,7 +1511,8 @@ def write_shadow(evald, key, path):
         return
     s = shadow_rows(evald, key)
     json.dump([[_cell(v) for v in r] for r in s.itertuples(index=False, name=None)], open(path, "w"))
-    print(f"SHADOW: {len(s)} lines -> {path} (append to the Shadow tab; graded tomorrow to keep VPE calibrated)")
+    print(f"SHADOW: {len(s)} lines -> {path}\n  >>> REQUIRED NEXT STEP: append_values {path} to 'Shadow NBA'!A1 and confirm Calib V1 grew by {len(s)}."
+          " Skipping this breaks VPE's learning loop.")
 
 
 def cmd_shadow(a):

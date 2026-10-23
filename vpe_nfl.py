@@ -1633,7 +1633,8 @@ def write_shadow(evald, key, path):
         return
     s = shadow_rows(evald, key)
     json.dump([[_cell(v) for v in r] for r in s.itertuples(index=False, name=None)], open(path, "w"))
-    print(f"SHADOW: {len(s)} lines -> {path} (append to the Shadow tab; graded tomorrow to keep VPE calibrated)")
+    print(f"SHADOW: {len(s)} lines -> {path}\n  >>> REQUIRED NEXT STEP: append_values {path} to 'Shadow NFL'!A1 and confirm Calib V2 grew by {len(s)}."
+          " Skipping this breaks VPE's learning loop.")
 
 
 def cmd_shadow(a):
