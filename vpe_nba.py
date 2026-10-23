@@ -978,6 +978,22 @@ def cmd_lines(a):
                 if ul and uo:
                     out.append((r["player"], mu, mk, ul, "", uo, ub))
     df = pd.DataFrame(out, columns=["player", "matchup", "market", "line", "over_odds", "under_odds", "book"])
+    # slate guard: odds pages sometimes still show another night's games; keep only matchups on date D's schedule
+    date = pd.Timestamp(a.date) if getattr(a, "date", None) else today_et()
+    day = load_schedule(season_for(date))
+    day = day[day["date"] == date] if len(day) else day
+    if len(day) == 0:
+        print(f"  ! SLATE GUARD: no games on the schedule for {date.date()}; rows kept unchecked")
+    else:
+        games = {frozenset((h, w)) for h, w in zip(day["home"], day["away"])}
+        teams = [parse_matchup(m)[:2] for m in df["matchup"]]
+        ok = pd.Series([bool(t[0] and t[1] and frozenset(t) in games) for t in teams], index=df.index)
+        for mk, g in df.groupby("market"):
+            k, n = int(ok[g.index].sum()), len(g)
+            if k < n:
+                print(f"  ! SLATE GUARD {mk}: dropped {n - k} of {n} rows not on the {date.date()} schedule"
+                      + (" -> page shows another slate, re-fetch it with ?date=" + str(date.date()) if k == 0 else ""))
+        df = df[ok]
     df.to_csv(a.out, index=False)
     print(f"LINES: {len(df)} rows -> {a.out} | " + ", ".join(f"{k} {v}" for k, v in df["market"].value_counts().items()))
 
