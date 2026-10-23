@@ -1126,6 +1126,40 @@ def _read_loose_csv(path):
             if l.strip() and not l.strip().startswith("```") and not l.startswith("MARKET=")]
     return pd.read_csv(io.StringIO("\n".join(keep)), dtype=str).fillna("")
 
+_NFL_ALIAS = {"LAR": "LA", "WSH": "WAS", "JAC": "JAX", "LVR": "LV", "OAK": "LV", "SD": "LAC", "STL": "LA", "GNB": "GB",
+              "KAN": "KC", "NWE": "NE", "NOR": "NO", "SFO": "SF", "TAM": "TB"}
+
+def _nfl_team(x):
+    s = str(x).strip().upper()
+    return _NFL_ALIAS.get(s, s)
+
+def slate_guard(df, a):
+    """Odds pages can still show another week's games: keep only rows whose matchup (e.g. 'LA @ LV', 'DET vs GB')
+    is a game in the target week; say per market how many were dropped."""
+    cfg = _cfg(a)
+    try:
+        g = load_games()
+    except Exception as e:
+        print(f"  ! SLATE GUARD: schedule unavailable ({e}); rows kept unchecked")
+        return df
+    g = g[(g["season"] == cfg["season"]) & (g["game_type"] == "REG")]
+    week = a.week or int(g[g["home_score"].isna()]["week"].min())
+    games = {frozenset((h, w)) for h, w in zip(g[g["week"] == week]["home_team"], g[g["week"] == week]["away_team"])}
+    def pair(m):
+        parts = re.split(r"\s+(?:@|vs\.?|at)\s+", str(m).strip(), maxsplit=1, flags=re.I)
+        return frozenset(_nfl_team(p) for p in parts) if len(parts) == 2 else None
+    pairs = df["matchup"].map(pair)
+    if pairs.isna().all():
+        print("  ! SLATE GUARD: no readable matchups in the pages; rows kept unchecked")
+        return df
+    ok = pairs.map(lambda p: p in games if p is not None else False)
+    for mk, grp in df.groupby("market"):
+        k, n = int(ok[grp.index].sum()), len(grp)
+        if k < n:
+            print(f"  ! SLATE GUARD {mk}: dropped {n - k} of {n} rows not in week {week}"
+                  + (" -> page shows another week: re-fetch it, or pass --week N if the schedule file lags" if k == 0 else ""))
+    return df[ok]
+
 def cmd_lines(a):
     """Turns odds-site rows (player,matchup,over_line,over_odds,over_book,under_line,under_odds,under_book)
     into props.csv. Same line both sides -> one row; different lines -> one row per side."""
@@ -1138,13 +1172,15 @@ def cmd_lines(a):
         for _, r in d.iterrows():
             ol, oo, ob = r.get("over_line", ""), r.get("over_odds", ""), r.get("over_book", "")
             ul, uo, ub = r.get("under_line", ""), r.get("under_odds", ""), r.get("under_book", "")
+            mu = r.get("matchup", "")
             if ol and ul and oo and uo and float(ol) == float(ul):
-                out.append((r["player"], mk, ol, oo, uo, f"{ob}/{ub}"))
+                out.append((r["player"], mk, ol, oo, uo, f"{ob}/{ub}", mu))
             else:
-                if ol and oo: out.append((r["player"], mk, ol, oo, "", ob))
-                if ul and uo: out.append((r["player"], mk, ul, "", uo, ub))
-    df = pd.DataFrame(out, columns=["player", "market", "line", "over_odds", "under_odds", "book"])
-    df.to_csv(a.out, index=False)
+                if ol and oo: out.append((r["player"], mk, ol, oo, "", ob, mu))
+                if ul and uo: out.append((r["player"], mk, ul, "", uo, ub, mu))
+    df = pd.DataFrame(out, columns=["player", "market", "line", "over_odds", "under_odds", "book", "matchup"])
+    df = slate_guard(df, a)
+    df.drop(columns="matchup").to_csv(a.out, index=False)
     dk = df["book"].str.contains("draftkings", case=False).sum()
     print(f"LINES: {len(df)} rows from {len(a.src)} market pages -> {a.out} ({dk} rows priced at DraftKings, "
           f"rest best-of-market) | by market: " + ", ".join(f"{k} {v}" for k, v in df["market"].value_counts().items()))
