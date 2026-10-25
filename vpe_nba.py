@@ -973,6 +973,31 @@ def cmd_slate(a):
     if len(skip):
         print("\nnot pulled:", "; ".join(f"{r.player} ({r.note})" for r in skip.itertuples()))
 
+def merge_best(df):
+    """Several odds sources for the same prop -> one row per player/market/line with the best Over and best Under
+    price found anywhere (line shopping across every source that passed the slate guard)."""
+    if df.empty:
+        return df
+    d = df.copy()
+    d["_k"] = d["player"].map(norm_name)
+    out = []
+    for (_, mk, ln), g in d.groupby(["_k", "market", "line"], sort=False):
+        best = {}
+        for side, col in (("o", "over_odds"), ("u", "under_odds")):
+            cand = [(american_to_decimal(float(v)), v, side_book(b, "Over" if side == "o" else "Under") if "/" in str(b) else str(b))
+                    for v, b in zip(g[col], g["book"]) if str(v).strip() not in ("", "nan")]
+            best[side] = max(cand) if cand else None
+        r = g.iloc[0]
+        ob = best["o"][2] if best["o"] else ""
+        ub = best["u"][2] if best["u"] else ""
+        out.append({"player": r["player"], **({"matchup": r["matchup"]} if "matchup" in g else {}), "market": mk, "line": ln,
+                    "over_odds": best["o"][1] if best["o"] else "", "under_odds": best["u"][1] if best["u"] else "",
+                    "book": f"{ob}/{ub}" if ob and ub else (ob or ub)})
+    m = pd.DataFrame(out, columns=list(df.columns))
+    if len(m) < len(df):
+        print(f"MERGE: {len(df)} rows from all sources -> {len(m)} props, best Over and best Under price kept for each")
+    return m
+
 def cmd_lines(a):
     out = []
     for spec in a.src:
@@ -1011,11 +1036,12 @@ def cmd_lines(a):
         df = df[ok]
         # coverage: how many of tonight's games each market has lines for (stale page = 0)
         cov = {mk: len({frozenset(parse_matchup(m)[:2]) for m in g["matchup"]}) for mk, g in df.groupby("market")}
-        srcs = [s.split("=", 1)[0] for s in a.src]
+        srcs = list(dict.fromkeys(s.split("=", 1)[0] for s in a.src))
         print(f"COVERAGE ({len(games)} games on {date.date()}): "
               + " | ".join(f"{mk} {cov.get(canon_market(mk) or mk, 0)}/{len(games)}" for mk in srcs)
               + ("  -> STALE: " + ", ".join(mk for mk in srcs if not cov.get(canon_market(mk) or mk))
                  + " (re-fetch; if still stale, leave out and say so)" if any(not cov.get(canon_market(mk) or mk) for mk in srcs) else ""))
+    df = merge_best(df)
     df.to_csv(a.out, index=False)
     print(f"LINES: {len(df)} rows -> {a.out} | " + ", ".join(f"{k} {v}" for k, v in df["market"].value_counts().items()))
 

@@ -1133,6 +1133,31 @@ def _nfl_team(x):
     s = str(x).strip().upper()
     return _NFL_ALIAS.get(s, s)
 
+def merge_best(df):
+    """Several odds sources for the same prop -> one row per player/market/line with the best Over and best Under
+    price found anywhere (line shopping across every source that passed the slate guard)."""
+    if df.empty:
+        return df
+    d = df.copy()
+    d["_k"] = d["player"].map(norm_name)
+    out = []
+    for (_, mk, ln), g in d.groupby(["_k", "market", "line"], sort=False):
+        best = {}
+        for side, col in (("o", "over_odds"), ("u", "under_odds")):
+            cand = [(american_to_decimal(float(v)), v, side_book(b, "Over" if side == "o" else "Under") if "/" in str(b) else str(b))
+                    for v, b in zip(g[col], g["book"]) if str(v).strip() not in ("", "nan")]
+            best[side] = max(cand) if cand else None
+        r = g.iloc[0]
+        ob = best["o"][2] if best["o"] else ""
+        ub = best["u"][2] if best["u"] else ""
+        out.append({"player": r["player"], **({"matchup": r["matchup"]} if "matchup" in g else {}), "market": mk, "line": ln,
+                    "over_odds": best["o"][1] if best["o"] else "", "under_odds": best["u"][1] if best["u"] else "",
+                    "book": f"{ob}/{ub}" if ob and ub else (ob or ub)})
+    m = pd.DataFrame(out, columns=list(df.columns))
+    if len(m) < len(df):
+        print(f"MERGE: {len(df)} rows from all sources -> {len(m)} props, best Over and best Under price kept for each")
+    return m
+
 def slate_guard(df, a):
     """Odds pages can still show another week's games: keep only rows whose matchup (e.g. 'LA @ LV', 'DET vs GB')
     is a game in the target week; say per market how many were dropped."""
@@ -1180,6 +1205,7 @@ def cmd_lines(a):
                 if ul and uo: out.append((r["player"], mk, ul, "", uo, ub, mu))
     df = pd.DataFrame(out, columns=["player", "market", "line", "over_odds", "under_odds", "book", "matchup"])
     df = slate_guard(df, a)
+    df = merge_best(df)
     df.drop(columns="matchup").to_csv(a.out, index=False)
     dk = df["book"].str.contains("draftkings", case=False).sum()
     print(f"LINES: {len(df)} rows from {len(a.src)} market pages -> {a.out} ({dk} rows priced at DraftKings, "
