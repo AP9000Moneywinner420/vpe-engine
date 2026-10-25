@@ -405,7 +405,7 @@ def without_split(state, pid, team, out_pid):
         out["r_" + s] = (r["_w"] * r[s]).sum() / wmin
     return out
 
-def team_adjust(state, sl, outs, rosters, cfg, use_split=True):
+def team_adjust(state, sl, outs, rosters, cfg, use_split=True, sure=None):
     """USAGE MODEL. Team totals have to add up: ~240.7 minutes and a team-sized stat line per game.
     1) An out player's minutes go first to teammates at his position (weighted by their role), scaled by how often he
        has actually been playing lately (a long-term absence is already in everyone's averages -> no double count).
@@ -430,7 +430,8 @@ def team_adjust(state, sl, outs, rosters, cfg, use_split=True):
         partial = state.n_team.get(team, 0) < 3
         av = pd.Series({p: state.avail.get((team, p), np.nan) for p in R.index})
         # who will play: today's slate players yes; other healthy roster players at their recent play rate
-        R["p"] = np.where(R.index.isin(sl.index), 1.0, av.fillna(m["unknown_play_rate"]).clip(0, 1))
+        surely = sl.index if sure is None else pd.Index(list(sure))
+        R["p"] = np.where(R.index.isin(surely), 1.0, av.fillna(m["unknown_play_rate"]).clip(0, 1))
         ot = outs[(outs["team"] == team) & (outs["min"] >= m["usage_min_out_minutes"])] if len(out_ids) else []
         dmin = pd.Series(0.0, index=R.index)
         names = []
@@ -448,7 +449,15 @@ def team_adjust(state, sl, outs, rosters, cfg, use_split=True):
         scale = (m["team_minutes"] / (tot_min + bench)) ** m["min_norm_alpha"] if tot_min > 0 else 1.0
         if partial:
             scale = min(scale, m["partial_scale_cap"])
-        m2 = np.minimum(m1 * scale, m["max_minutes"])
+        if m.get("norm_mode", "scale") == "bench" and scale < 1 and tot_min > 0:
+            # too many minutes on the roster: take the excess mostly from bench minutes, not from the starters
+            # (early season the prior over-credits bench roles; proportional scaling cut starters ~2-4 min)
+            cut = tot_min * (1 - scale)
+            w = (m1 * np.clip(m.get("bench_pivot", 40) - m1, 1, None)).clip(lower=0)
+            denom = float((R["p"] * w).sum())
+            m2 = np.minimum((m1 - (cut * w / denom if denom > 0 else 0)).clip(lower=0), m["max_minutes"])
+        else:
+            m2 = np.minimum(m1 * scale, m["max_minutes"])
         mult = {}
         for s in USE_STATS:
             beta = m["usage_beta"].get(s, m["usage_beta"]["default"]) * (m["partial_beta_mult"] if partial else 1.0)
@@ -486,7 +495,7 @@ def blowout_factor(spread, starter, cfg):
         return float(np.sum(w * f[idx]) / np.sum(w))
     return expect(-float(spread)) / expect(0.0)
 
-def project(state, sl, outs, rosters, cfg, flags=None):
+def project(state, sl, outs, rosters, cfg, flags=None, sure=None):
     """sl: DataFrame indexed by pid with team, opp, home, b2b, spread. Returns means and variances per market."""
     m = cfg["model"]
     flags = flags or {}
@@ -507,7 +516,7 @@ def project(state, sl, outs, rosters, cfg, flags=None):
     sl["nt_min"] = [mins_tab[t][i] if n else 1.0 for t, i, n in zip(tier, idx, sl["new_team"])]
     sl["nt_rate"] = [rate_tab[t][i] if n else 1.0 for t, i, n in zip(tier, idx, sl["new_team"])]
     sl = team_adjust(state, sl, outs if flags.get("usage", True) else None, rosters, cfg,
-                     use_split=flags.get("split", True)) if flags.get("team", True) else \
+                     use_split=flags.get("split", True), sure=sure) if flags.get("team", True) else \
         sl.assign(dmin=0.0, usage_note="", **{"u_" + s: 1.0 for s in USE_STATS})
     sit = m["situational"]
     stren = sit["strength"]
@@ -797,11 +806,11 @@ CONFIG = {
                         "balanced": {"max_units_per_day": 8, "allow_tier3": True},
                         "aggressive": {"max_units_per_day": 12, "allow_tier3": True}},
   "model": {"decay_min": 0.85, "decay_rate": 0.97, "prev_decay": 0.97,
-            "prior_min_games": 3, "prior_rate_minutes": 400, "pos_shrink_minutes": 25,
+            "prior_min_games": 1, "prior_rate_minutes": 400, "pos_shrink_minutes": 25,
             "dvp_shrink_games": 15, "dvp_prior_games": 10, "prior_trust": 0.5, "dvp_cap": [0.9, 1.1],
             "pace_prior_games": 10, "pace_elasticity": 1.0,
-            "usage_min_out_minutes": 12, "usage_rep_factor": 0.85, "team_minutes": 240.7, "min_norm_alpha": 0.75,
-            "bench_allowance_max": 35, "unknown_play_rate": 0.6, "team_total_prior_games": 8, "partial_beta_mult": 0.5, "partial_scale_cap": 1.0, "usage_mult_cap": 1.3,
+            "usage_min_out_minutes": 12, "usage_rep_factor": 0.85, "team_minutes": 240.7, "min_norm_alpha": 0.5,
+            "bench_allowance_max": 35, "norm_mode": "bench", "bench_pivot": 40, "unknown_play_rate": 0.6, "team_total_prior_games": 8, "partial_beta_mult": 0.5, "partial_scale_cap": 1.0, "usage_mult_cap": 1.3,
             "usage_beta": {"default": 0.5}, "wo_min_games": 3, "max_minutes": 40,
             # measured on 2024-25 + 2025-26 regular seasons (~40k player-games): players who suit up on the 2nd night of
             # a back-to-back show no minutes/per-minute drop (the B2B effect is rest DNPs -> injury report), so 1.0;
@@ -880,7 +889,7 @@ def _read_props(paths):
         d["team"] = None
     return d.reset_index(drop=True)
 
-def _prepare(state, sched, date, props_players, injuries, games, cfg):
+def _prepare(state, sched, date, props_players, injuries, games, cfg, sure_names=None):
     """Map names -> ids, current teams, today's games, outs. Returns (proj, overrides, outs)."""
     overrides = {}
     pids = []
@@ -897,7 +906,8 @@ def _prepare(state, sched, date, props_players, injuries, games, cfg):
     sl = build_slate(state, sched, date, sorted(set(pids)), overrides, games)
     outs = build_outs(state, injuries, overrides)
     rosters = team_rosters(state, overrides, date)
-    proj = project(state, sl, outs, rosters, cfg) if len(sl) else pd.DataFrame()
+    sure = None if sure_names is None else {p for p in (state.find(n) for n in sure_names) if p is not None}
+    proj = project(state, sl, outs, rosters, cfg, sure=sure) if len(sl) else pd.DataFrame()
     return proj, overrides, outs
 
 # ==================== commands ====================
@@ -916,8 +926,13 @@ def cmd_board(a):
     if a.props:
         pr = _read_props([a.props])
         props_players = list(zip(pr["player"], pr["team"]))
-    pids = [(n, None) for n in P[(P["team"].isin(teams)) & (P["min"] >= 10)]["name"]]
-    proj, _, outs = _prepare(state, sched, date, props_players + pids, inj, games, cfg)
+    played_now = P["n_cur"] > 0
+    has_games = P["team"].map(lambda x: state.n_team.get(x, 0) > 0)
+    pids = [(n, None) for n in P[(P["team"].isin(teams)) & (P["min"] >= 10) & (played_now | ~has_games)]["name"]]
+    # board: only players with lines are "sure to play"; everyone else plays at his recent availability rate
+    # (before v2.1.4 every roster player counted as playing, which cut each player's minutes ~10-50%)
+    proj, _, outs = _prepare(state, sched, date, props_players + pids, inj, games, cfg,
+                             sure_names=[n for n, _ in props_players])
     if proj.empty:
         print("No players with a game on this date.")
         return
