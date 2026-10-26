@@ -7,7 +7,8 @@ Data: free ESPN box scores + schedules that sportsdataverse publishes on GitHub 
   python vpe_nba.py check  --props lines/dk.csv [--games games.csv] [--injuries "..."] [--bankroll 50] [--out bets.csv]
   python vpe_nba.py log    --placed placed.csv --log nba_pick_log.csv
   python vpe_nba.py grade  --log nba_pick_log.csv --date 2026-10-20 [--actuals actuals.csv]
-  python vpe_nba.py backtest --start 2026-01-05 --end 2026-04-12 [--step 2]
+  python vpe_nba.py backtest --start 2026-01-05 --end 2026-04-12 [--step 2] [--odds game_odds.csv]
+  python vpe_nba.py styles [--team DEN,GS] [--stat pts]          # team categories, player archetypes, matchup table
 """
 from scipy import stats as st
 import io
@@ -23,7 +24,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.1.6"
+VERSION = "NBA v2.2.0"
 
 # ==================== data ====================
 
@@ -756,6 +757,16 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None):
     sit = m["situational"]
     stren = sit["strength"]
     mins = sl["min"] + sl["dmin"]
+    # recent role: last 3 games' minutes pull the projection 40% of the way (backtest 2025-26: minutes MAE 5.00 -> 4.69)
+    if flags.get("role", True):
+        ml3 = state.extra["min_l3"].reindex(sl.index) if "min_l3" in state.extra else pd.Series(np.nan, index=sl.index)
+        mins = mins + m["role_weight"] * (ml3.fillna(sl["min"]) - sl["min"])
+    # real games without tonight's biggest absence: blend his actual minutes in those games (weight n / (n + 32))
+    if flags.get("wo", True) and "ws_n" in sl:
+        n_ = sl["ws_n"].fillna(0).to_numpy()
+        ok_ = n_ >= m["wo_min_games"]
+        k_ = m["wo_min_k"]
+        mins = pd.Series(np.where(ok_, (n_ * sl["ws_min"].fillna(0).to_numpy() + k_ * mins.to_numpy()) / (n_ + k_), mins.to_numpy()), index=sl.index)
     b2b = sl["b2b"].fillna(False).astype(bool)
     if flags.get("b2b", True):
         mins = mins * np.where(b2b, 1 + (sit["b2b_min"] - 1) * stren, 1.0)
@@ -771,10 +782,16 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None):
         miss_ = np.array([int(((td_["team"] == t) & (td_["date"] > d)).sum()) if pd.notna(d) else 0 for t, d in zip(sl["team"], last_)])
     else:
         miss_ = np.zeros(len(sl), dtype=int)
-    back = (miss_ >= ret["min_missed"]) & flags.get("return", True)
+    use_ret = flags.get("return", True)
+    rmult = np.ones(len(sl))
+    if use_ret:
+        for lo_, f_ in zip(ret["missed"], ret["mult"]):
+            rmult = np.where(miss_ >= lo_, f_, rmult)
+    back = use_ret & (miss_ >= ret["hold_missed"])
     sl["limited"] = lim
     sl["returning"] = back
-    mins = mins * np.where(lim, m["restricted_min_mult"], np.where(back, ret["min_mult"], 1.0))
+    sl["missed"] = miss_
+    mins = mins * np.where(lim, np.minimum(m["restricted_min_mult"], rmult), rmult)
     sl["proj_min"] = np.minimum(mins * sl["nt_min"], m["max_minutes"])
     pace = (state.pace.reindex(sl["opp"]).to_numpy() / state.lg_pace) if flags.get("pace", True) else 1.0
     pace_f = np.power(pace, m["pace_elasticity"])
@@ -797,18 +814,11 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None):
     env = np.clip(np.where(np.isfinite(implied) & (base_pts > 0), implied / base_pts, 1.0), 1 - tcfg["cap"], 1 + tcfg["cap"])
     sl["env"] = env
     sl["implied_pts"] = implied
-    # return from an absence (minutes restriction risk) and recent role
-    last = pd.to_datetime(P["last_date"].reindex(sl.index))
-    sl["days_off"] = (state.date - last).dt.days.to_numpy()
-    if state.tg is not None and len(state.tg):
-        td = state.tg[["team", "date"]].drop_duplicates()
-        sl["missed"] = [int(((td["team"] == t) & (td["date"] > d)).sum()) if pd.notna(d) else 0 for t, d in zip(sl["team"], last)]
-    else:
-        sl["missed"] = 0
+    sl["days_off"] = (state.date - pd.to_datetime(P["last_date"].reindex(sl.index))).dt.days.to_numpy()
     sl = sl.join(state.extra, how="left")
     sl["r_pf"] = P["r_pf"].reindex(sl.index).to_numpy() if "r_pf" in P else np.nan
     for s in ["pts", "reb", "ast", "fg3m", "stl", "blk", "tov"]:
-        if flags.get("arch", True) and s in state.mf:
+        if flags.get("arch", True) and s in state.mf and s in m["styles"]["apply"]:
             key = pd.MultiIndex.from_arrays([sl["arch"], sl["opp_style"], homeb])
             af = state.mf[s].reindex(key).fillna(1.0).to_numpy()
             af = 1 + (af - 1) * sstr
@@ -1164,10 +1174,17 @@ CONFIG = {
                              "rotation": {"min": [0.88] * 5 + [0.94] * 5, "rate": [0.93] * 5 + [0.97] * 5},
                              "bench": {"min": [0.80, 0.88, 0.88, 0.88, 0.88, 0.94, 0.94, 0.94, 0.94, 0.94],
                                        "rate": [0.90, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]}}},
-            "total": {"cap": 0.15, "elasticity": {}},
-            "restricted_min_mult": 0.8, "return": {"min_missed": 99, "min_mult": 1.0},
+            # game total (DK, via ESPN): player stat x (market implied team points / base expectation) ^ elasticity,
+            # fitted on 8k player-games per market 2025-26 (stable in both halves), shrunk a little
+            "total": {"cap": 0.15, "elasticity": {"pts": 0.85, "reb": 1.25, "ast": 0.5, "fg3m": 1.25, "stl": 1.0, "blk": 1.5, "tov": 0.0}},
+            # back from an absence: actual vs projected minutes by team games missed (2025-26, relative to everyone else)
+            "restricted_min_mult": 0.8, "return": {"missed": [1, 2, 3, 5, 8, 13], "mult": [0.97, 0.92, 0.9, 0.89, 0.82, 0.75], "hold_missed": 3},
+            "role_weight": 0.4, "wo_min_k": 32,
             "styles": {"k_players": 8, "k_def": 4, "k_off": 4, "min_minutes": 150, "team_prior_games": 12,
-                       "prev_weight": 1.0, "shrink_games": 250, "home_shrink_games": 400, "cap": 0.06, "strength": 1.0},
+                       "prev_weight": 1.0, "shrink_games": 250, "home_shrink_games": 400, "cap": 0.06, "strength": 1.0,
+                       # backtest 2025-26 (9k player-games/market): helps points (log-loss t=-2.3) and assists (MAE
+                       # t=-3.4); hurt rebounds/steals/blocks -> those show the style only, number unchanged
+                       "apply": ["pts", "ast"]},
             "new_team_sd_mult": 1.05, "early_sd_mult": 1.0,
             "prob_calibration_shrink": 0.8, "max_market_gap": 0.15, "min_minutes_to_bet": 20},
   "tiers": {"tier_1": {"min_edge": 0.04, "min_prob": 0.55, "max_units": 3.0},
@@ -1222,8 +1239,11 @@ def _read_props(paths):
     d["under_odds"] = d["under_odds"].map(parse_odds)
     d = d[d["line"].notna() & (d["over_odds"].notna() | d["under_odds"].notna())]
     if "matchup" in d:
+        # the matchup names BOTH teams; which one is his is decided later from his box scores (_prepare).
+        # (before v2.2 every player got the AWAY team here -> home players were scored as road players on a
+        # "new team" against their own team: ~20% too low, fake Unders)
         mm = d["matchup"].map(parse_matchup)
-        d["team"] = [x[0] for x in mm]
+        d["team"] = [(x[0], x[1]) if x[0] and x[1] else None for x in mm]
     else:
         d["team"] = None
     return d.reset_index(drop=True)
@@ -1232,9 +1252,24 @@ def _prepare(state, sched, date, props_players, injuries, games, cfg, sure_names
     """Map names -> ids, current teams, today's games, outs. Returns (proj, overrides, outs)."""
     overrides = {}
     pids = []
+    inj_team = {}
+    for _, r in (injuries if injuries is not None else pd.DataFrame()).iterrows():
+        if r.get("team"):
+            inj_team[norm_name(r["player"])] = r["team"]
+    mism = []
     for name, team in props_players:
         pid = state.find(name)
-        if pid is not None:
+        if pid is None:
+            continue
+        if isinstance(team, tuple):
+            cur = state.players.at[pid, "team"]
+            if norm_name(name) in inj_team or cur in team:
+                pids.append(pid)
+            elif name not in mism:
+                mism.append(name)
+                print(f"  ! TEAM CHECK: {name} is listed in {team[0]} @ {team[1]} but his last games were for {cur} "
+                      f"-> skipped (traded? add '{name}:Active:TEAM' to the injuries string to set his team)")
+        else:
             pids.append(pid)
             if team:
                 overrides[pid] = team
