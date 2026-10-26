@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.6"
+VERSION = "NFL v15.7"
 
 # ==================== data ====================
 
@@ -1722,6 +1722,7 @@ def set_calib(path, sport):
     b = ", ".join(f"{k} Over {v:+.1%}" for k, v in sorted(bias.items()) if abs(v) >= 0.005) or "none yet"
     src = f"{n} graded lines" if n else "no graded lines yet (prior)"
     print(f"CALIB: {src} -> win chance = {w:.0%} model + {1 - w:.0%} market | Over-rate corrections: {b}")
+    set_learned(os.path.join(os.path.dirname(path) or ".", "learned_tab.json") if path else None, sport)
     return w, bias
 
 
@@ -1735,9 +1736,155 @@ def blend_leg(model_p, market_p, market=None, side=None):
             p = p + pd.Series(market).map(b).fillna(0.0).to_numpy() * np.where(np.asarray(side) == "Over", 1.0, -1.0)
         else:
             p = p + b.get(market, 0.0) * (1.0 if side == "Over" else -1.0)
+    if LEARNED["tail"] or LEARNED["gate"]:
+        p = _learn_adjust(p, market_p, market, side)
     if isinstance(p, (pd.Series, np.ndarray)):
         return np.clip(p, 0.01, 0.99)
     return float(min(max(p, 0.01), 0.99))
+
+
+# ---------- self-learning (v2.4 / v15.7): bounded corrections learned from the graded Shadow tab ----------
+# Runs every morning after grading (`learn`). Writes the 'Learned NBA' / 'Learned NFL' tab; check/parlay/final/takeif read it via the
+# learned_tab.json saved next to calib_tab.json. Missing file = no change. Two things are learned, both capped:
+#  1. tail fix: when VPE says 60%+ for a side, does that side hit that often? correct each band, max +-4 pts, shrunk.
+#  2. market gate: per market x side, the lines VPE would bet; if they hit 5+ pts under what VPE said (z <= -2,
+#     150+ lines) VPE trusts the model half as much there; 10+ pts under (z <= -3) it defers fully to the market (no bet).
+#     A gate lifts itself when the recent window recovers. The core projection math is never touched.
+LEARN = {"start": {"NBA": "2026-10-26", "NFL": "2026-W1"}, "window": 8000, "n0_tail": 600, "tail_cap": 0.04,
+         "tail_bins": [0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0], "bet_edge": 0.025, "gate_n": 150}
+LEARNED = {"tail": None, "gate": {}}
+LEARNED_COLS = ["sport", "kind", "key", "value", "n", "note", "updated"]
+
+
+def _key_ord(k):
+    k = str(k).lstrip("'")
+    m = re.match(r"(\d{4})-W(\d+)$", k)
+    return (int(m.group(1)), int(m.group(2))) if m else (int(k[:4]) if k[:4].isdigit() else 0, k)
+
+
+def _learned_rows(path):
+    import json
+    if not path or not os.path.exists(path):
+        return []
+    v = json.load(open(path))
+    v = v.get("values", v) if isinstance(v, dict) else v
+    if not v or str(v[0][0]) != "sport":
+        return []
+    return [dict(zip(v[0], list(r) + [""] * (len(v[0]) - len(r)))) for r in v[1:]]
+
+
+def set_learned(path, sport):
+    LEARNED["tail"], LEARNED["gate"] = None, {}
+    xs, ds, gates = [], [], {}
+    for r in _learned_rows(path):
+        if str(r.get("sport", "")).upper() != sport:
+            continue
+        if r["kind"] == "tail":
+            xs.append(float(r["key"])); ds.append(float(r["value"]))
+        elif r["kind"] == "gate" and str(r["value"]) in ("1", "2"):
+            gates[str(r["key"])] = int(r["value"])
+    if xs:
+        o = np.argsort(xs)
+        LEARNED["tail"] = ([0.5, LEARN["tail_bins"][0]] + [xs[i] for i in o], [0.0, 0.0] + [float(np.clip(ds[i], -LEARN["tail_cap"], LEARN["tail_cap"])) for i in o])
+    LEARNED["gate"] = gates
+    if path:
+        t = "none" if not xs else ", ".join(f"{x:.0%}->{d:+.1%}" for x, d in zip(LEARNED["tail"][0][2:], LEARNED["tail"][1][2:]) if abs(d) >= 0.005) or "none needed"
+        g = ", ".join(f"{k} {'HALF' if v == 1 else 'PAUSED'}" for k, v in sorted(gates.items())) or "none"
+        print(f"LEARNED: tail fixes {t} | market gates {g}")
+
+
+def _learn_adjust(p, market_p, market=None, side=None):
+    """Apply the learned gate and tail fix to blended win chances (array or scalar)."""
+    scalar = np.ndim(p) == 0
+    p = np.atleast_1d(np.asarray(p, dtype=float)).copy()
+    mp = np.broadcast_to(np.atleast_1d(np.asarray(market_p, dtype=float)), p.shape)
+    if LEARNED["gate"] and market is not None:
+        mk = np.broadcast_to(np.atleast_1d(np.asarray(market, dtype=object)), p.shape)
+        sd = np.broadcast_to(np.atleast_1d(np.asarray(side, dtype=object)), p.shape)
+        lvl = np.array([LEARNED["gate"].get(f"{m}|{s}", 0) for m, s in zip(mk, sd)])
+        p = np.where(lvl == 1, mp + 0.5 * (p - mp), np.where(lvl == 2, mp, p))
+    if LEARNED["tail"]:
+        c = np.maximum(p, 1 - p)
+        d = np.interp(c, *LEARNED["tail"])
+        p = np.where(p >= 0.5, p + d, p - d)
+    return float(p[0]) if scalar else p
+
+
+def cmd_learn(a):
+    """Shadow window + Calib tab -> Learned tab (tail fixes + market gates). Prints what changed and why."""
+    import json, datetime
+    set_calib(a.calib, SPORT)
+    LEARNED["tail"], LEARNED["gate"] = None, {}   # learn from the base blend, never from its own fixes
+    vals = _values(a.json)
+    rows = [list(r) + [""] * (len(SHADOW_COLS) - len(r)) for r in vals if r and str(r[0]) != "key"]
+    start = _key_ord(LEARN["start"][SPORT])
+    seen, data = set(), []
+    for r in rows:
+        k = str(r[0]).lstrip("'")
+        if str(r[9]).strip() not in ("0", "1") or _key_ord(k) < start or not str(r[6]).strip() or not str(r[7]).strip():
+            continue
+        u = (k, r[1], r[2], str(r[3]))
+        if u in seen:
+            continue
+        seen.add(u)
+        data.append({"market": r[2], "pm": float(r[6]), "pk": float(r[7]), "over": int(float(r[9])),
+                     "oo": str(r[4]).strip(), "uo": str(r[5]).strip()})
+    d = pd.DataFrame(data).tail(LEARN["window"])
+    prev = {(r["kind"], str(r["key"])): r for r in _learned_rows(a.learned) if str(r.get("sport", "")).upper() == SPORT}
+    today = datetime.date.today().isoformat()
+    out = [LEARNED_COLS]
+    print(f"LEARN {SPORT}: {len(d)} graded lines since {LEARN['start'][SPORT]} (window {LEARN['window']})")
+    if d.empty:
+        json.dump(out, open(a.out, "w"))
+        print(f"  nothing to learn yet -> {a.out} (header only; write to 'Learned {SPORT}'!A1 after clearing A:G)")
+        return
+    q = np.asarray(blend_leg(d["pm"].to_numpy(), d["pk"].to_numpy(), d["market"], np.full(len(d), "Over")), dtype=float)
+    fav_over = q >= 0.5
+    c = np.where(fav_over, q, 1 - q)
+    hit = np.where(fav_over, d["over"], 1 - d["over"])
+    bins = LEARN["tail_bins"]
+    print("  tail check (VPE said -> happened, n, fix):")
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        m = (c >= lo) & (c < hi)
+        n = int(m.sum())
+        if n == 0:
+            continue
+        said, got = float(c[m].mean()), float(hit[m].mean())
+        fix = float(np.clip((got - said) * n / (n + LEARN["n0_tail"]), -LEARN["tail_cap"], LEARN["tail_cap"]))
+        out.append([SPORT, "tail", round(said, 3), round(fix, 4), n, f"said {said:.1%} hit {got:.1%}", today])
+        print(f"    {lo:.0%}-{hi:.0%}: {said:.1%} -> {got:.1%}  n={n:<5} fix {fix:+.1%}")
+    print("  market gates (lines VPE would bet):")
+    for side in ("Over", "Under"):
+        odds = d["oo"] if side == "Over" else d["uo"]
+        ok = odds.str.match(r"^[+-]?\d+(\.0)?$")
+        if not ok.any():
+            continue
+        p_side = np.where(side == "Over", q, 1 - q)
+        be = np.full(len(d), np.nan)
+        be[ok.to_numpy()] = [implied_prob(float(o)) for o in odds[ok]]
+        y = d["over"].to_numpy() if side == "Over" else 1 - d["over"].to_numpy()
+        bet = ok.to_numpy() & (p_side - be >= LEARN["bet_edge"])
+        for mk in sorted(d["market"].unique()):
+            m = bet & (d["market"].to_numpy() == mk)
+            n = int(m.sum())
+            key = f"{mk}|{side}"
+            if n < 20:
+                continue
+            pred, got = float(p_side[m].mean()), float(y[m].mean())
+            z = (got - pred) / max(np.sqrt(pred * (1 - pred) / n), 1e-9)
+            lvl = 0
+            if n >= LEARN["gate_n"] and got - pred <= -0.10 and z <= -3:
+                lvl = 2
+            elif n >= LEARN["gate_n"] and got - pred <= -0.05 and z <= -2:
+                lvl = 1
+            was = int(float(prev.get(("gate", key), {}).get("value", 0) or 0))
+            tag = {0: "ok", 1: "HALF trust", 2: "PAUSED"}[lvl] + ("" if lvl == was else f" (was {({0: 'ok', 1: 'HALF', 2: 'PAUSED'})[was]})")
+            out.append([SPORT, "gate", key, lvl, n, f"said {pred:.1%} hit {got:.1%} z {z:+.1f}", today])
+            if lvl or was or n >= LEARN["gate_n"]:
+                print(f"    {key:<22} said {pred:.1%} hit {got:.1%}  n={n:<4} z={z:+.1f} -> {tag}")
+    json.dump(out, open(a.out, "w"))
+    print(f"Learned table -> {a.out}: clear 'Learned {SPORT}'!A:G, then write it at 'Learned {SPORT}'!A1. Save it as learned_tab.json"
+          f" next to calib_tab.json before check/parlay/final/takeif.")
 
 
 def shadow_rows(allp, key):
@@ -2311,6 +2458,9 @@ if __name__ == "__main__":
     ss.add_argument("--profile"); ss.add_argument("--props", default="props.csv"); ss.add_argument("--injuries-file", default="inj.txt")
     ss.add_argument("--calib", default="calib_tab.json"); ss.add_argument("--shadow", default="shadow_new.json")
     ss.add_argument("--v2-before", type=int); ss.add_argument("--v2-after", type=int)
+    ln = sub.add_parser("learn"); ln.add_argument("--json", required=True, help="Shadow window (get_values JSON)")
+    ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
+    ln.add_argument("--out", default="learned_new.json")
     sw = sub.add_parser("shadow")
     sw.add_argument("--json", required=True, help="get_values JSON of the Shadow tab window")
     sw.add_argument("--first-row", type=int, required=True, help="sheet row of the first row in --json")
@@ -2332,6 +2482,6 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status,
+     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "status": cmd_status,
      "takeif": cmd_takeif, "frames": cmd_frames}[a.cmd](a)
 
