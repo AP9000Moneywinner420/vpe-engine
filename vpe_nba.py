@@ -673,12 +673,46 @@ def _take_if(mu, var, mk, line, side, prob, shrink, cfg):
             break
     return min_odds, limit
 
+def market_mean(line, p_over, mk, cfg, sdm=1.0):
+    """Mean the market implies: the mu at which this stat's distribution (VPE's fitted variance shape) gives
+    P(over line) = the main line's no-vig Over chance."""
+    a, b = cfg["model"]["var"][mk]
+    f = lambda m: prob_over(m, (a * m + b * m * m) * sdm ** 2, mk, line)
+    lo, hi = 0.02, max(3.0 * line + 10.0, 5.0)
+    if not (f(lo) <= p_over <= f(hi)):
+        return None
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if f(mid) < p_over else (lo, mid)
+    return (lo + hi) / 2
+
+
+def anchored_market_over(mk, line, main, cfg, sdm=1.0):
+    """No-vig market chance of Over `line` for a one-sided price (alt line / milestone), read off the player's
+    main two-sided line instead of guessing the vig. main: list of (line, no-vig over prob). None if no anchor."""
+    if not main:
+        return None
+    ml, mp = min(main, key=lambda x: abs(x[0] - line))
+    if ml == line:
+        return mp
+    m = market_mean(ml, mp, mk, cfg, sdm)
+    if m is None:
+        return None
+    a, b = cfg["model"]["var"][mk]
+    return prob_over(m, (a * m + b * m * m) * sdm ** 2, mk, line)
+
+
 def evaluate(props, proj, injuries, cfg):
     unit_pct, kf = cfg["unit_pct_of_bankroll"], cfg["staking"]["kelly_fraction"]
     profile = cfg["strategy_profiles"][cfg["strategy_profile"]]
     shrink = cfg["model"]["prob_calibration_shrink"]
     status = {norm_name(r["player"]): r["status"] for _, r in injuries.iterrows()} if injuries is not None else {}
     rows, skipped = [], []
+    mains = {}
+    for _, r in props.iterrows():
+        if r["market"] is not None and pd.notna(r["pid"]) and pd.notna(r["over_odds"]) and pd.notna(r["under_odds"]):
+            mains.setdefault((r["pid"], r["market"]), []).append((float(r["line"]), no_vig(r["over_odds"], r["under_odds"])[0]))
+    smax = cfg["staking"].get("straight_max_odds", 200)
     for _, r in props.iterrows():
         mk, pid = r["market"], r["pid"]
         if mk is None:
@@ -705,8 +739,19 @@ def evaluate(props, proj, injuries, cfg):
         if pd.notna(oo) and pd.notna(uo):
             fair_over, _ = no_vig(oo, uo)
         else:
-            fair = implied_prob(oo if pd.notna(oo) else uo) / 1.07
-            fair_over = fair if pd.notna(oo) else 1 - fair
+            # one-sided price (alt line / milestone like "6+ assists +250"): books charge far more than 7% there, so
+            # read the market's chance off this player's main two-sided line (market-implied mean) instead
+            a_, b_ = cfg["model"]["var"][mk]
+            sdm = math.sqrt(max(var, 1e-9) / max(a_ * mu + b_ * mu * mu, 1e-9))
+            fair_over = anchored_market_over(mk, line, mains.get((pid, mk)), cfg, sdm)
+            if fair_over is None:
+                one = oo if pd.notna(oo) else uo
+                if -200 <= one <= 150:  # near-even single side (split lines): ordinary vig, old estimate is fine
+                    fair = implied_prob(one) / 1.07
+                    fair_over = fair if pd.notna(oo) else 1 - fair
+                else:
+                    skipped.append((r["player"], mk, f"one-sided {int(one):+d} with no main line to price it against"))
+                    continue
         pb_over = blend_leg(pm_over, fair_over, mk, "Over")  # win chance: learned model/market mix
         for side, odds, prob, pm in (("Over", oo, pb_over, pm_over), ("Under", uo, 1 - pb_over, 1 - pm_over)):
             if pd.isna(odds):
@@ -714,6 +759,8 @@ def evaluate(props, proj, injuries, cfg):
             edge = prob - implied_prob(odds)
             tier = _tier(edge, prob, cfg)
             if tier == "tier_3" and not profile["allow_tier3"]:
+                tier = None
+            if tier and odds > smax:  # long shots: tail of the distribution is where the model is least reliable
                 tier = None
             units = 0.0
             if tier:
@@ -834,7 +881,7 @@ CONFIG = {
   "tiers": {"tier_1": {"min_edge": 0.04, "min_prob": 0.55, "max_units": 3.0},
             "tier_2": {"min_edge": 0.03, "min_prob": 0.52, "max_units": 2.0},
             "tier_3": {"min_edge": 0.025, "min_prob": 0.30, "max_units": 1.0}},
-  "staking": {"kelly_fraction": 0.25, "questionable_stake_mult": 0.5, "max_props_per_player": 1, "max_units_per_game": 4},
+  "staking": {"straight_max_odds": 200, "kelly_fraction": 0.25, "questionable_stake_mult": 0.5, "max_props_per_player": 1, "max_units_per_game": 4},
   "parlays": {"enabled": False, "max_legs": 3, "units": 0.5},
 }
 
@@ -1551,9 +1598,19 @@ def write_shadow(evald, key, path):
     if evald is None or evald.empty or not path:
         return
     s = shadow_rows(evald, key)
-    json.dump([[_cell(v) for v in r] for r in s.itertuples(index=False, name=None)], open(path, "w"))
-    print(f"SHADOW: {len(s)} lines -> {path}\n  >>> REQUIRED NEXT STEP: append_values {path} to 'Shadow NBA'!A1 and confirm Calib V1 grew by {len(s)}."
-          " Skipping this breaks VPE's learning loop.")
+    rows = [[_cell(v) for v in r] for r in s.itertuples(index=False, name=None)]
+    json.dump(rows, open(path, "w"))
+    # small chunks: one big append is easy to skip or truncate in a chat; 100 rows per call is reliable
+    stem, n = path[:-5] if path.endswith(".json") else path, 100
+    parts = [rows[i:i + n] for i in range(0, len(rows), n)]
+    names = []
+    for i, part in enumerate(parts, 1):
+        name = f"{stem}_{i}.json"
+        json.dump(part, open(name, "w"))
+        names.append(name)
+    print(f"SHADOW: {len(s)} lines -> {path} (also split into {len(parts)} files of <= {n} rows: {', '.join(names)})\n"
+          f"  >>> REQUIRED: read 'Calib'!V1 (= before), append_values each file in order to 'Shadow NBA'!A1, then re-read V1:"
+          f" it must equal before + {len(s)}. Report 'Shadow: {len(s)} lines saved' only after that check passes.")
 
 
 def cmd_shadow(a):
