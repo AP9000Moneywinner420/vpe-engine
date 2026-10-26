@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.7"
+VERSION = "NFL v15.8"
 
 # ==================== data ====================
 
@@ -1887,6 +1887,48 @@ def cmd_learn(a):
           f" next to calib_tab.json before check/parlay/final/takeif.")
 
 
+# ---------- MENU (v15.8): one view of the week's best options (no same-game sim in NFL yet) ----------
+MENU = {"props_per_game": 3}
+
+
+def cmd_menu(a):
+    import json
+    set_calib(getattr(a, "calib", None), SPORT)
+    allp = pd.read_csv(a.all)
+    pool = parlay_pool(allp)
+    print("\n" + "=" * 70 + "\nVPE MENU - best options this week (ranked inside each section)\n" + "=" * 70)
+    print("\n1) BEST STRAIGHT BETS (the staked slip; max 2 per game)")
+    if a.bets and os.path.exists(a.bets):
+        b = pd.read_csv(a.bets)
+        b = b[b["tier"].notna()] if "tier" in b else b
+        for _, r in b.sort_values("edge", ascending=False).iterrows():
+            print(f"   {r['player']} ({r['team']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}) vs {r['opp']}"
+                  f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%} | {r['units']}u")
+        if b.empty:
+            print("   none qualify this week")
+    else:
+        print("   (run check first)")
+    print("\n2) BEST CROSS-GAME PARLAY (ONE-PARLAY RULE)")
+    pp = a.parlays if a.parlays and os.path.exists(a.parlays) else None
+    rec = next((x for x in json.load(open(pp)) if x.get("recommended")), None) if pp else None
+    if rec:
+        print(f"   {rec['name']} at {BOOK_NAME[rec['book']]} {rec['odds']:+d} | hit {rec['hit']:.1%} | ${rec['stake_usd']:.2f}")
+        for l in rec["legs"]:
+            print(f"     - {l[0]} {l[2]} {l[3]} {l[1]}")
+    else:
+        print("   none this week (or run parlay first)")
+    print("\n3) BY GAME: best props (same-game parlays: NBA only for now - NFL correlations not modeled yet)")
+    if pool.empty:
+        print("   no legs qualify")
+        return
+    for gid, g in pool.groupby("game_id", sort=False):
+        r0 = g.iloc[0]
+        print(f"\n  {r0['team']} vs {r0['opp']}")
+        for _, r in g.sort_values("leg_edge", ascending=False).head(MENU["props_per_game"]).iterrows():
+            print(f"    prop: {r['player']} {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['bet_at']}) | win {r['leg_prob']:.1%}"
+                  f" | edge {r['leg_edge']:+.1%} | take if odds >= {int(r['take_min']):+d}")
+
+
 def shadow_rows(allp, key):
     """One row per line scored this run (Over view): what the model and the market said before the game."""
     out = {}
@@ -2458,6 +2500,8 @@ if __name__ == "__main__":
     ss.add_argument("--profile"); ss.add_argument("--props", default="props.csv"); ss.add_argument("--injuries-file", default="inj.txt")
     ss.add_argument("--calib", default="calib_tab.json"); ss.add_argument("--shadow", default="shadow_new.json")
     ss.add_argument("--v2-before", type=int); ss.add_argument("--v2-after", type=int)
+    mn = sub.add_parser("menu"); mn.add_argument("--all", default="bets_all.csv"); mn.add_argument("--bets", default="bets.csv")
+    mn.add_argument("--parlays", default="vpe_parlays.json"); mn.add_argument("--calib", default="calib_tab.json")
     ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
@@ -2482,6 +2526,6 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "status": cmd_status,
+     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "status": cmd_status,
      "takeif": cmd_takeif, "frames": cmd_frames}[a.cmd](a)
 

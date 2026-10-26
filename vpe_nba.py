@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.4.0"
+VERSION = "NBA v2.5.0"
 
 # ==================== data ====================
 
@@ -2945,6 +2945,115 @@ def cmd_sgp(a):
     elif lift < 0.95:
         print("  why: legs work AGAINST each other (e.g. blowout script vs starter Overs) - worse than it looks")
 
+# ---------- MENU (v2.5): one view of the night's best options ----------
+# 1) best straight bets (the staked slip)  2) best cross-game parlay (the ONE-PARLAY RULE pick)
+# 3) per game: best props + best same-game "story" parlay (legs that move together, joint chance from the 20k-game sim)
+MENU = {"props_per_game": 3, "sgp_cands": 6, "sgp_min_dec": 3.0, "sgp_max_legs": 4, "sgp_min_ev": 0.10}
+
+
+def _story(legs, home):
+    ov = [l for l in legs if l["side"] == "Over"]
+    teams = {l["team"] for l in legs}
+    if len(ov) == len(legs) and len(teams) == 2:
+        return "SHOOTOUT: both teams score, every Over hits together"
+    if len(ov) == len(legs):
+        return "TEAM ROLLS: one team's attack carries all the Overs"
+    if not ov:
+        return "GRIND / BLOWOUT: low-volume game, Unders together"
+    return "MIXED SCRIPT: one side's usage rises as the other's falls"
+
+
+def cmd_menu(a):
+    import json
+    set_calib(getattr(a, "calib", None), SPORT)
+    cfg = _cfg(a)
+    allp = pd.read_csv(a.all)
+    pool = parlay_pool(allp)
+    date, state, sched = _setup(a, cfg)
+    print("\n" + "=" * 70 + "\nVPE MENU - best options tonight (ranked inside each section)\n" + "=" * 70)
+    # 1. straights
+    print("\n1) BEST STRAIGHT BETS (the staked slip; max 2 per game)")
+    if a.bets and os.path.exists(a.bets):
+        b = pd.read_csv(a.bets)
+        b = b[b.get("tier").notna()] if "tier" in b else b
+        if len(b):
+            for _, r in b.sort_values("edge", ascending=False).iterrows():
+                print(f"   {r['player']} ({r['team']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}) vs {r['opp']}"
+                      f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%} | {r['units']}u")
+        else:
+            print("   none qualify tonight")
+    else:
+        print("   (run check first)")
+    # 2. cross-game parlay
+    print("\n2) BEST CROSS-GAME PARLAY (ONE-PARLAY RULE)")
+    pp = a.parlays if a.parlays and os.path.exists(a.parlays) else None
+    rec = next((x for x in json.load(open(pp)) if x.get("recommended")), None) if pp else None
+    if rec:
+        print(f"   {rec['name']} at {BOOK_NAME[rec['book']]} {rec['odds']:+d} | hit {rec['hit']:.1%} | ${rec['stake_usd']:.2f}")
+        for l in rec["legs"]:
+            print(f"     - {l[0]} {l[2]} {l[3]} {l[1]}")
+    else:
+        print("   none tonight (or run parlay first)")
+    # 3. per game
+    print("\n3) BY GAME: best props + best same-game story parlay (SGP, rate-only until 30 are graded)")
+    if pool.empty:
+        print("   no legs qualify tonight")
+        return
+    inj = parse_injuries(a.injuries)
+    games = guard_games(load_games_file(a.games), sched, date) if a.games else None
+    sim_ok = pool[pool["market"].isin([m for m in MARKETS if all(c in SGP_CORR["stats"] for c in MARKETS[m])])]
+    players = [(n, None) for n in sim_ok["player"].unique()]
+    proj, _, outs = _prepare(state, sched, date, players, inj, games, cfg) if players else (pd.DataFrame(), {}, {})
+    ratings, shift = team_ratings(state, date), injury_shift(state, outs)
+    for gid, g in pool.groupby("game_id", sort=False):
+        r0 = g.iloc[0]
+        home, away = (r0["team"], r0["opp"]) if str(r0["home"]).lower() in ("true", "1") else (r0["opp"], r0["team"])
+        print(f"\n  {away} @ {home}")
+        top = g.sort_values("leg_edge", ascending=False).head(MENU["props_per_game"])
+        for _, r in top.iterrows():
+            print(f"    prop: {r['player']} {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['bet_at']}) | win {r['leg_prob']:.1%}"
+                  f" | edge {r['leg_edge']:+.1%} | take if odds >= {int(r['take_min']):+d}")
+        c = g[g["player"].isin(sim_ok["player"])].head(MENU["sgp_cands"]).to_dict("records")
+        legs = []
+        for x in c:
+            pid = state.find(x["player"])
+            if pid is None or pid not in proj.index:
+                continue
+            legs.append({"kind": "player", "pid": pid, "market": x["market"], "side": x["side"], "line": float(x["line"]),
+                         "p": float(x["leg_prob"]), "team": x["team"], "label": f"{x['player']} {x['side']} {x['line']} {x['market']}"})
+        if len(legs) < 2:
+            print("    SGP: not enough qualifying legs in this game")
+            continue
+        gm = games[(games["home"] == home) & (games["away"] == away)] if games is not None else pd.DataFrame()
+        hs = float(gm.iloc[0]["home_spread"]) if len(gm) and pd.notna(gm.iloc[0]["home_spread"]) else None
+        tot = float(gm.iloc[0]["total"]) if len(gm) and pd.notna(gm.iloc[0]["total"]) else None
+        cm, ct, *_ = game_center(ratings, home, away, hs, tot, shift)
+        H = sgp_simulate(legs, proj, home, cm, ct)
+        ps = H.mean(axis=1)
+        best = None
+        for n in range(2, min(MENU["sgp_max_legs"], len(legs)) + 1):
+            for idx in itertools.combinations(range(len(legs)), n):
+                lift = H[list(idx)].all(axis=0).mean() / max(float(np.prod(ps[list(idx)])), 1e-9)
+                pr = [legs[i]["p"] for i in idx]
+                joint = min(float(np.prod(pr)) * lift, min(pr))
+                if joint <= 0 or 1 / joint < MENU["sgp_min_dec"]:
+                    continue
+                if best is None or joint > best[0]:
+                    best = (joint, lift, idx)
+        if best is None:
+            print(f"    SGP: no combo pays {MENU['sgp_min_dec']:.0f}x+ from tonight's legs")
+            continue
+        joint, lift, idx = best
+        sl = [legs[i] for i in idx]
+        fair = decimal_to_american(1 / joint)
+        need = decimal_to_american((1 + MENU["sgp_min_ev"]) / joint)
+        print(f"    SGP ({len(sl)} legs) - {_story(sl, home)}")
+        for l in sl:
+            print(f"      - {l['label']} (win {l['p']:.1%})")
+        print(f"      joint {joint:.1%} (legs move together: x{lift:.2f}) | fair {fair:+d} | "
+              f"TAKE only if the app's SGP price is >= {need:+d} (EV +{MENU['sgp_min_ev']:.0%}); a boost counts")
+
+
 def cmd_vig(a):
     """Measure the hold on one-sided 'X+' prices (FanDuel milestones) against each player's main two-sided line:
     hold = book implied / fair (fair = main line's no-vig chance carried to the milestone through the implied mean)."""
@@ -3266,6 +3375,10 @@ if __name__ == "__main__":
     ss.add_argument("--injuries-file", default="inj.txt"); ss.add_argument("--calib", default="calib_tab.json")
     ss.add_argument("--shadow", default="shadow_new.json"); ss.add_argument("--ignore-tip", action="store_true")
     ss.add_argument("--v1-before", type=int); ss.add_argument("--v1-after", type=int)
+    mn = sub.add_parser("menu"); mn.add_argument("--date"); mn.add_argument("--all", default="bets_all.csv")
+    mn.add_argument("--bets", default="bets.csv"); mn.add_argument("--parlays", default="vpe_parlays.json")
+    mn.add_argument("--games", default="games.csv"); mn.add_argument("--injuries", default="")
+    mn.add_argument("--calib", default="calib_tab.json")
     ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
@@ -3290,5 +3403,5 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
-     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "status": cmd_status, "styles": cmd_styles,
+     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "status": cmd_status, "styles": cmd_styles,
      "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "vig": cmd_vig}[a.cmd](a)
