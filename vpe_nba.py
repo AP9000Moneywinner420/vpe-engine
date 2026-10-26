@@ -55,10 +55,11 @@ def _download(url, path, max_age_hours):
             raise
     return path
 
-STATS = ["pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "oreb", "dreb", "fga", "fta", "fg3a"]
+STATS = ["pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "oreb", "dreb", "fga", "fta", "fg3a", "fgm", "pf"]
 RAW = {"points": "pts", "rebounds": "reb", "assists": "ast", "three_point_field_goals_made": "fg3m", "steals": "stl",
        "blocks": "blk", "turnovers": "tov", "offensive_rebounds": "oreb", "defensive_rebounds": "dreb",
-       "field_goals_attempted": "fga", "free_throws_attempted": "fta", "three_point_field_goals_attempted": "fg3a"}
+       "field_goals_attempted": "fga", "free_throws_attempted": "fta", "three_point_field_goals_attempted": "fg3a",
+       "field_goals_made": "fgm", "fouls": "pf"}
 POS = {"G": "G", "PG": "G", "SG": "G", "F": "F", "SF": "F", "PF": "F", "C": "C"}
 NBA_TEAMS = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DAL", "DEN", "DET", "GS", "HOU", "IND", "LAC", "LAL", "MEM",
              "MIA", "MIL", "MIN", "NO", "NY", "OKC", "ORL", "PHI", "PHX", "POR", "SA", "SAC", "TOR", "UTAH", "WSH"}
@@ -253,10 +254,187 @@ def prep_prev(prev_box, cfg):
     tg = team_games(prev_box)
     dvp, _ = dvp_table(prev_box, tg, m["dvp_shrink_games"])
     p = prev_box[prev_box["played"]]
-    return {"players": player_table(prev_box, m["prev_decay"], m["prev_decay"]), "tg": tg, "dvp": dvp,
+    players = player_table(prev_box, m["prev_decay"], m["prev_decay"])
+    sty = fit_styles(prev_box, players, tg, cfg)
+    df_, _ = def_features(tg)
+    rows = matchup_rows(prev_box, players, dvp, sty["P"].train, sty["D"].train, cfg, w=m["styles"]["prev_weight"])
+    return {"players": players, "tg": tg, "dvp": dvp, "styles": sty, "style_rows": rows, "def_feat": df_,
+            "off_feat": off_features(tg),
+            "allow": tg.groupby("opp")["pts"].mean(),
             "pace": tg.groupby("team")["game_poss"].mean(), "lg_pace": tg["game_poss"].mean(),
             "pos_min": p.groupby("pos")["min"].sum(), "pos_sum": p.groupby("pos")[STATS].sum(),
             "team_tot": tg.groupby("team")[STATS].mean(), "lg_team_tot": tg[STATS].mean()}
+
+# ==================== styles: player archetypes x team defensive styles ====================
+# Players are grouped into archetypes by HOW they produce (usage, 3-point share, free-throw rate, passing, boards,
+# blocks); defenses into styles by WHAT they give up (threes allowed, free throws allowed, turnovers forced, offensive
+# boards allowed, rim protection, pace). Groups are fitted on last season (fixed all season, so labels don't jump) and
+# this season's players/teams are assigned to the nearest group. Then: how does each archetype do vs each defensive
+# style, home and away, compared with what the rest of the model already expects (player rate x defense-vs-position)?
+# Pooling ~7 teams per style and dozens of players per archetype gives samples big enough to trust; one team's
+# "road vs zone teams" split is mostly noise on its own.
+ARCH_STATS = ["pts", "reb", "ast", "fg3m", "stl", "blk", "tov"]
+
+def arch_features(t):
+    fga = t["r_fga"].astype(float).clip(lower=1e-4)
+    reb = t["r_reb"].astype(float).clip(lower=1e-4)
+    return pd.DataFrame({"usage": (t["r_fga"] + 0.44 * t["r_fta"] + t["r_tov"]).astype(float) * 36,
+                         "three": t["r_fg3a"].astype(float) / fga, "ftr": t["r_fta"].astype(float) / fga,
+                         "ast": t["r_ast"].astype(float) * 36, "reb": reb * 36,
+                         "oreb": t["r_oreb"].astype(float) / reb, "blk": t["r_blk"].astype(float) * 36}, index=t.index)
+
+def def_features(tg):
+    """Per defense: what offenses do against it (from team-game rows; `opp` is the defense)."""
+    g = tg.groupby("opp")
+    s = g[["fga", "fg3a", "fta", "tov", "oreb", "poss", "fgm", "ast"]].sum()
+    own = tg.groupby("team")[["dreb", "blk"]].sum()
+    out = pd.DataFrame({"three": s["fg3a"] / s["fga"], "ftr": s["fta"] / s["fga"], "tov": s["tov"] / s["poss"],
+                        "oreb": s["oreb"] / (s["oreb"] + own["dreb"].reindex(s.index)),
+                        "rim": own["blk"].reindex(s.index) / s["fga"], "ast": s["ast"] / s["fgm"].clip(lower=1),
+                        "pace": g["game_poss"].mean()})
+    return out, g["game_id"].nunique()
+
+def off_features(tg):
+    g = tg.groupby("team")
+    s = g[["fga", "fg3a", "fta", "oreb", "dreb", "ast", "fgm"]].sum()
+    return pd.DataFrame({"three": s["fg3a"] / s["fga"], "ftr": s["fta"] / s["fga"], "ast": s["ast"] / s["fgm"].clip(lower=1),
+                         "oreb": s["oreb"] / (s["oreb"] + s["dreb"]), "pace": g["game_poss"].mean()})
+
+def _kmeans(X, k, n_init=12, iters=200):
+    best = None
+    for seed in range(n_init):
+        rng = np.random.default_rng(seed)
+        C = X[[rng.integers(len(X))]]
+        for _ in range(1, k):
+            d = ((X[:, None, :] - C[None]) ** 2).sum(-1).min(1)
+            C = np.vstack([C, X[rng.choice(len(X), p=d / d.sum())]])
+        for _ in range(iters):
+            lab = ((X[:, None, :] - C[None]) ** 2).sum(-1).argmin(1)
+            nc = np.array([X[lab == j].mean(0) if (lab == j).any() else C[j] for j in range(k)])
+            if np.allclose(nc, C):
+                break
+            C = nc
+        inertia = ((X - C[lab]) ** 2).sum()
+        if best is None or inertia < best[0]:
+            best = (inertia, C, lab)
+    # stable order: sort groups by their first feature so labels don't depend on the random start
+    order = np.argsort(best[1][:, 0])
+    remap = np.empty_like(order); remap[order] = np.arange(len(order))
+    return best[1][order], remap[best[2]]
+
+class Styler:
+    """Fitted groups + names. fit on a feature table; assign() maps new rows to the nearest group."""
+    def __init__(self, F, k, namer, w=None):
+        self.cols = list(F.columns)
+        self.mu, self.sd = F.mean(), F.std().replace(0, 1)
+        X = ((F - self.mu) / self.sd).to_numpy()
+        self.w = np.ones(len(self.cols)) if w is None else np.asarray([w.get(c, 1.0) for c in self.cols])
+        C, lab = _kmeans(X * self.w, k)
+        self.C = C
+        self.names = namer(pd.DataFrame(C / self.w, columns=self.cols))
+        self.train = pd.Series([self.names[j] for j in lab], index=F.index)
+    def assign(self, F):
+        F = F[self.cols].replace([np.inf, -np.inf], np.nan).dropna()
+        if F.empty:
+            return pd.Series(dtype=object)
+        X = ((F - self.mu) / self.sd).to_numpy() * self.w
+        lab = ((X[:, None, :] - self.C[None]) ** 2).sum(-1).argmin(1)
+        return pd.Series([self.names[j] for j in lab], index=F.index)
+
+def _greedy_names(Z, labels):
+    """Give each group the label that fits it best, each label used once (best fits picked first)."""
+    sc = np.array([[f(z) for f in labels.values()] for _, z in Z.iterrows()])
+    names, used, out = list(labels), set(), [None] * len(Z)
+    for _ in range(len(Z)):
+        sc_ = sc.copy()
+        for j, n in enumerate(names):
+            if n in used:
+                sc_[:, j] = -1e9
+        for i in range(len(Z)):
+            if out[i] is not None:
+                sc_[i, :] = -1e9
+        i, j = np.unravel_index(np.argmax(sc_), sc_.shape)
+        out[i] = names[j]
+        used.add(names[j])
+    return out
+
+_bal = lambda z: -float(np.abs(z).sum()) / 2
+PLAYER_LABELS = {
+    "Primary creator": lambda z: z["usage"] + z["ast"], "Scorer": lambda z: z["usage"] - 0.5 * z["ast"] + 0.3 * z["ftr"],
+    "Table-setter": lambda z: z["ast"] - 0.5 * z["usage"], "Spot-up shooter": lambda z: z["three"] - 0.7 * z["usage"],
+    "Slasher": lambda z: z["ftr"] - z["three"] - 0.3 * z["reb"], "Rim-running big": lambda z: z["reb"] + z["blk"] + z["oreb"] - z["three"] - z["usage"],
+    "Stretch big": lambda z: z["reb"] + z["three"] + 0.5 * z["blk"], "Playmaking big": lambda z: z["reb"] + z["ast"],
+    "Post scorer big": lambda z: z["reb"] + z["usage"] - z["three"] - z["ast"],
+    "Point forward": lambda z: z["usage"] + z["ast"] + z["reb"] - z["three"], "Paint big": lambda z: z["reb"] + z["ftr"] - z["three"] - z["ast"], "3-and-D wing": lambda z: z["three"] - z["ast"] + 0.2 * z["reb"],
+    "Role wing": _bal}
+DEF_LABELS = {
+    "Pressure / gamble": lambda z: z["tov"] + 0.5 * z["ftr"], "Run-off-the-line": lambda z: -z["three"] - 0.3 * z["rim"],
+    "Drop / protect paint": lambda z: z["rim"] + z["three"], "Leaky on the glass": lambda z: z["oreb"],
+    "Up-tempo": lambda z: z["pace"], "Foul-prone": lambda z: z["ftr"] - z["tov"], "Balanced": _bal}
+OFF_LABELS = {
+    "Pace & space": lambda z: z["three"] + z["pace"], "Half-court threes": lambda z: z["three"] - z["pace"],
+    "Ball movement": lambda z: z["ast"], "Paint & glass": lambda z: z["oreb"] + z["ftr"] - z["three"],
+    "Iso-heavy": lambda z: -z["ast"], "Slow grind": lambda z: -z["pace"], "Balanced": _bal}
+
+def name_players(Z):
+    return _greedy_names(Z, PLAYER_LABELS)
+
+def name_defenses(Z):
+    return _greedy_names(Z, DEF_LABELS)
+
+def name_offenses(Z):
+    return _greedy_names(Z, OFF_LABELS)
+
+def fit_styles(box, ptab, tg, cfg):
+    """Fit player archetypes and team styles on one (finished) season."""
+    sc = cfg["model"]["styles"]
+    pl = ptab[(ptab["n"] >= 15) & (ptab["min"] >= 12)]
+    P = Styler(arch_features(pl).replace([np.inf, -np.inf], np.nan).dropna(), sc["k_players"], name_players)
+    D = Styler(def_features(tg)[0], sc["k_def"], name_defenses)
+    O = Styler(off_features(tg), sc["k_off"], name_offenses)
+    return {"P": P, "D": D, "O": O}
+
+def matchup_rows(box, rates, dvp, arch, dstyle, cfg, w=1.0):
+    """One row per player-game: actual vs what the model's base expects (minutes x his rate x defense-vs-position x
+    home/away), tagged with his archetype, the opponent's defensive style and home/away."""
+    sit = cfg["model"]["situational"]
+    p = box[box["played"] & (box["min"] >= 10)]
+    p = p[p["pid"].isin(rates.index) & p["pid"].isin(arch.index) & p["opp"].isin(dstyle.index)]
+    if p.empty:
+        return pd.DataFrame()
+    hf = np.where(p["home"], sit["home_rate"], sit["away_rate"])
+    out = pd.DataFrame({"arch": arch.reindex(p["pid"]).to_numpy(), "dstyle": dstyle.reindex(p["opp"]).to_numpy(),
+                        "home": p["home"].to_numpy(), "w": w})
+    idx = pd.MultiIndex.from_arrays([p["opp"], p["pos"]])
+    for s in ARCH_STATS:
+        dv = dvp[s].reindex(idx).fillna(1.0).to_numpy() if len(dvp) else 1.0
+        out["e_" + s] = p["min"].to_numpy() * rates["r_" + s].reindex(p["pid"]).to_numpy() * dv * hf
+        out["a_" + s] = p[s].to_numpy()
+    return out
+
+def matchup_factors(rows, cfg):
+    """archetype x defensive style (x home/away) multipliers, shrunk twice: cell -> (archetype, style) -> 1.0."""
+    sc = cfg["model"]["styles"]
+    k, kh, cap = sc["shrink_games"], sc["home_shrink_games"], sc["cap"]
+    if rows is None or rows.empty:
+        return {}
+    r = rows.copy()
+    out = {}
+    for s in ARCH_STATS:
+        r["_e"], r["_a"] = r["e_" + s] * r["w"], r["a_" + s] * r["w"]
+        g2 = r.groupby(["arch", "dstyle"]).agg(e=("_e", "sum"), a=("_a", "sum"), n=("w", "sum"))
+        g2 = g2[g2["e"] > 0]
+        f2 = 1 + (g2["a"] / g2["e"] - 1) * g2["n"] / (g2["n"] + k)
+        g3 = r.groupby(["arch", "dstyle", "home"]).agg(e=("_e", "sum"), a=("_a", "sum"), n=("w", "sum"))
+        g3 = g3[g3["e"] > 0]
+        base = f2.reindex(pd.MultiIndex.from_arrays([g3.index.get_level_values(0), g3.index.get_level_values(1)])).fillna(1.0).to_numpy()
+        # home split: how this cell's home (or road) games differ from the cell as a whole
+        g2a = g2.reindex(pd.MultiIndex.from_arrays([g3.index.get_level_values(0), g3.index.get_level_values(1)]))
+        cell_ratio = (g2a["a"] / g2a["e"]).to_numpy()
+        rel = (g3["a"] / g3["e"]).to_numpy() / np.where(cell_ratio > 0, cell_ratio, 1.0)
+        f3 = base * (1 + (rel - 1) * g3["n"].to_numpy() / (g3["n"].to_numpy() + kh))
+        out[s] = pd.Series(np.clip(f3, 1 - cap, 1 + cap), index=g3.index)
+    return out
 
 class State:
     """Everything known before tip on `date`: player baselines, team pace, defense-vs-position, team totals."""
@@ -363,6 +541,56 @@ class State:
         else:
             dvp = prior if prior is not None else pd.DataFrame()
         self.dvp = dvp.clip(cap[0], cap[1]) if len(dvp) else dvp
+        # points each defense allows per game (for the game-total check), this season shrunk toward last season
+        lg_pts = float(self.lg_team_tot["pts"])
+        prior_allow = (lg_pts + (pv["allow"] - lg_pts) * tr) if pv and "allow" in pv else pd.Series(lg_pts, index=sorted(NBA_TEAMS))
+        if self.tg is not None and len(self.tg):
+            ca = self.tg.groupby("opp")["pts"].agg(["mean", "size"]).reindex(prior_allow.index)
+            nn_ = ca["size"].fillna(0)
+            self.allow = (nn_ * ca["mean"].fillna(0) + kt * prior_allow) / (nn_ + kt)
+        else:
+            self.allow = prior_allow
+        self.lg_pts = lg_pts
+        # ---- styles: archetypes, defensive/offensive styles, archetype x style factors ----
+        self.arch, self.dstyle, self.ostyle, self.mf = pd.Series(dtype=object), pd.Series(dtype=object), pd.Series(dtype=object), {}
+        sty = pv.get("styles") if pv else None
+        if sty:
+            ms = m["styles"]
+            self.arch = sty["P"].assign(arch_features(self.players[self.players["eff_min"] >= ms["min_minutes"]]))
+            dprev, oprev = pv["def_feat"], pv["off_feat"]
+            dmix, omix = dprev, oprev
+            if self.tg is not None and len(self.tg) > 30:
+                kk = ms["team_prior_games"]
+                dc, nd = def_features(self.tg)
+                oc = off_features(self.tg)
+                no = self.tg.groupby("team")["game_id"].nunique()
+                wd = (nd.reindex(dprev.index).fillna(0) / (nd.reindex(dprev.index).fillna(0) + kk)).to_numpy()[:, None]
+                wo = (no.reindex(oprev.index).fillna(0) / (no.reindex(oprev.index).fillna(0) + kk)).to_numpy()[:, None]
+                dmix = dprev * (1 - wd) + dc.reindex(dprev.index).fillna(dprev) * wd
+                omix = oprev * (1 - wo) + oc.reindex(oprev.index).fillna(oprev) * wo
+            self.dstyle, self.ostyle = sty["D"].assign(dmix), sty["O"].assign(omix)
+            rows = [pv["style_rows"]]
+            if len(cp):
+                rows.append(matchup_rows(cur, player_table(cur, 1.0, 1.0), self.dvp, self.arch, self.dstyle, cfg, 1.0))
+            self.mf = matchup_factors(pd.concat([r for r in rows if len(r)]), cfg)
+        # ---- per-player extras: recent role, foul rate, how streaky he is (dispersion vs the fitted variance) ----
+        ex = pd.DataFrame(index=self.players.index)
+        if len(cp):
+            srt = cp.sort_values(["date", "game_id"])
+            ex["start_l2"] = srt.groupby("pid").tail(2).groupby("pid")["starter"].mean()
+            ex["min_l3"] = srt.groupby("pid").tail(3).groupby("pid")["min"].mean()
+        allg = pd.concat([x for x in (cp, prev_box[prev_box["played"]] if prev_box is not None and len(prev_box) else None)
+                          if x is not None and len(x)]) if (len(cp) or (prev_box is not None and len(prev_box))) else None
+        if allg is not None:
+            allg = allg[allg["pid"].isin(self.players.index) & (allg["min"] >= 10)]
+            for s_ in ("pts", "reb", "ast", "fg3m"):
+                mu_ = allg["min"].to_numpy() * self.players["r_" + s_].reindex(allg["pid"]).to_numpy()
+                a_, b_ = m["var"][s_]
+                v_ = np.maximum(a_ * mu_ + b_ * mu_ ** 2, 0.05)
+                t_ = pd.DataFrame({"pid": allg["pid"].to_numpy(), "z2": (allg[s_].to_numpy() - mu_) ** 2 / v_}).groupby("pid")["z2"].agg(["sum", "count"])
+                ex["disp_" + s_] = t_["sum"] / t_["count"]
+                ex["disp_n"] = t_["count"]
+        self.extra = ex
 
     def find(self, name):
         key = norm_name(name)
@@ -421,6 +649,8 @@ def team_adjust(state, sl, outs, rosters, cfg, use_split=True, sure=None):
     for s in USE_STATS:
         sl["u_" + s] = 1.0
     sl["usage_note"] = ""
+    for c in ("ws_n", "ws_min", "ws_r_pts", "ws_r_reb", "ws_r_ast", "ws_r_fg3m", "m2"):
+        sl[c] = np.nan
     out_ids = set(outs["pid"]) if outs is not None and len(outs) else set()
     for team in sl["team"].dropna().unique():
         roster = [p for p in dict.fromkeys(rosters.get(team, []) + list(sl.index[sl["team"] == team]))
@@ -471,12 +701,16 @@ def team_adjust(state, sl, outs, rosters, cfg, use_split=True, sure=None):
             if pid not in R.index:
                 continue
             sl.at[pid, "dmin"] = m2[pid] - P.at[pid, "min"]
+            sl.at[pid, "m2"] = m2[pid]
             for s in USE_STATS:
                 sl.at[pid, "u_" + s] = mult[s]
             note = (f"OUT: {', '.join(names)} | " if names else "") + \
                    f"{m2[pid] - P.at[pid, 'min']:+.1f} min, usage x{mult['fga']:.2f}, pts x{mult['pts']:.2f}"
             if use_split and big is not None:
                 ws = without_split(state, pid, team, big.name)
+                if ws:
+                    for c in ("n", "min", "r_pts", "r_reb", "r_ast", "r_fg3m"):
+                        sl.at[pid, "ws_" + c] = ws[c]
                 if ws and ws["n"] >= m["wo_min_games"]:
                     note += f" | real games w/o {big['name']}: {ws['n']} ({ws['min']:.0f} min, {ws['r_pts'] * 36:.1f} pts/36)"
             sl.at[pid, "usage_note"] = note
@@ -496,7 +730,7 @@ def blowout_factor(spread, starter, cfg):
         return float(np.sum(w * f[idx]) / np.sum(w))
     return expect(-float(spread)) / expect(0.0)
 
-def project(state, sl, outs, rosters, cfg, flags=None, sure=None):
+def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None):
     """sl: DataFrame indexed by pid with team, opp, home, b2b, spread. Returns means and variances per market."""
     m = cfg["model"]
     flags = flags or {}
@@ -528,20 +762,67 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None):
     if flags.get("blowout", True):
         bf = [blowout_factor(sp, mn >= 26, cfg) for sp, mn in zip(sl["spread"], sl["min"])]
         mins = mins * (1 + (np.array(bf) - 1) * stren)
+    # minutes restriction: listed as Limited (news says "minutes restriction"), or back from a long absence
+    ret = m["return"]
+    lim = sl.index.isin(list(limited or []))
+    last_ = pd.to_datetime(P["last_date"].reindex(sl.index))
+    if state.tg is not None and len(state.tg):
+        td_ = state.tg[["team", "date"]].drop_duplicates()
+        miss_ = np.array([int(((td_["team"] == t) & (td_["date"] > d)).sum()) if pd.notna(d) else 0 for t, d in zip(sl["team"], last_)])
+    else:
+        miss_ = np.zeros(len(sl), dtype=int)
+    back = (miss_ >= ret["min_missed"]) & flags.get("return", True)
+    sl["limited"] = lim
+    sl["returning"] = back
+    mins = mins * np.where(lim, m["restricted_min_mult"], np.where(back, ret["min_mult"], 1.0))
     sl["proj_min"] = np.minimum(mins * sl["nt_min"], m["max_minutes"])
     pace = (state.pace.reindex(sl["opp"]).to_numpy() / state.lg_pace) if flags.get("pace", True) else 1.0
     pace_f = np.power(pace, m["pace_elasticity"])
     home_f = np.where(sl["home"].fillna(False).astype(bool), sit["home_rate"], sit["away_rate"]) if flags.get("home", True) else 1.0
     home_f = 1 + (np.asarray(home_f) - 1) * stren
     b2b_r = np.where(b2b, 1 + (sit["b2b_rate"] - 1) * stren, 1.0) if flags.get("b2b", True) else 1.0
+    # styles: his archetype vs the opponent's defensive style (home/away)
+    homeb = sl["home"].fillna(False).astype(bool).to_numpy()
+    sl["arch"] = state.arch.reindex(sl.index).to_numpy()
+    sl["opp_style"] = state.dstyle.reindex(sl["opp"]).to_numpy()
+    sl["team_style"] = state.ostyle.reindex(sl["team"]).to_numpy()
+    sstr = m["styles"]["strength"]
+    # game total: the market's implied team points vs what the base model expects (team scoring x opponent allowed)
+    tcfg = m["total"]
+    tot = pd.to_numeric(sl["total"], errors="coerce") if "total" in sl else pd.Series(np.nan, index=sl.index)
+    spr = pd.to_numeric(sl["spread"], errors="coerce")
+    implied = ((tot - spr) / 2).to_numpy()
+    base_pts = state.team_tot["pts"].reindex(sl["team"]).to_numpy() * \
+        state.allow.reindex(sl["opp"]).to_numpy() / state.lg_pts * np.asarray(home_f, dtype=float)
+    env = np.clip(np.where(np.isfinite(implied) & (base_pts > 0), implied / base_pts, 1.0), 1 - tcfg["cap"], 1 + tcfg["cap"])
+    sl["env"] = env
+    sl["implied_pts"] = implied
+    # return from an absence (minutes restriction risk) and recent role
+    last = pd.to_datetime(P["last_date"].reindex(sl.index))
+    sl["days_off"] = (state.date - last).dt.days.to_numpy()
+    if state.tg is not None and len(state.tg):
+        td = state.tg[["team", "date"]].drop_duplicates()
+        sl["missed"] = [int(((td["team"] == t) & (td["date"] > d)).sum()) if pd.notna(d) else 0 for t, d in zip(sl["team"], last)]
+    else:
+        sl["missed"] = 0
+    sl = sl.join(state.extra, how="left")
+    sl["r_pf"] = P["r_pf"].reindex(sl.index).to_numpy() if "r_pf" in P else np.nan
     for s in ["pts", "reb", "ast", "fg3m", "stl", "blk", "tov"]:
+        if flags.get("arch", True) and s in state.mf:
+            key = pd.MultiIndex.from_arrays([sl["arch"], sl["opp_style"], homeb])
+            af = state.mf[s].reindex(key).fillna(1.0).to_numpy()
+            af = 1 + (af - 1) * sstr
+        else:
+            af = np.ones(len(sl))
+        ef = np.power(env, tcfg["elasticity"].get(s, 0.0)) if flags.get("total", True) else 1.0
+        sl["af_" + s] = af
         if flags.get("dvp", True) and len(state.dvp):
             idx = pd.MultiIndex.from_arrays([sl["opp"], sl["pos"]])
             dv = state.dvp[s].reindex(idx).fillna(1.0).to_numpy()
         else:
             dv = 1.0
         rate = P["r_" + s].reindex(sl.index).to_numpy() * sl["u_" + s].to_numpy()
-        sl["mu_" + s] = sl["proj_min"].to_numpy() * rate * dv * pace_f * home_f * b2b_r * sl["nt_rate"].to_numpy()
+        sl["mu_" + s] = sl["proj_min"].to_numpy() * rate * dv * pace_f * home_f * b2b_r * sl["nt_rate"].to_numpy() * af * ef
         sl["dvp_" + s] = dv
     sl["pace_f"] = pace_f
     for mk, comps in MARKETS.items():
@@ -763,6 +1044,8 @@ def evaluate(props, proj, injuries, cfg):
                 tier = None
             if tier and odds > smax:  # long shots: tail of the distribution is where the model is least reliable
                 tier = None
+            if tier and side == "Over" and (bool(p.get("limited", False)) or bool(p.get("returning", False))):
+                tier = None  # minutes restriction risk: never back the Over
             units = 0.0
             if tier:
                 units = min(kf * kelly_fraction(prob, odds) / unit_pct, cfg["tiers"][tier]["max_units"])
@@ -783,7 +1066,11 @@ def evaluate(props, proj, injuries, cfg):
                          "injury": stt or "", "usage_note": p["usage_note"], "new_team": bool(p["new_team"]),
                          "dvp": round(float(np.prod([p["dvp_" + c] for c in MARKETS[mk] if "dvp_" + c in p])), 3),
                          "pace_f": round(float(p["pace_f"]), 3), "b2b": bool(p["b2b"]), "spread": p["spread"],
-                         "n_cur": int(p["n_cur"]), "min_odds": mo, "line_limit": ll})
+                         "n_cur": int(p["n_cur"]), "min_odds": mo, "line_limit": ll,
+                         "arch": p.get("arch", ""), "opp_style": p.get("opp_style", ""),
+                         "style_f": round(float(np.prod([p["af_" + c] for c in MARKETS[mk] if "af_" + c in p])), 3),
+                         "env": round(float(p.get("env", 1.0)), 3), "limited": bool(p.get("limited", False)),
+                         "returning": bool(p.get("returning", False))})
     ev = pd.DataFrame(rows)
     if len(ev):
         ev["market_gap"] = (ev["model_prob"] - ev["market_prob"]).abs().round(3)
@@ -877,6 +1164,10 @@ CONFIG = {
                              "rotation": {"min": [0.88] * 5 + [0.94] * 5, "rate": [0.93] * 5 + [0.97] * 5},
                              "bench": {"min": [0.80, 0.88, 0.88, 0.88, 0.88, 0.94, 0.94, 0.94, 0.94, 0.94],
                                        "rate": [0.90, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]}}},
+            "total": {"cap": 0.15, "elasticity": {}},
+            "restricted_min_mult": 0.8, "return": {"min_missed": 99, "min_mult": 1.0},
+            "styles": {"k_players": 8, "k_def": 4, "k_off": 4, "min_minutes": 150, "team_prior_games": 12,
+                       "prev_weight": 1.0, "shrink_games": 250, "home_shrink_games": 400, "cap": 0.06, "strength": 1.0},
             "new_team_sd_mult": 1.05, "early_sd_mult": 1.0,
             "prob_calibration_shrink": 0.8, "max_market_gap": 0.15, "min_minutes_to_bet": 20},
   "tiers": {"tier_1": {"min_edge": 0.04, "min_prob": 0.55, "max_units": 3.0},
@@ -955,7 +1246,13 @@ def _prepare(state, sched, date, props_players, injuries, games, cfg, sure_names
     outs = build_outs(state, injuries, overrides)
     rosters = team_rosters(state, overrides, date)
     sure = None if sure_names is None else {p for p in (state.find(n) for n in sure_names) if p is not None}
-    proj = project(state, sl, outs, rosters, cfg, sure=sure) if len(sl) else pd.DataFrame()
+    lim = set()
+    if injuries is not None and len(injuries):
+        for _, r in injuries[injuries["status"].isin(["Limited", "Restricted", "Minutes Restriction"])].iterrows():
+            pid = state.find(r["player"])
+            if pid is not None:
+                lim.add(pid)
+    proj = project(state, sl, outs, rosters, cfg, sure=sure, limited=lim) if len(sl) else pd.DataFrame()
     return proj, overrides, outs
 
 # ==================== commands ====================
@@ -989,9 +1286,38 @@ def cmd_board(a):
         keys = {norm_name(x) for x in a.player.split(";")}
         proj = proj[proj["name"].map(norm_name).isin(keys)]
     pd.set_option("display.width", 250); pd.set_option("display.max_rows", 500); pd.set_option("display.max_colwidth", 80)
-    cols = ["name", "team", "opp", "pos", "proj_min", "mu_pts", "mu_reb", "mu_ast", "mu_fg3m", "mu_pra", "dvp_pts",
-            "pace_f", "new_team", "usage_note"]
+    cols = ["name", "team", "opp", "pos", "arch", "opp_style", "proj_min", "mu_pts", "mu_reb", "mu_ast", "mu_fg3m", "mu_pra",
+            "dvp_pts", "af_pts", "env", "pace_f", "new_team", "usage_note"]
     print(proj.sort_values(["team", "proj_min"], ascending=[True, False])[cols].round(2).to_string(index=False))
+
+def cmd_styles(a):
+    """Team categories (offense + defense style) and player archetypes, plus how each archetype does vs each defense."""
+    cfg = _cfg(a)
+    date, state, sched = _setup(a, cfg)
+    if not len(state.dstyle):
+        print("STYLES: last season not loaded -> no groups")
+        return
+    T = pd.DataFrame({"offense": state.ostyle, "defense": state.dstyle})
+    print("=== TEAM STYLES (this season, shrunk toward last season) ===")
+    for d, g in T.groupby("defense"):
+        print(f"  DEF {d:22s}: " + ", ".join(f"{t} ({o})" for t, o in g["offense"].items()))
+    P = state.players
+    arch = state.arch
+    teams = {norm_team(t) for t in a.team.split(",")} if a.team else None
+    print("\n=== PLAYER ARCHETYPES (top players by minutes) ===")
+    for n, g in arch.groupby(arch):
+        pl = P.loc[g.index]
+        if teams:
+            pl = pl[pl["team"].isin(teams)]
+        top = pl[pl["last_date"] >= date - pd.Timedelta(days=30)].sort_values("min", ascending=False).head(8)
+        if len(top):
+            print(f"  {n:18s}: " + ", ".join(f"{r['name']} ({r['team']})" for _, r in top.iterrows()))
+    stat = a.stat or "pts"
+    if stat in state.mf:
+        f = state.mf[stat].unstack("home")
+        f.columns = ["road" if not c else "home" for c in f.columns]
+        print(f"\n=== {stat.upper()}: archetype vs defensive style (x1.03 = 3% more than the base model expects) ===")
+        print(f.round(3).to_string())
 
 def cmd_slate(a):
     """Rank today's players (from the points page) by projected minutes; print the per-player pages to pull."""
@@ -1093,6 +1419,43 @@ def cmd_lines(a):
     df.to_csv(a.out, index=False)
     print(f"LINES: {len(df)} rows -> {a.out} | " + ", ".join(f"{k} {v}" for k, v in df["market"].value_counts().items()))
 
+def find_middles(props, proj, cfg, max_cost=0.12):
+    """MIDDLES (the real hedge): an Over at a low line at one book + an Under at a higher line at another book.
+    Lands between the two lines -> both win; anywhere else -> one wins, one loses (small cost). Ranked by EV per $1 a
+    side using VPE's projection (shrunk like every pick) for the chance of landing in the window."""
+    shrink = cfg["model"]["prob_calibration_shrink"]
+    rows = []
+    p = props[props["pid"].notna() & props["market"].notna()]
+    for (pid, mk), g in p.groupby(["pid", "market"]):
+        if pid not in proj.index:
+            continue
+        ov = g[g["over_odds"].notna()][["line", "over_odds", "book"]]
+        un = g[g["under_odds"].notna()][["line", "under_odds", "book"]]
+        if ov.empty or un.empty:
+            continue
+        mu, var = float(proj.at[pid, "mu_" + mk]), float(proj.at[pid, "var_" + mk])
+        for _, o in ov.iterrows():
+            for _, u in un.iterrows():
+                l1, l2 = float(o["line"]), float(u["line"])
+                if l2 - l1 < 1:
+                    continue
+                d1, d2 = american_to_decimal(o["over_odds"]), american_to_decimal(u["under_odds"])
+                worst = min(d1 - 2, d2 - 2)  # one side wins, the other loses ($1 each)
+                if worst < -max_cost:
+                    continue
+                p_hi = 0.5 + (prob_over(mu, var, mk, l2 - 0.0) - 0.5) * shrink   # over the high line
+                p_lo = 0.5 + (prob_over(mu, var, mk, l1) - 0.5) * shrink         # over the low line
+                p_mid = max(p_lo - p_hi, 0.0)
+                p_below = 1 - p_lo
+                ev = p_mid * (d1 + d2 - 2) + p_hi * (d1 - 2) + p_below * (d2 - 2)
+                ob = side_book(o["book"], "Over") if "/" in str(o["book"]) else str(o["book"])
+                ub = side_book(u["book"], "Under") if "/" in str(u["book"]) else str(u["book"])
+                rows.append({"player": proj.at[pid, "name"], "market": mk, "over": f"O{l1:g} {int(o['over_odds']):+d} {ob}",
+                             "under": f"U{l2:g} {int(u['under_odds']):+d} {ub}", "window": f"{math.floor(l1) + 1:g}-{math.ceil(l2) - 1:g}",
+                             "p_middle": round(p_mid, 3), "worst_case": round(worst, 3), "ev_per_2": round(ev, 3), "mean": round(mu, 1)})
+    m = pd.DataFrame(rows)
+    return m.sort_values("ev_per_2", ascending=False).drop_duplicates(["player", "market"]) if len(m) else m
+
 def cmd_check(a):
     cfg = _cfg(a)
     set_calib(getattr(a, "calib", None), SPORT)
@@ -1144,6 +1507,9 @@ def cmd_check(a):
     print("\n(parlays: built by the parlay command)")
     for p in parlays:
         print(f"  {p['odds']:+d} | prob {p['prob']:.1%} | EV/u {p['ev_per_unit']:+.3f} | {p['units']}u | " + " + ".join(p["legs"]))
+    mids = find_middles(props, proj, cfg) if len(proj) else pd.DataFrame()
+    print("\n=== MIDDLES (Over low line + Under high line at different books; both win inside the window) ===")
+    print(mids.head(8).to_string(index=False) if len(mids) else "none tonight")
     print("\n=== SKIPPED ===")
     print(skipped.drop_duplicates().to_string(index=False) if not skipped.empty else "none")
     if a.out:
@@ -2053,16 +2419,29 @@ def cmd_backtest(a):
     dates = sorted(d for d in cur["date"].unique() if start <= d <= end)[::a.step]
     team_dates = cur[cur["played"]].groupby("team")["date"].apply(lambda x: set(x))
     flags = {f: False for f in (a.off or "").split(",") if f}
+    odds = None
+    if getattr(a, "odds", None):
+        odds = pd.read_csv(a.odds, dtype={"game_id": str}).dropna(subset=["total"]).drop_duplicates("game_id").set_index("game_id")
+        odds["home_spread"] = pd.to_numeric(odds["home_spread"], errors="coerce")
+        odds["total"] = pd.to_numeric(odds["total"], errors="coerce")
+    extra_cols = ["arch", "opp_style", "team_style", "home", "env", "implied_pts", "days_off", "missed", "start_l2",
+                  "min_l3", "disp_pts", "disp_reb", "disp_ast", "disp_fg3m", "disp_n", "r_pf", "ws_n", "ws_min",
+                  "ws_r_pts", "ws_r_reb", "ws_r_ast", "ws_r_fg3m", "m2", "proj_min", "spread", "total", "start_rate"]
     recs = []
     for d in dates:
         state = State(cur, prev, d, cfg, pc, prev2_box=prev2)
         state.pv_box = prev
         today = cur[cur["date"] == d]
         played = today[today["played"]]
-        sl = played.set_index("pid")[["team", "opp", "home"]].copy()
+        sl = played.set_index("pid")[["team", "opp", "home", "game_id"]].copy()
         sl = sl[sl.index.isin(state.players.index)]
         sl["b2b"] = [(d - pd.Timedelta(days=1)) in team_dates.get(t, set()) for t in sl["team"]]
-        sl["spread"] = np.nan
+        sl["spread"], sl["total"] = np.nan, np.nan
+        if odds is not None:
+            o = odds.reindex(sl["game_id"].astype(str))
+            hs = o["home_spread"].to_numpy()
+            sl["spread"] = np.where(sl["home"].to_numpy(), hs, -hs)
+            sl["total"] = o["total"].to_numpy()
         P = state.players
         if state.tg is not None:
             cand = P[(P["min"] >= 8) & (P["last_date"] >= d - pd.Timedelta(days=25)) & P["team"].isin(set(today["team"]))]
@@ -2087,7 +2466,11 @@ def cmd_backtest(a):
                                       "var": pr["var_" + mk].to_numpy(), "naive": nv.to_numpy(),
                                       "actual": act.reindex(pr.index)[comps].sum(axis=1).to_numpy(),
                                       "min": act.reindex(pr.index)["min"].to_numpy(), "base_min": pr["min"].to_numpy(),
-                                      "out": has_out.to_numpy(), "new_team": pr["new_team"].to_numpy()}))
+                                      "out": has_out.to_numpy(), "new_team": pr["new_team"].to_numpy(),
+                                      "af": pr["af_" + mk].to_numpy() if "af_" + mk in pr else np.nan,
+                                      "started": act.reindex(pr.index)["starter"].to_numpy(),
+                                      "pf": act.reindex(pr.index)["pf"].to_numpy(),
+                                      **{c: pr[c].to_numpy() for c in extra_cols if c in pr}}))
     df = pd.concat(recs, ignore_index=True)
     for c in ("mu", "var", "naive", "actual", "min", "base_min"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -2121,11 +2504,12 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Verified Prop Engine - NBA (in-chat edition)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("board", "slate", "lines", "check", "log", "grade", "backtest", "parlay"):
+    for name in ("board", "slate", "lines", "check", "log", "grade", "backtest", "parlay", "styles"):
         p = sub.add_parser(name)
         p.add_argument("--date"); p.add_argument("--bankroll", type=float); p.add_argument("--profile")
     for name in ("board", "slate", "check"):
         sub.choices[name].add_argument("--injuries", help='"Name:Out;Name:Questionable;Name:Out:PHI"')
+    sub.choices["styles"].add_argument("--team"); sub.choices["styles"].add_argument("--stat")
     for name in ("board", "check"):
         sub.choices[name].add_argument("--games", help="CSV away,home,home_spread,total")
     sub.choices["board"].add_argument("--team"); sub.choices["board"].add_argument("--player")
@@ -2142,7 +2526,7 @@ if __name__ == "__main__":
     sub.choices["grade"].add_argument("--log", default="nba_pick_log.csv"); sub.choices["grade"].add_argument("--actuals")
     sub.choices["backtest"].add_argument("--start", required=True); sub.choices["backtest"].add_argument("--end", required=True)
     sub.choices["backtest"].add_argument("--step", type=int, default=1); sub.choices["backtest"].add_argument("--off", default="")
-    sub.choices["backtest"].add_argument("--save")
+    sub.choices["backtest"].add_argument("--save"); sub.choices["backtest"].add_argument("--odds")
     sub.choices["parlay"].add_argument("--all", default="bets_all.csv")
     sub.choices["parlay"].add_argument("--bets", default="bets.csv")
     sub.choices["parlay"].add_argument("--stake", type=float, help="$ per parlay (default 5% of bankroll)")
@@ -2183,4 +2567,4 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
-     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status}[a.cmd](a)
+     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status, "styles": cmd_styles}[a.cmd](a)
