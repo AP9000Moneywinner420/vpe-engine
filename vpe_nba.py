@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.5.1"
+VERSION = "NBA v2.5.2"
 
 # ==================== data ====================
 
@@ -1818,7 +1818,7 @@ PARLAY = {"model_weight": 0.4, "side_bias": {},  # replaced every run by the lea
           "books": ["draftkings", "fanduel"],
           "haircut": 0.05,           # price from another book -> assume ours pays 0.05 less in decimal odds (~6-8 cents)
           "junk_lines": {"rush_yds": 10.5, "rec_yds": 10.5, "receptions": 1.5, "rush_att": 3.5},  # line below -> skip
-          "max_under_share": 0.45,   # Unders <= 45% of a parlay's legs (2 legs: 0, 3-4: 1, 5-6: 2, 7: 3)
+          "max_under_share": 1.0,    # v2.5.2: no Under cap (it guarded against the v2.1 home-team bug; the learned market gates now police each market x side)
           "under_override_hit": 1.20,  # ...unless the Under-heavy parlay is >= 20% more likely to hit
           "under_override_ev": 0.10,   # ...AND has >= 10 pts more EV than the best balanced one
           "pool": 14, "max_legs": 7,
