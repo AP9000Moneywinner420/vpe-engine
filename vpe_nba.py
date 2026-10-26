@@ -554,6 +554,7 @@ class State:
         self.lg_pts = lg_pts
         # ---- styles: archetypes, defensive/offensive styles, archetype x style factors ----
         self.arch, self.dstyle, self.ostyle, self.mf = pd.Series(dtype=object), pd.Series(dtype=object), pd.Series(dtype=object), {}
+        self.pz, self.dz = pd.DataFrame(), pd.DataFrame()
         sty = pv.get("styles") if pv else None
         if sty:
             ms = m["styles"]
@@ -570,6 +571,10 @@ class State:
                 dmix = dprev * (1 - wd) + dc.reindex(dprev.index).fillna(dprev) * wd
                 omix = oprev * (1 - wo) + oc.reindex(oprev.index).fillna(oprev) * wo
             self.dstyle, self.ostyle = sty["D"].assign(dmix), sty["O"].assign(omix)
+            # continuous traits in z-scores (vs last season's rotation players / teams) for trait x trait matchups
+            pf_ = arch_features(self.players).replace([np.inf, -np.inf], np.nan)
+            self.pz = (pf_ - sty["P"].mu) / sty["P"].sd
+            self.dz = (dmix - sty["D"].mu) / sty["D"].sd
             rows = [pv["style_rows"]]
             if len(cp):
                 rows.append(matchup_rows(cur, player_table(cur, 1.0, 1.0), self.dvp, self.arch, self.dstyle, cfg, 1.0))
@@ -803,6 +808,10 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None):
     sl["arch"] = state.arch.reindex(sl.index).to_numpy()
     sl["opp_style"] = state.dstyle.reindex(sl["opp"]).to_numpy()
     sl["team_style"] = state.ostyle.reindex(sl["team"]).to_numpy()
+    for c_ in state.pz.columns:
+        sl["pz_" + c_] = state.pz[c_].reindex(sl.index).to_numpy()
+    for c_ in state.dz.columns:
+        sl["dz_" + c_] = state.dz[c_].reindex(sl["opp"]).to_numpy()
     sstr = m["styles"]["strength"]
     # game total: the market's implied team points vs what the base model expects (team scoring x opponent allowed)
     tcfg = m["total"]
@@ -2461,7 +2470,9 @@ def cmd_backtest(a):
         odds["total"] = pd.to_numeric(odds["total"], errors="coerce")
     extra_cols = ["arch", "opp_style", "team_style", "home", "env", "implied_pts", "days_off", "missed", "start_l2",
                   "min_l3", "disp_pts", "disp_reb", "disp_ast", "disp_fg3m", "disp_n", "r_pf", "ws_n", "ws_min",
-                  "ws_r_pts", "ws_r_reb", "ws_r_ast", "ws_r_fg3m", "m2", "proj_min", "spread", "total", "start_rate"]
+                  "ws_r_pts", "ws_r_reb", "ws_r_ast", "ws_r_fg3m", "m2", "proj_min", "spread", "total", "start_rate",
+                  "pz_usage", "pz_three", "pz_ftr", "pz_ast", "pz_reb", "pz_oreb", "pz_blk",
+                  "dz_three", "dz_ftr", "dz_tov", "dz_oreb", "dz_rim", "dz_ast", "dz_pace"]
     recs = []
     for d in dates:
         state = State(cur, prev, d, cfg, pc, prev2_box=prev2)
