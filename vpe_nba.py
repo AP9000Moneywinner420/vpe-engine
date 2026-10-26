@@ -18,13 +18,14 @@ import numpy as np
 import os
 import pandas as pd
 import re
+import sys
 import time
 import unicodedata
 import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.2.0"
+VERSION = "NBA v2.3.0"
 
 # ==================== data ====================
 
@@ -101,7 +102,7 @@ _SUFFIX = re.compile(r"\b(jr|sr|ii|iii|iv|v)\b")
 def norm_name(name):
     s = unicodedata.normalize("NFKD", str(name))
     s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
-    s = s.replace(".", "").replace("'", "").replace("’", "").replace("-", " ")
+    s = s.replace(".", "").replace(",", " ").replace("'", "").replace("’", "").replace("-", " ")
     s = _SUFFIX.sub("", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -854,6 +855,17 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None):
         sl["var_" + mk] = (a * mu + b * mu ** 2) * sdm ** 2
     return sl
 
+# ---------- probability calibration ----------
+# Raw P(over) from the distribution -> calibrated chance. Middle (35-65%) = the old flat 0.8 shrink toward 50%; tails
+# (<25%, >75% raw) = isotonic fit on walk-forward backtests (the flat shrink was too timid at the low end and too
+# strong at the high end); linear blend in between. Map in CONFIG["model"]["prob_map"] (x = raw, y = calibrated).
+def cal_prob(p):
+    m = CONFIG["model"].get("prob_map")
+    if m:
+        return np.interp(p, m["x"], m["y"]) if np.ndim(p) else float(np.interp(p, m["x"], m["y"]))
+    sh = CONFIG["model"]["prob_calibration_shrink"]
+    return 0.5 + (np.asarray(p) - 0.5) * sh if np.ndim(p) else 0.5 + (p - 0.5) * sh
+
 def prob_over(mu, var, market, line):
     if mu <= 0:
         return 0.0
@@ -947,6 +959,20 @@ def load_games_file(path):
 
 # ==================== selection ====================
 
+def guard_games(games, sched, date):
+    """Date guard for games.csv (spreads/totals): keep only matchups on D's schedule that haven't tipped. Odds pages
+    often serve another day's lines; a wrong-night spread silently moves blowout risk and the game total."""
+    if games is None or not len(games) or sched is None or not len(sched):
+        return games
+    day = sched[sched["date"] == pd.Timestamp(date)]
+    tonight = {frozenset((h, w)) for h, w in zip(day["home"], day["away"])}
+    ok = pd.Series([frozenset((h, w)) in tonight for h, w in zip(games["home"], games["away"])], index=games.index)
+    if (~ok).any():
+        bad = ", ".join(f"{w} @ {h}" for h, w in zip(games.loc[~ok, "home"], games.loc[~ok, "away"]))
+        print(f"  ! DATE GUARD games.csv: dropped {int((~ok).sum())} of {len(games)} games not on the {pd.Timestamp(date).date()} "
+              f"schedule ({bad})" + (" -> spreads page is on another day: re-fetch" if not ok.any() else ""))
+    return games[ok]
+
 def _tier(edge, prob, cfg):
     for t in ("tier_1", "tier_2", "tier_3"):
         c = cfg["tiers"][t]
@@ -960,9 +986,9 @@ def _take_if(mu, var, mk, line, side, prob, shrink, cfg):
     min_odds = int(decimal_to_american(1 / be)) if 0.02 < be < 0.98 else None
     be110 = implied_prob(-110)
     limit, L = None, line
-    po0 = 0.5 + (prob_over(mu, var, mk, line) - 0.5) * shrink
+    po0 = cal_prob(prob_over(mu, var, mk, line))
     for _ in range(30):
-        po = 0.5 + (prob_over(mu, var, mk, L) - 0.5) * shrink
+        po = cal_prob(prob_over(mu, var, mk, L))
         po = (1 - prob if side == "Under" else prob) + PARLAY["model_weight"] * (po - po0)  # blended, moved with the line
         pr = po if side == "Over" else 1 - po
         if pr - be110 >= c["min_edge"] and pr >= c["min_prob"]:
@@ -1035,7 +1061,7 @@ def evaluate(props, proj, injuries, cfg):
             continue
         line = float(r["line"])
         mu, var = float(p["mu_" + mk]), float(p["var_" + mk])
-        pm_over = 0.5 + (prob_over(mu, var, mk, line) - 0.5) * shrink
+        pm_over = cal_prob(prob_over(mu, var, mk, line))
         oo, uo = r["over_odds"], r["under_odds"]
         if pd.notna(oo) and pd.notna(uo):
             fair_over, _ = no_vig(oo, uo)
@@ -1048,7 +1074,7 @@ def evaluate(props, proj, injuries, cfg):
             if fair_over is None:
                 one = oo if pd.notna(oo) else uo
                 if -200 <= one <= 150:  # near-even single side (split lines): ordinary vig, old estimate is fine
-                    fair = implied_prob(one) / 1.07
+                    fair = one_sided_fair(one)
                     fair_over = fair if pd.notna(oo) else 1 - fair
                 else:
                     skipped.append((r["player"], mk, f"one-sided {int(one):+d} with no main line to price it against"))
@@ -1118,12 +1144,15 @@ def apply_caps(ev, cfg):
     bets = bets.sort_values("score", ascending=False).drop_duplicates(["player", "market"])
     st_ = cfg["staking"]
     cap_day = cfg["strategy_profiles"][cfg["strategy_profile"]]["max_units_per_day"] - cfg.get("used_units", 0.0)
-    kept, pp, pg, total = [], {}, {}, 0.0
+    kept, pp, pg, total, ng = [], {}, {}, 0.0, {}
     for _, b in bets.iterrows():
         if pp.get(b["player"], 0) >= st_["max_props_per_player"]:
             continue
         if pg.get(b["game_id"], 0) + b["units"] > st_["max_units_per_game"] or total + b["units"] > cap_day:
             continue
+        if ng.get(b["game_id"], 0) >= st_.get("max_bets_per_game", 99):  # Sun 10/25: 69% of the money rode on one game
+            continue
+        ng[b["game_id"]] = ng.get(b["game_id"], 0) + 1
         kept.append(b)
         pp[b["player"]] = pp.get(b["player"], 0) + 1
         pg[b["game_id"]] = pg.get(b["game_id"], 0) + b["units"]
@@ -1191,16 +1220,26 @@ CONFIG = {
             "role_weight": 0.4, "wo_min_k": 32,
             "styles": {"k_players": 8, "k_def": 4, "k_off": 4, "min_minutes": 150, "team_prior_games": 12,
                        "prev_weight": 1.0, "shrink_games": 250, "home_shrink_games": 400, "cap": 0.06, "strength": 1.0,
-                       # backtest 2025-26 (9k player-games/market): helps points (log-loss t=-2.3) and assists (MAE
-                       # t=-3.4); hurt rebounds/steals/blocks -> those show the style only, number unchanged
-                       "apply": ["pts", "ast"]},
+                       # v2.3 two-season test: assists better in BOTH seasons (MAE t=-3.4 2025-26, -3.2 2024-25);
+                       # points helped 2025-26 but HURT 2024-25 (t=+4.2) -> dropped; reb/stl/blk hurt -> display only.
+                       # 343 continuous trait x defense pairs (slasher x rim protection, PnR x switching, shooter x
+                       # threes allowed, ...) tested on top of defense-vs-position: none beat it in both seasons.
+                       "apply": ["ast"]},
             "new_team_sd_mult": 1.05, "early_sd_mult": 1.0,
-            "prob_calibration_shrink": 0.8, "max_market_gap": 0.15, "min_minutes_to_bet": 20},
+            "prob_calibration_shrink": 0.8, "max_market_gap": 0.15, "min_minutes_to_bet": 20,
+            # v2.3 calibration map (see cal_prob): cross-season test 2024-25 <-> 2025-26 log-loss better both ways
+            # (t=+3.6 / +7.8); 0-10% bucket 12% -> 4% predicted (actual 4-5%), 80-90% 78-80% -> 84% (actual 82-85%)
+            "prob_map": {"x": [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.3, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.4, 0.41, 0.42, 0.43, 0.44, 0.45, 0.46, 0.47, 0.48, 0.49, 0.5, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.6, 0.61, 0.62, 0.63, 0.64, 0.65, 0.66, 0.67, 0.68, 0.69, 0.7, 0.71, 0.72, 0.73, 0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.8, 0.81, 0.82, 0.83, 0.84, 0.85, 0.86, 0.87, 0.88, 0.89, 0.9, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.0],
+                         "y": [0.0, 0.0243, 0.0275, 0.0517, 0.0607, 0.12, 0.1216, 0.1236, 0.1271, 0.1305, 0.1339, 0.1407, 0.1485, 0.1563, 0.1648, 0.1735, 0.1824, 0.1919, 0.203, 0.2142, 0.2208, 0.2292, 0.2382, 0.2472, 0.2535, 0.2571, 0.276, 0.2954, 0.3047, 0.3208, 0.3319, 0.3421, 0.3508, 0.3596, 0.3693, 0.38, 0.388, 0.396, 0.404, 0.412, 0.42, 0.428, 0.436, 0.444, 0.452, 0.46, 0.468, 0.476, 0.484, 0.492, 0.5, 0.508, 0.516, 0.524, 0.532, 0.54, 0.548, 0.556, 0.564, 0.572, 0.58, 0.588, 0.596, 0.604, 0.612, 0.62, 0.6288, 0.637, 0.6442, 0.6523, 0.6605, 0.6695, 0.6795, 0.6896, 0.6984, 0.7056, 0.7142, 0.7251, 0.7367, 0.7523, 0.7703, 0.7838, 0.797, 0.8101, 0.8247, 0.8288, 0.8406, 0.8524, 0.8588, 0.8637, 0.8734, 0.8824, 0.9037, 0.9109, 0.9134, 0.9187, 0.9324, 0.9461, 0.9798, 1.0, 1.0]}},
   "tiers": {"tier_1": {"min_edge": 0.04, "min_prob": 0.55, "max_units": 3.0},
             "tier_2": {"min_edge": 0.03, "min_prob": 0.52, "max_units": 2.0},
             "tier_3": {"min_edge": 0.025, "min_prob": 0.30, "max_units": 1.0}},
-  "staking": {"straight_max_odds": 200, "kelly_fraction": 0.25, "questionable_stake_mult": 0.5, "max_props_per_player": 1, "max_units_per_game": 4},
+  "staking": {"straight_max_odds": 200, "kelly_fraction": 0.25, "questionable_stake_mult": 0.5, "max_props_per_player": 1, "max_units_per_game": 4,
+              "max_bets_per_game": 2},
   "parlays": {"enabled": False, "max_legs": 3, "units": 0.5},
+  # hold on one-sided "X+" prices with no main line to anchor them (placeholder until `vig` measures it: the old flat
+  # 7% is kept for near-even prices; long shots carry more hold at every book we've seen -> assumed higher)
+  "one_sided_hold": {"short": 0.07, "mid": 0.07, "long": 0.15, "short_to": -200, "long_from": 150},
 }
 
 def _cfg(a):
@@ -1305,7 +1344,7 @@ def cmd_board(a):
     cfg = _cfg(a)
     date, state, sched = _setup(a, cfg)
     inj = parse_injuries(a.injuries)
-    games = load_games_file(a.games)
+    games = guard_games(load_games_file(a.games), sched, date)
     day = sched[sched["date"] == date]
     teams = set(day["home"]) | set(day["away"])
     if a.team:
@@ -1487,8 +1526,8 @@ def find_middles(props, proj, cfg, max_cost=0.12):
                 worst = min(d1 - 2, d2 - 2)  # one side wins, the other loses ($1 each)
                 if worst < -max_cost:
                     continue
-                p_hi = 0.5 + (prob_over(mu, var, mk, l2 - 0.0) - 0.5) * shrink   # over the high line
-                p_lo = 0.5 + (prob_over(mu, var, mk, l1) - 0.5) * shrink         # over the low line
+                p_hi = cal_prob(prob_over(mu, var, mk, l2 - 0.0))   # over the high line
+                p_lo = cal_prob(prob_over(mu, var, mk, l1))         # over the low line
                 p_mid = max(p_lo - p_hi, 0.0)
                 p_below = 1 - p_lo
                 ev = p_mid * (d1 + d2 - 2) + p_hi * (d1 - 2) + p_below * (d2 - 2)
@@ -1508,7 +1547,7 @@ def cmd_check(a):
     date, state, sched = _setup(a, cfg)
     props = _read_props(a.props)
     inj = parse_injuries(a.injuries)
-    games = load_games_file(a.games)
+    games = guard_games(load_games_file(a.games), sched, date)
     day = sched[sched["date"] == date] if len(sched) else sched
     if len(day):
         tonight = {frozenset((h, w)) for h, w in zip(day["home"], day["away"])}
@@ -1517,6 +1556,13 @@ def cmd_check(a):
         print(f"SPREADS: {n}/{len(tonight)} of tonight's games have a spread"
               + ("" if n == len(tonight) else " -> missing games get no blowout adjustment"
                  + (" (spreads page looks stale: re-fetch with ?date=D)" if n == 0 else "")))
+    if len(day) and props["team"].map(lambda t: isinstance(t, tuple)).any():
+        # date guard on the props file itself (screenshots / recordings go straight to check, not through `lines`)
+        ok = props["team"].map(lambda t: not isinstance(t, tuple) or frozenset(t) in tonight)
+        if (~ok).any():
+            print(f"  ! DATE GUARD props: dropped {int((~ok).sum())} of {len(props)} rows whose matchup isn't on the "
+                  f"{date.date()} schedule ({', '.join(sorted({f'{t[0]} @ {t[1]}' for t in props.loc[~ok, 'team']}))})")
+        props = props[ok].reset_index(drop=True)
     proj, overrides, outs = _prepare(state, sched, date, list(zip(props["player"], props["team"])), inj, games, cfg)
     props["pid"] = [state.find(n) for n in props["player"]]
     print(f"USAGE MODEL: {len(outs)} players Out/Doubtful with a role -> minutes and usage redistributed"
@@ -1643,7 +1689,8 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             return r, (s or {}).get("leg_prob", (s or {}).get("prob")), sug, s
         stake, boost = float(b["stake"]), _num(b["boost_pct"])
         r.update({"bet_type": "straight", "units": round(stake / unit, 2), "stake_usd": stake,
-                  "boost_pct": boost or np.nan})
+                  "boost_pct": boost or np.nan, "face_usd": _face(b), "bonus_bet": _bonus(b),
+                  "rec_units": (s or {}).get("rec_units", 0.0) if sug else 0.0})
         if odds is None:
             r.update({"tier": "unscored", "source": "unscored: odds unreadable", "vpe_verdict": "unscored"})
             return r, None, sug, s
@@ -1653,6 +1700,10 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             r.update({"tier": "unscored", "source": "unscored: " + why, "vpe_verdict": "unscored"})
         else:
             te, v, eb, ee = rate_pick(s["prob"], odds, eff, cfg, sug)
+            mo = s.get("min_odds")
+            if mo is not None and pd.notna(mo) and american_to_decimal(odds) < american_to_decimal(mo) - 1e-9:
+                v = f"SKIP rule broken: {int(odds):+d} worse than take-if {int(mo):+d}"
+                r["note"] = (r["note"] + " [below take-if]").strip()
             r.update({"tier": te or "off_model", "source": "engine" if te else "off_model", "vpe_verdict": v,
                       "edge_base": eb, "edge": ee, "ev_per_unit": round(ev_per_unit(s["prob"], eff), 3)})
         return r, None, sug, s
@@ -1669,11 +1720,15 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         probs = [o[1] for o in out]
         teams = [frozenset((o[3]["team"], o[3]["opp"])) for o in out if o[3]]
         same_game = len(teams) != len(set(teams))
+        # a placed parlay is a VPE pick only if it is EXACTLY a parlay VPE built tonight (same legs, nothing added/removed)
+        lk = frozenset((norm_name(o[0]["player"]), o[0]["market"], o[0]["side"]) for o in out)
+        vpe_par = next((v for v in VPE_PARLAYS if frozenset((norm_name(x[0]), x[1], x[2]) for x in v["legs"]) == lk), None)
         r = {**stamp, "logged_at": now, "bet_type": "parlay", "parlay_id": f"{tag}-{p}", "market": "parlay",
              "player": " + ".join(f"{o[0]['player']} {o[0]['side']} {o[0]['line']:g} {o[0]['market']}" for o in out),
              "side": np.nan, "odds": podds, "book": _book(b0), "units": round(stake / unit, 2),
-             "stake_usd": stake, "boost_pct": boost or np.nan,
-             "suggested": "unknown" if any(o[2] is None for o in out) else ("yes" if all(o[2] for o in out) else "no"),
+             "stake_usd": stake, "boost_pct": boost or np.nan, "face_usd": _face(b0), "bonus_bet": _bonus(b0),
+             "suggested": "yes" if vpe_par else "no",
+             "rec_stake_usd": vpe_par["stake_usd"] if vpe_par else 0.0,
              "note": ("same-game legs: model treats them as independent, real odds of all hitting differ. " if same_game else "")
                      + ("" if pd.isna(b0["note"]) else str(b0["note"]))}
         if podds is None:
@@ -1681,7 +1736,10 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         else:
             eff = boosted_american(podds, boost)
             r["odds_eff"] = eff
-            if any(x is None for x in probs):
+            if same_game:
+                r.update({"tier": "sgp_correlated", "vpe_verdict": "same-game parlay: legs correlated, EV not rated "
+                          "(use the sgp command before placing)"})
+            elif any(x is None for x in probs):
                 r.update({"tier": "unscored", "vpe_verdict": "unscored (a leg has no projection)"})
             else:
                 prob = float(np.prod(probs))
@@ -1694,6 +1752,16 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         rows.append(r)
     return rows
 
+VPE_PARLAYS = []  # parlays VPE built this run (vpe_parlays.json, written by `parlay`), loaded by `log`
+
+def _face(b):
+    v = pd.to_numeric(b.get("face", np.nan) if hasattr(b, "get") else np.nan, errors="coerce")
+    return float(v) if pd.notna(v) else np.nan
+
+def _bonus(b):
+    v = str(b.get("bonus", "") if hasattr(b, "get") else "").strip().lower()
+    return "yes" if v in ("yes", "y", "true", "1", "bonus") else ""
+
 def _book(b):
     """Book from placed.csv (optional `book` column: DraftKings / FanDuel); default DraftKings."""
     v = str(b.get("book", "") if hasattr(b, "get") else "").strip()
@@ -1701,11 +1769,19 @@ def _book(b):
         v.lower().replace(" ", ""), v if v and v.lower() != "nan" else "DraftKings")
 
 def win_profit(r):
-    """Units won on a WIN at the effective (boosted) odds."""
+    """Units won on a WIN at the effective (boosted) odds. Bankroll rule: stake_usd = total CHARGED (bet + 3% Bet
+    Protect+ fee); face_usd = the bet amount the payout is based on. Bonus bet: stake_usd = the fee only and the bonus
+    stake itself is not returned."""
     o = r.get("odds_eff")
     o = r.get("odds") if o is None or pd.isna(o) else o
     if not r["units"] or o is None or pd.isna(o):
         return 0.0
+    face, charged = pd.to_numeric(r.get("face_usd"), errors="coerce"), pd.to_numeric(r.get("stake_usd"), errors="coerce")
+    if pd.notna(face) and face > 0 and pd.notna(charged) and charged > 0:
+        unit = charged / r["units"]
+        bonus = str(r.get("bonus_bet", "")).strip().lower() in ("yes", "true", "1")
+        won = face * (american_to_decimal(o) - (1 if bonus else 0)) - charged
+        return round(won / unit, 3)
     return round(r["units"] * (american_to_decimal(o) - 1), 3)
 
 def settle_parlays(log):
@@ -1856,7 +1932,7 @@ def cmd_parlay(a):
     print(pool.head(6)[cols].to_string(index=False) if len(pool) else "none")
     print(f"STAKE: ${stake:.2f} per parlay ({PARLAY['stake_pct']:.0%} of ${bank:.0f} bankroll unless --stake given)"
           + (f" | {boost:g}% profit boost -> its own BOOST parlay at {BOOK_NAME.get(bbook, bbook)}" if boost else ""))
-    keys = []
+    keys, built = [], []
     for name, target in PARLAY["targets"]:
         found, free = [], []
         for bk in PARLAY["books"]:
@@ -1898,8 +1974,22 @@ def cmd_parlay(a):
         print(f"  -> build it at {BOOK_NAME[bk]}; if its parlay odds (before boost) are below {decimal_to_american(need):+d}"
               f" or a leg is worse than take_min, rerun with --exclude")
         keys += [(c["player"], c["market"], c["side"]) for c in combo]
-    if boost:
-        print_boost(a, allp, stake, cols, keys)
+        built.append({"name": name, "target": target, "book": bk, "odds": decimal_to_american(dec), "hit": round(p, 4),
+                      "stake_usd": stake, "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]})
+    bp = print_boost(a, allp, stake, cols, keys) if boost else None
+    if bp:
+        built.append(bp)
+    # ONE-PARLAY RULE (10/21-10/26: parlays were the whole loss, -$15.14 of -$15.89): recommend ONE parlay a night:
+    # the BOOST parlay if there is one (+EV at market odds alone), else the biggest VPE could build (~10x), else ~4x.
+    if built:
+        rec = bp or max(built, key=lambda b: b["target"])
+        rec["recommended"] = True
+        print(f"\nONE-PARLAY RULE: place ONLY the {rec['name']} parlay at {BOOK_NAME[rec['book']]} "
+              f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}). Any other parlay above = reference only.")
+    else:
+        print("\nONE-PARLAY RULE: no VPE parlay tonight -> place none.")
+    import json
+    json.dump(built, open(getattr(a, "parlays_out", None) or "vpe_parlays.json", "w"), indent=1)
     if len(pool):
         keys += list(zip(pool.head(6)["player"], pool.head(6)["market"], pool.head(6)["side"]))
     if a.bets and os.path.exists(a.bets):
@@ -2139,6 +2229,8 @@ def print_boost(a, allp, stake, cols, keys):
     if a.boost_max_win:
         print(f"  (boost winnings capped at ${a.boost_max_win:g}: counted)")
     keys += [(c["player"], c["market"], c["side"]) for c in combo]
+    return {"name": f"BOOST {boost:g}%", "target": 0, "book": bbook, "odds": decimal_to_american(dec), "hit": round(p, 4),
+            "stake_usd": stake, "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]}
 
 
 
@@ -2209,7 +2301,7 @@ def cmd_final(a):
     print("=== FINAL CHECK (closing prices recorded) ===")
     print(out.to_string(index=False) if len(out) else "slip empty")
     if a.log and os.path.exists(a.log) and len(out):
-        log = pd.read_csv(a.log, dtype={"result": "object"})
+        log = read_log(a.log)
         if "closing_odds" not in log:
             log["closing_odds"] = np.nan
         n = 0
@@ -2232,7 +2324,19 @@ def cmd_final(a):
 LOG_COLS = ["season", "date", "logged_at", "player", "team", "opp", "market", "side", "line", "odds", "book", "tier",
             "units", "stake_usd", "source", "model_prob", "edge", "ev_per_unit", "closing_odds", "actual", "result",
             "profit_units",
-            "bet_type", "parlay_id", "suggested", "vpe_verdict", "boost_pct", "odds_eff", "edge_base", "note"]
+            "bet_type", "parlay_id", "suggested", "vpe_verdict", "boost_pct", "odds_eff", "edge_base", "note",
+            "face_usd", "bonus_bet", "rec_units", "rec_stake_usd"]
+LOG_NUM = ["season", "line", "odds", "units", "stake_usd", "model_prob", "edge", "ev_per_unit", "closing_odds", "actual",
+           "profit_units", "boost_pct", "odds_eff", "edge_base", "face_usd", "rec_units", "rec_stake_usd"]
+
+def read_log(path):
+    """Pick log CSV: every column read as text first (a float written into a text column crashed pandas), then the
+    numeric ones converted."""
+    d = pd.read_csv(path, dtype=object)
+    for c in LOG_NUM:
+        if c in d:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    return d
 
 # ---------- Google Sheet sync: the Pick Log sheet is the source of truth ----------
 def _cell(v):
@@ -2273,7 +2377,7 @@ def cmd_sheet(a):
         df.to_csv(a.log, index=False)
         print(f"pulled {len(df)} rows -> {a.log}")
     else:
-        log = pd.read_csv(a.log, dtype={"result": "object"})
+        log = read_log(a.log)
         out = sheet_rows(log, header=True)
         json.dump(out, open(a.out, "w"))
         print(f"{len(out) - 1} rows + header -> {a.out} (write it at A1 of the tab with update_values)")
@@ -2292,13 +2396,20 @@ def cmd_log(a):
         if hit.empty:
             return None, "no projection saved for this player/market (run check first)"
         h = hit.iloc[0]
-        po = 0.5 + (prob_over(h["mean"], h["var"], mk, line) - 0.5) * shrink
+        po = cal_prob(prob_over(h["mean"], h["var"], mk, line))
         pr = po if side == "Over" else 1 - po
         mp = market_prob_for(allp, player, mk, side, line, odds)
         pb = blend_leg(pr, mp, mk, side)
-        return {"prob": pb, "leg_prob": pb, "team": h["team"], "opp": h["opp"]}, ""
+        ex = hit[(hit["side"] == side) & (pd.to_numeric(hit["line"], errors="coerce") == float(line))]
+        e0 = ex.iloc[0] if len(ex) else None
+        return {"prob": pb, "leg_prob": pb, "team": h["team"], "opp": h["opp"],
+                "rec_units": float(e0["units"]) if e0 is not None and pd.notna(e0.get("units")) else 0.0,
+                "min_odds": e0.get("min_odds") if e0 is not None else None}, ""
 
     slip = slip_keys(a.slip)
+    import json as _j
+    pp_ = getattr(a, "parlays", None) or "vpe_parlays.json"
+    VPE_PARLAYS[:] = _j.load(open(pp_)) if os.path.exists(pp_) else []
     stamp = {"season": season_for(today_et()),
              "date": allp["date"].iloc[0] if len(allp) else str(today_et().date())}
     rows = build_log_rows(pd.read_csv(a.placed, dtype=str), score, cfg, unit, slip, stamp)
@@ -2308,7 +2419,7 @@ def cmd_log(a):
         return
     new = pd.DataFrame(rows).reindex(columns=LOG_COLS)
     if os.path.exists(a.log):
-        new = pd.concat([pd.read_csv(a.log, dtype={"result": "object"}), new], ignore_index=True).reindex(columns=LOG_COLS)
+        new = pd.concat([read_log(a.log), new], ignore_index=True).reindex(columns=LOG_COLS)
     new.to_csv(a.log, index=False)
     print_logged(rows)
     import json
@@ -2320,7 +2431,7 @@ def cmd_log(a):
 
 def cmd_grade(a):
     cfg = _cfg(a)
-    log = pd.read_csv(a.log, dtype={"result": "object"})
+    log = read_log(a.log)
     for c in ("actual", "profit_units", "closing_odds", "odds_eff"):
         log[c] = pd.to_numeric(log.get(c), errors="coerce")
     for c in ("bet_type", "parlay_id", "suggested", "vpe_verdict"):
@@ -2373,6 +2484,406 @@ def cmd_grade(a):
             clv = c["closing_odds"].astype(float).map(implied_prob) - c["odds"].astype(float).map(implied_prob)
             print(f"CLV: {len(c)} bets with a closing price | beat the close {(clv > 0).mean():.0%} | avg {clv.mean():+.3f} prob pts")
 
+
+# ==================== game lines + same-game parlays (RATE-ONLY) ====================
+# Built in the run chat 10/26 (vpe_sgp.py / team_model.py / nba_corr.json), folded in here in v2.3.
+# Team ratings: opponent-adjusted offense/defense points, ridge, time-decayed (half-life 60 days), last season as prior.
+# Injury-aware (v2.3): each missing rotation player costs his team INJ_BETA x (his game score per minute above
+# replacement x his minutes x how often he has been playing lately) points of margin. Walk-forward 2025-26: model
+# margin MAE 11.84 -> 11.42 (t=+3.5) and 11.11 -> 10.99 in the other half; totals NOT adjusted (didn't help).
+# Honest status: vs DK CLOSING lines the market alone is best (any model weight made MAE worse). vs OPENING lines the
+# injury-aware model adds value (open MAE 11.31 -> 11.25 at 30% model) and its gap predicts where the line moves
+# (corr 0.47). So a game-line edge exists only BEFORE the line moves -> rate-only until CLV shows it in real bets.
+GAME = {"model_w": 0.30, "sd_margin": 12.5, "sd_total": 18.0, "held_margin": 4.0, "held_total": 6.0,
+        "inj_beta": 0.42, "repl_gs_per_min": 0.25, "half_life": 60, "lam": 2.0, "prior_w": 6.0}
+SGP_CORR = {"sdM_market": 12.5, "sdT_market": 18.0, "bins": [0, 5, 10, 15, 20, 100], "stats": ["pts", "reb", "ast", "fg3m"], "starter": {"pts": {"bT": 0.16, "bM": 0.095, "shift": [0.045, 0.092, 0.035, 0.002, -0.164], "res_sd": 1.007}, "reb": {"bT": -0.05, "bM": 0.057, "shift": [0.096, 0.116, 0.02, -0.079, -0.17], "res_sd": 1.015}, "ast": {"bT": 0.113, "bM": 0.098, "shift": [0.004, 0.026, 0.017, 0.02, -0.058], "res_sd": 1.024}, "fg3m": {"bT": 0.105, "bM": 0.095, "shift": [-0.001, 0.02, 0.022, 0.035, -0.061], "res_sd": 0.976}}, "bench": {"pts": {"bT": 0.076, "bM": 0.035, "shift": [-0.044, -0.009, -0.048, -0.038, 0.093], "res_sd": 0.934}, "reb": {"bT": -0.056, "bM": 0.017, "shift": [0.04, 0.006, -0.03, -0.044, 0.016], "res_sd": 0.945}, "ast": {"bT": 0.062, "bM": 0.041, "shift": [-0.041, -0.001, -0.03, -0.038, 0.072], "res_sd": 0.931}, "fg3m": {"bT": 0.061, "bM": 0.043, "shift": [-0.02, -0.006, -0.017, -0.036, 0.052], "res_sd": 0.89}}, "within": [[1.0, 0.333, 0.209, 0.661], [0.333, 1.0, 0.255, 0.153], [0.209, 0.255, 1.0, 0.112], [0.661, 0.153, 0.112, 1.0]], "teammate": [[-0.009, 0.028, 0.049, -0.019], [0.028, 0.004, 0.016, 0.007], [0.049, 0.016, 0.003, 0.035], [-0.019, 0.007, 0.035, -0.014]], "opponent": [[0.012, 0.007, 0.008, 0.006], [0.007, 0.015, 0.006, 0.006], [0.008, 0.006, 0.006, 0.005], [0.006, 0.006, 0.005, 0.001]]}
+
+def _team_games(box):
+    b = box[box["played"]]
+    return b.groupby(["game_id", "date", "team", "opp", "home"])["pts"].sum().reset_index()
+
+def _fit_ratings(games, asof, half_life=40, lam=4.0, prior=None, prior_w=10.0):
+    g = games[games["date"] < asof]
+    teams = sorted(set(games["team"]) | set(games["opp"]))
+    ix = {t: i for i, t in enumerate(teams)}; n = len(teams)
+    w = 0.5 ** ((asof - g["date"]).dt.days.to_numpy() / half_life)
+    X = np.zeros((len(g), 2 * n + 2)); X[:, 0] = 1
+    X[np.arange(len(g)), 1] = np.where(g["home"].to_numpy(), 1.0, -1.0) / 2
+    X[np.arange(len(g)), 2 + g["team"].map(ix).to_numpy()] = 1
+    X[np.arange(len(g)), 2 + n + g["opp"].map(ix).to_numpy()] = 1
+    y = g["pts"].to_numpy(float); W = np.sqrt(w)[:, None]
+    P = np.eye(2 * n + 2) * lam; P[0, 0] = P[1, 1] = 1e-6
+    target = np.zeros(2 * n + 2)
+    if prior is not None:
+        _, _, po, pdf = prior
+        for t, i in ix.items():
+            target[2 + i] = po.get(t, 0.0); target[2 + n + i] = pdf.get(t, 0.0)
+        P[2:, 2:] = np.eye(2 * n) * prior_w
+    beta = np.linalg.solve((X * W).T @ (X * W) + P, (X * W).T @ (y * np.sqrt(w)) + P @ target)
+    return beta[0], beta[1], {t: beta[2 + i] for t, i in ix.items()}, {t: beta[2 + n + i] for t, i in ix.items()}
+
+def _predict(model, home, away):
+    mu, hca, off, deff = model
+    ph = mu + hca / 2 + off.get(home, 0) + deff.get(away, 0)
+    pa = mu - hca / 2 + off.get(away, 0) + deff.get(home, 0)
+    return ph - pa, ph + pa
+
+def team_ratings(state, date):
+    prev = getattr(state, "pv_box", None)
+    gp = _team_games(prev) if prev is not None and len(prev) else None
+    prior = _fit_ratings(gp, gp["date"].max() + pd.Timedelta(days=1), GAME["half_life"], GAME["lam"]) if gp is not None else None
+    gc = _team_games(state.cur) if len(state.cur) else None
+    if gc is None or not len(gc):
+        return prior
+    return _fit_ratings(gc, pd.Timestamp(date), GAME["half_life"], GAME["lam"], prior=prior, prior_w=GAME["prior_w"])
+
+def player_value(state, pid, team):
+    """Points of margin a player is worth to his team tonight: game score per minute above replacement x minutes x
+    how often he has been playing (a long absence is already in the team rating -> small)."""
+    P = state.players
+    if pid not in P.index:
+        return 0.0
+    r = P.loc[pid]
+    ftm = max(r["r_pts"] - 2 * r["r_fgm"] - r["r_fg3m"], 0)
+    gs = (r["r_pts"] + 0.4 * r["r_fgm"] - 0.7 * r["r_fga"] - 0.4 * (r["r_fta"] - ftm) + 0.7 * r["r_oreb"] + 0.3 * r["r_dreb"]
+          + r["r_stl"] + 0.7 * r["r_ast"] + 0.7 * r["r_blk"] - 0.4 * r["r_pf"] - r["r_tov"])
+    av = state.avail.get((team, pid), 0.6)
+    return max(gs - GAME["repl_gs_per_min"], 0) * float(r["min"]) * av
+
+def injury_shift(state, outs):
+    """Home-margin shift per game: sum over each team's Out/Doubtful players of inj_beta x value."""
+    lost = {}
+    if outs is not None and len(outs):
+        for _, o in outs.iterrows():
+            if o["min"] >= 12:
+                lost[o["team"]] = lost.get(o["team"], 0.0) + player_value(state, o["pid"], o["team"])
+    return lost
+
+def game_center(model, home, away, mkt_spread, mkt_total, lost=None):
+    m_mod, t_mod = _predict(model, home, away)
+    lost = lost or {}
+    m_mod += GAME["inj_beta"] * (lost.get(away, 0.0) - lost.get(home, 0.0))
+    m_mkt = -mkt_spread if mkt_spread is not None and not pd.isna(mkt_spread) else m_mod
+    t_mkt = mkt_total if mkt_total is not None and not pd.isna(mkt_total) else t_mod
+    w = GAME["model_w"]
+    return w * m_mod + (1 - w) * m_mkt, w * t_mod + (1 - w) * t_mkt, m_mod, t_mod, m_mkt, t_mkt
+
+def cmd_games(a):
+    """Rate spreads / totals / moneylines. RATE-ONLY: never part of a slip until promoted (see skill)."""
+    cfg = _cfg(a)
+    date, state, sched = _setup(a, cfg)
+    model = team_ratings(state, date)
+    g = _read_loose_csv(a.games)
+    g["home"], g["away"] = g["home"].map(norm_team), g["away"].map(norm_team)
+    for c in g.columns:
+        if c not in ("home", "away"):
+            g[c] = pd.to_numeric(g[c].astype(str).str.replace("+", "", regex=False).replace({"PK": "0", "pk": "0"}), errors="coerce")
+    g = guard_games(g, sched, date)
+    inj = parse_injuries(a.injuries)
+    outs = build_outs(state, inj, {})
+    lost = injury_shift(state, outs)
+    rows, log = [], []
+    for _, r in g.iterrows():
+        home, away = r["home"], r["away"]
+        cm, ct, m_mod, t_mod, m_mkt, t_mkt = game_center(model, home, away, r.get("home_spread"), r.get("total"), lost)
+        inj_note = f"inj {GAME['inj_beta'] * (lost.get(away, 0) - lost.get(home, 0)):+.1f}" if (lost.get(home) or lost.get(away)) else ""
+        def leg(name, p, odds, gap, held_at):
+            odds = -110 if odds is None or pd.isna(odds) else int(odds)
+            edge = p - implied_prob(odds)
+            tier = _tier(edge, p, cfg)
+            held = tier is not None and gap > held_at
+            rows.append({"game": f"{away}@{home}", "bet": name, "odds": odds, "vpe_prob": round(p, 3), "edge": round(edge, 3),
+                         "verdict": "HELD (model vs market gap)" if held else (tier or "pass"),
+                         "model": f"margin {m_mod:+.1f} total {t_mod:.1f}", "market": f"margin {m_mkt:+.1f} total {t_mkt:.1f}",
+                         "injuries": inj_note})
+        hs = r.get("home_spread")
+        if pd.notna(hs):
+            ph = float(st.norm.sf(-hs, cm, GAME["sd_margin"]))
+            leg(f"{home} {hs:+g}", ph, r.get("spread_home_odds"), abs(m_mod - m_mkt), GAME["held_margin"])
+            leg(f"{away} {-hs:+g}", 1 - ph, r.get("spread_away_odds"), abs(m_mod - m_mkt), GAME["held_margin"])
+        tot = r.get("total")
+        if pd.notna(tot):
+            po = float(st.norm.sf(tot, ct, GAME["sd_total"]))
+            leg(f"Over {tot:g}", po, r.get("over_odds"), abs(t_mod - t_mkt), GAME["held_total"])
+            leg(f"Under {tot:g}", 1 - po, r.get("under_odds"), abs(t_mod - t_mkt), GAME["held_total"])
+        pw = float(st.norm.sf(0, cm, GAME["sd_margin"]))
+        if pd.notna(r.get("home_ml")):
+            leg(f"{home} ML", pw, r.get("home_ml"), abs(m_mod - m_mkt), GAME["held_margin"])
+            leg(f"{away} ML", 1 - pw, r.get("away_ml"), abs(m_mod - m_mkt), GAME["held_margin"])
+        log.append([str(date.date()), away, home, round(m_mod, 2), round(t_mod, 2),
+                    "" if pd.isna(hs) else float(hs), "" if pd.isna(tot) else float(tot), inj_note, "", ""])
+    out = pd.DataFrame(rows)
+    pd.set_option("display.width", 250)
+    print(f"GAME MARKETS - RATE ONLY | prob = {1 - GAME['model_w']:.0%} market + {GAME['model_w']:.0%} injury-aware team ratings | "
+          f"HELD = model vs market gap > {GAME['held_margin']:g} margin / {GAME['held_total']:g} total")
+    print("  backtest: vs CLOSING lines the market alone is best; an edge can only exist before the line moves "
+          "(the model's gap predicted the open->close move, corr 0.47). Track CLV before trusting any of this.")
+    print(out.to_string(index=False) if len(out) else "no games")
+    out.to_csv(a.out, index=False)
+    import json
+    json.dump(log, open(a.log_out, "w"))
+    print(f"saved -> {a.out} | ratings log rows -> {a.log_out} (append to 'Games NBA'; grade with gamesgrade)")
+
+GAMES_COLS = ["date", "away", "home", "model_margin", "model_total", "home_spread", "total", "injuries", "act_margin", "act_total"]
+
+def cmd_gamesgrade(a):
+    """Fill actual margin/total into the 'Games NBA' rows and score model vs market so far (item 11: Sun 10/25 the
+    ratings' totals beat the market's 10 vs 15 pts on 5 games - only a real sample can say if that holds)."""
+    import json
+    vals = _values(a.json)
+    hdr, body = vals[0], vals[1:]
+    d = pd.DataFrame([list(r) + [""] * (len(hdr) - len(r)) for r in body], columns=hdr, dtype=object)
+    sched_all = []
+    for s_ in sorted({season_for(pd.Timestamp(x)) for x in d["date"] if x}):
+        p = _download(URLS["sched"].format(s=s_), os.path.join(CACHE, f"sched_{s_}.parquet"), 6)
+        sc = pd.read_parquet(p)
+        sched_all.append(pd.DataFrame({"date": pd.to_datetime(sc["game_date"]).dt.normalize().astype(str).str[:10],
+                                       "home": sc["home_abbreviation"].map(norm_team), "away": sc["away_abbreviation"].map(norm_team),
+                                       "hs": pd.to_numeric(sc["home_score"], errors="coerce"), "as": pd.to_numeric(sc["away_score"], errors="coerce"),
+                                       "done": sc["status_type_completed"].astype(bool)}))
+    S = pd.concat(sched_all)
+    S = S[S["done"]].set_index(["date", "away", "home"])
+    for i, r in d.iterrows():
+        k = (str(r["date"])[:10], r["away"], r["home"])
+        if k in S.index and str(r.get("act_margin", "")) in ("", "nan"):
+            x = S.loc[k]
+            x = x.iloc[0] if isinstance(x, pd.DataFrame) else x
+            d.at[i, "act_margin"], d.at[i, "act_total"] = float(x["hs"] - x["as"]), float(x["hs"] + x["as"])
+    for c in ("model_margin", "model_total", "home_spread", "total", "act_margin", "act_total"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    g = d.dropna(subset=["act_margin"])
+    json.dump([GAMES_COLS] + [[_cell(v) for v in r] for r in d.reindex(columns=GAMES_COLS).itertuples(index=False, name=None)],
+              open(a.out, "w"))
+    if len(g):
+        mm = (g["act_margin"] + g["home_spread"]).abs().mean()  # market margin = -home_spread
+        print(f"GAMES graded {len(g)} | margin MAE: market {(g['act_margin'] + g['home_spread']).abs().mean():.2f} vs ratings "
+              f"{(g['act_margin'] - g['model_margin']).abs().mean():.2f} | total MAE: market {(g['act_total'] - g['total']).abs().mean():.2f}"
+              f" vs ratings {(g['act_total'] - g['model_total']).abs().mean():.2f}")
+        print("  promote game lines only if the ratings beat the market's numbers over 100+ games AND game-line bets beat the close (CLV)")
+    print(f"full tab -> {a.out} (update_values at 'Games NBA'!A1)")
+
+# ---------- same-game parlay checker (RATE-ONLY) ----------
+# joint = product of each leg's VPE probability x LIFT, where LIFT = P(all hit) / product P(each) in 20,000 simulated
+# games: margin and total, blowout minutes, a player's own pts/reb/ast/3PM and teammates/opponents move together the
+# way they did in 2025-26 box scores (SGP_CORR). Validated lifts vs data: pts+PRA 1.69 (data 1.82), pts+reb 1.16 (1.21).
+SGP_N = 20000
+
+def _sgp_cov(signs):
+    W, TM, OP = np.array(SGP_CORR["within"]), np.array(SGP_CORR["teammate"]), np.array(SGP_CORR["opponent"])
+    k = len(signs); C = np.zeros((4 * k, 4 * k))
+    for i in range(k):
+        for j in range(k):
+            C[4 * i:4 * i + 4, 4 * j:4 * j + 4] = W if i == j else (TM if signs[i] == signs[j] else OP)
+    w, v = np.linalg.eigh((C + C.T) / 2)
+    C = v @ np.diag(np.clip(w, 1e-6, None)) @ v.T
+    d = np.sqrt(np.diag(C)); return C / np.outer(d, d)
+
+def _sgp_ppf(u, mu, var, continuous):
+    mu = max(mu, 0.01)
+    if continuous:
+        return st.norm.ppf(u, mu, math.sqrt(max(var, 1e-6)))
+    if var <= mu * 1.02:
+        return st.poisson.ppf(u, mu)
+    n = mu * mu / (var - mu)
+    return st.nbinom.ppf(u, n, n / (n + mu))
+
+def sgp_simulate(legs, proj, home, cm, ct, seed=7):
+    rng = np.random.default_rng(seed)
+    zM, zT = rng.standard_normal(SGP_N), rng.standard_normal(SGP_N)
+    M, T = cm + GAME["sd_margin"] * zM, ct + GAME["sd_total"] * zT
+    bins = np.array(SGP_CORR["bins"])
+    bidx = np.clip(np.searchsorted(bins, np.abs(M), side="right") - 1, 0, len(bins) - 2)
+    pids = list(dict.fromkeys(l["pid"] for l in legs if l["kind"] == "player"))
+    sign = [1 if proj.loc[p, "team"] == home else -1 for p in pids]
+    vals = {}
+    if pids:
+        E = rng.multivariate_normal(np.zeros(4 * len(pids)), _sgp_cov(sign), size=SGP_N, method="cholesky")
+        for i, p in enumerate(pids):
+            row = proj.loc[p]
+            role = "starter" if float(row.get("start_rate", 0) or 0) >= 0.5 else "bench"
+            for j, c in enumerate(SGP_CORR["stats"]):
+                prm = SGP_CORR[role][c]
+                L = prm["bT"] * zT + prm["bM"] * sign[i] * zM + np.array(prm["shift"])[bidx] + prm["res_sd"] * E[:, 4 * i + j]
+                u = (st.rankdata(L) - 0.5) / SGP_N
+                vals[(p, c)] = _sgp_ppf(u, float(row["mu_" + c]), float(row["var_" + c]), c in CONT)
+    hits = []
+    for l in legs:
+        if l["kind"] == "player":
+            if any((l["pid"], c) not in vals for c in MARKETS[l["market"]]):
+                raise SystemExit(f"{l['label']}: market not simulated (pts/reb/ast/3PM and their combos only)")
+            x = sum(vals[(l["pid"], c)] for c in MARKETS[l["market"]])
+            thr = math.floor(l["line"]) + 0.5
+            hits.append(x > thr if l["side"] == "Over" else x < thr)
+        elif l["kind"] == "spread":
+            hits.append((M if l["team"] == home else -M) + l["line"] > 0)
+        elif l["kind"] == "ml":
+            hits.append((M > 0) if l["team"] == home else (M < 0))
+        else:
+            hits.append(T > l["line"] if l["side"] == "Over" else T < l["line"])
+    return np.vstack([np.asarray(h) for h in hits])
+
+def _parse_sgp_leg(s_):
+    t = [x.strip() for x in s_.split(";")]
+    k = t[1].lower() if len(t) > 1 else ""
+    if k == "total":
+        return {"kind": "total", "side": t[2].title(), "line": float(t[3]), "label": f"Game {t[2].title()} {t[3]}"}
+    if k == "spread":
+        return {"kind": "spread", "team": norm_team(t[0]), "line": float(t[2]), "label": f"{t[0]} {float(t[2]):+g}"}
+    if k == "ml":
+        return {"kind": "ml", "team": norm_team(t[0]), "label": f"{t[0]} ML"}
+    return {"kind": "player", "name": t[0], "market": canon_market(t[1]), "side": t[2].title(), "line": float(t[3]),
+            "odds": t[4] if len(t) > 4 and t[4] else None, "label": f"{t[0]} {t[2].title()} {t[3]} {t[1]}"}
+
+def one_sided_fair(odds):
+    """No-vig chance for a price shown on ONE side only ('4+ assists +250'): implied / (1 + hold). The hold on these
+    markets is measured by the `vig` command; until it has data, the table in CONFIG is used."""
+    h = CONFIG["one_sided_hold"]
+    o = float(odds)
+    hold = h["long"] if o >= h["long_from"] else (h["short"] if o <= h["short_to"] else h["mid"])
+    return min(implied_prob(o) / (1 + hold), 0.97)
+
+def cmd_sgp(a):
+    cfg = _cfg(a)
+    date, state, sched = _setup(a, cfg)
+    inj = parse_injuries(a.injuries)
+    games = guard_games(load_games_file(a.games), sched, date)
+    legs = [_parse_sgp_leg(x) for x in a.leg]
+    players = [(l["name"], None) for l in legs if l["kind"] == "player"]
+    proj, _, outs = _prepare(state, sched, date, players, inj, games, cfg)
+    for l in legs:
+        if l["kind"] == "player":
+            l["pid"] = state.find(l["name"])
+            if l["pid"] is None or l["pid"] not in proj.index:
+                sys.exit(f"no projection for {l['name']} (not playing today / name mismatch)")
+    if len({frozenset((r["team"], r["opp"])) for _, r in proj.iterrows()}) > 1:
+        sys.exit("legs are from different games - this checker is for same-game parlays")
+    if len(proj):
+        r0 = proj.iloc[0]; home, away = (r0["team"], r0["opp"]) if r0["home"] else (r0["opp"], r0["team"])
+    else:
+        tms = {l.get("team") for l in legs if l.get("team")}
+        g0 = games[games["home"].isin(tms) | games["away"].isin(tms)].iloc[0]; home, away = g0["home"], g0["away"]
+    gm = games[(games["home"] == home) & (games["away"] == away)] if games is not None else pd.DataFrame()
+    hs = float(gm.iloc[0]["home_spread"]) if len(gm) and pd.notna(gm.iloc[0]["home_spread"]) else None
+    tot = float(gm.iloc[0]["total"]) if len(gm) and pd.notna(gm.iloc[0]["total"]) else None
+    cm, ct, *_ = game_center(team_ratings(state, date), home, away, hs, tot, injury_shift(state, outs))
+    H = sgp_simulate(legs, proj, home, cm, ct)
+    p_sim = H.mean(axis=1); lift = H.all(axis=0).mean() / max(np.prod(p_sim), 1e-9)
+    probs = []
+    for l, ps in zip(legs, p_sim):
+        if l["kind"] == "player":
+            r = proj.loc[l["pid"]]
+            po = cal_prob(prob_over(float(r["mu_" + l["market"]]), float(r["var_" + l["market"]]), l["market"], l["line"]))
+            p = po if l["side"] == "Over" else 1 - po
+            l["model_p"] = p
+            if l.get("odds"):
+                o = l["odds"]
+                mp = no_vig(*[float(x.replace("+", "")) for x in o.split("/")])[0] if "/" in o else one_sided_fair(o.replace("+", ""))
+                p = 0.5 * p + 0.5 * mp
+        else:
+            p = float(ps)
+        probs.append(p)
+    joint = min(float(np.prod(probs)) * lift, min(probs))
+    price = int(float(str(a.price).replace("+", ""))); dec = american_to_decimal(price)
+    ev = joint * dec - 1
+    print(f"\nSGP {away}@{home} - RATE ONLY | center: home margin {cm:+.1f}, total {ct:.1f} | {SGP_N:,} simulated games")
+    for l, p in zip(legs, probs):
+        extra = f" (model {l['model_p']:.1%}, 50/50 with book)" if l.get("odds") and l.get("model_p") is not None else ""
+        print(f"  {l['label']:42s} VPE {p:5.1%}{extra}")
+    print(f"  independent product {np.prod(probs):.2%} x correlation lift {lift:.2f} = joint {joint:.2%}")
+    print(f"  book price {price:+d} (implies {1 / dec:.2%}) | fair price {decimal_to_american(1 / joint):+d} | EV {ev:+.0%}")
+    print(f"  VERDICT: {'TAKE' if ev >= a.min_ev else 'SKIP'} (needs EV >= {a.min_ev:+.0%}; rate-only - correlations from last "
+          "season, not yet proven against real SGP results)")
+    if lift > 1.05:
+        print("  why: legs move together (shared minutes / pace / same-player stats) - the book may or may not price that in")
+    elif lift < 0.95:
+        print("  why: legs work AGAINST each other (e.g. blowout script vs starter Overs) - worse than it looks")
+
+def cmd_vig(a):
+    """Measure the hold on one-sided 'X+' prices (FanDuel milestones) against each player's main two-sided line:
+    hold = book implied / fair (fair = main line's no-vig chance carried to the milestone through the implied mean)."""
+    props = _read_props(a.props)
+    cfg = _cfg(a)
+    rows = []
+    for (pl, mk), g in props[props["market"].notna()].groupby(["player", "market"]):
+        main = [(float(r["line"]), no_vig(r["over_odds"], r["under_odds"])[0]) for _, r in g.iterrows()
+                if pd.notna(r["over_odds"]) and pd.notna(r["under_odds"])]
+        for _, r in g[g["under_odds"].isna() & g["over_odds"].notna()].iterrows():
+            fair = anchored_market_over(mk, float(r["line"]), main, cfg)
+            if fair is None or fair <= 0.01:
+                continue
+            rows.append({"player": pl, "market": mk, "line": r["line"], "odds": int(r["over_odds"]), "book": r.get("book", ""),
+                         "fair": round(fair, 4), "implied": round(implied_prob(r["over_odds"]), 4),
+                         "hold": round(implied_prob(r["over_odds"]) / fair - 1, 4)})
+    d = pd.DataFrame(rows)
+    if d.empty:
+        print("VIG: no one-sided rows with a main line to compare (need both the main O/U and the X+ ladder)"); return
+    d["band"] = pd.cut(d["odds"], [-10000, -200, 150, 100000], labels=["short (<=-200)", "mid", "long (>=+150)"])
+    print(d.groupby("band", observed=True)["hold"].agg(["size", "median", "mean"]).round(3).to_string())
+    d.to_csv(a.out, index=False)
+    print(f"rows -> {a.out} (append to the 'Vig' tab; after ~200 rows per band, set CONFIG one_sided_hold from the medians)")
+
+def cmd_frames(a):
+    """App screen recording -> still frames to read (item 2: recordings are now the main price source).
+    Extracts one frame every --every seconds, drops near-duplicates (scrolling pauses), writes frames/f_0001.png ...
+    Then read the frames and transcribe them into props.csv / games.csv (formats in the skill)."""
+    import subprocess, shutil, glob
+    os.makedirs(a.out, exist_ok=True)
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "imageio-ffmpeg", "--break-system-packages"], check=False)
+            import imageio_ffmpeg
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+    tmp = os.path.join(a.out, "_raw")
+    os.makedirs(tmp, exist_ok=True)
+    subprocess.run([ff, "-loglevel", "error", "-y", "-i", a.video, "-vf", f"fps=1/{a.every},scale=-2:1280",
+                    os.path.join(tmp, "r_%05d.png")], check=True)
+    from PIL import Image
+    kept, prev = [], None
+    for f in sorted(glob.glob(os.path.join(tmp, "r_*.png"))):
+        im = Image.open(f).convert("L").resize((90, 160))
+        arr = np.asarray(im, dtype=float)
+        if prev is None or np.abs(arr - prev).mean() > a.diff:
+            kept.append(f); prev = arr
+    for i, f in enumerate(kept[:a.max], 1):
+        shutil.copy(f, os.path.join(a.out, f"f_{i:04d}.png"))
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"FRAMES: {len(kept)} distinct screens kept (of the raw frames) -> {a.out}/f_0001.png ...; "
+          f"{'first ' + str(a.max) + ' written' if len(kept) > a.max else 'all written'}")
+
+def cmd_takeif(a):
+    """TAKE / SKIP for the price the app shows right now. Straight bets: VPE's min_odds (take-if). Parlay legs: the
+    leg's take_min. Anything not tiered tonight = SKIP (not a VPE pick at any price shown)."""
+    set_calib(getattr(a, "calib", None), SPORT)
+    allp = pd.read_csv(a.all)
+    pool = parlay_pool(allp)
+    for spec in a.bet:
+        t = [x.strip() for x in spec.split(";")]
+        if len(t) < 5:
+            print(f"{spec}: need Player;market;Side;line;odds"); continue
+        pl, mk, side, line, odds = t[0], canon_market(t[1]) or t[1], t[2].title(), float(t[3]), _odds(t[4])
+        k = norm_name(pl)
+        h = allp[(allp["player"].map(norm_name) == k) & (allp["market"] == mk) & (allp["side"] == side)
+                 & (pd.to_numeric(allp["line"], errors="coerce") == line)]
+        lg = pool[(pool["player"].map(norm_name) == k) & (pool["market"] == mk) & (pool["side"] == side)
+                  & (pd.to_numeric(pool["line"], errors="coerce") == line)] if len(pool) else pool
+        tag = f"{pl} {side} {line:g} {mk} @ {odds:+d}"
+        if h.empty:
+            print(f"{tag}: SKIP - not in tonight's run (different line? rerun check with this line)"); continue
+        r = h.iloc[0]
+        if pd.notna(r.get("tier")) and str(r.get("tier")) not in ("", "nan"):
+            mo = int(r["min_odds"]) if pd.notna(r.get("min_odds")) else None
+            ok = mo is None or american_to_decimal(odds) >= american_to_decimal(mo) - 1e-9
+            print(f"{tag}: {'TAKE' if ok else 'SKIP'} straight (take-if {mo:+d}, win chance {r['blend_prob']:.1%})" if mo is not None
+                  else f"{tag}: TAKE straight (win chance {r['blend_prob']:.1%})")
+        elif len(lg):
+            tm_ = int(lg.iloc[0]["take_min"])
+            ok = american_to_decimal(odds) >= american_to_decimal(tm_) - 1e-9
+            print(f"{tag}: {'TAKE' if ok else 'SKIP'} as a parlay leg only (take_min {tm_:+d}, leg prob {lg.iloc[0]['leg_prob']:.1%})")
+        else:
+            print(f"{tag}: SKIP - not a VPE pick at any price (win chance {r['blend_prob']:.1%}, needs {implied_prob(odds):.1%} + edge)")
 
 def cmd_status(a):
     """RUN STATUS gate: one block at the top of every slip, same checks in every chat and on every model.
@@ -2524,7 +3035,7 @@ def cmd_backtest(a):
     shrink = cfg["model"]["prob_calibration_shrink"]
     df["line"] = np.floor(df["naive"]) + 0.5
     df["p_raw"] = [prob_over(m, v, mk, l) for m, v, mk, l in zip(df["mu"], df["var"], df["market"], df["line"])]
-    df["p"] = 0.5 + (df["p_raw"] - 0.5) * shrink
+    df["p"] = cal_prob(df["p_raw"].to_numpy())
     df["over"] = (df["actual"] > df["line"]).astype(float)
     print(f"BACKTEST {start.date()}..{end.date()} every {a.step} day(s), {len(dates)} dates, off={a.off or 'none'}")
     print(f"{'market':7s} {'n':>6s} {'MAE':>6s} {'naive':>6s} {'bias':>6s} {'brier':>6s} {'b_naive':>7s} {'z_sd':>5s}")
@@ -2556,6 +3067,20 @@ if __name__ == "__main__":
     for name in ("board", "slate", "check"):
         sub.choices[name].add_argument("--injuries", help='"Name:Out;Name:Questionable;Name:Out:PHI"')
     sub.choices["styles"].add_argument("--team"); sub.choices["styles"].add_argument("--stat")
+    gm_ = sub.add_parser("games"); gm_.add_argument("--date"); gm_.add_argument("--games", required=True)
+    gm_.add_argument("--injuries", default=""); gm_.add_argument("--out", default="game_bets.csv")
+    gm_.add_argument("--log-out", default="games_log.json"); gm_.add_argument("--bankroll", type=float); gm_.add_argument("--profile")
+    gg_ = sub.add_parser("gamesgrade"); gg_.add_argument("--json", required=True); gg_.add_argument("--out", default="games_tab.json")
+    sp_ = sub.add_parser("sgp"); sp_.add_argument("--date"); sp_.add_argument("--games", required=True)
+    sp_.add_argument("--injuries", default=""); sp_.add_argument("--leg", action="append", required=True)
+    sp_.add_argument("--price", required=True); sp_.add_argument("--min-ev", type=float, default=0.10)
+    sp_.add_argument("--bankroll", type=float); sp_.add_argument("--profile")
+    vg_ = sub.add_parser("vig"); vg_.add_argument("--props", nargs="+", required=True); vg_.add_argument("--out", default="vig_obs.csv")
+    fr = sub.add_parser("frames"); fr.add_argument("--video", required=True); fr.add_argument("--out", default="frames")
+    fr.add_argument("--every", type=float, default=1.0); fr.add_argument("--diff", type=float, default=6.0)
+    fr.add_argument("--max", type=int, default=60)
+    tk = sub.add_parser("takeif"); tk.add_argument("--all", default="bets_all.csv"); tk.add_argument("--calib")
+    tk.add_argument("--bet", action="append", required=True, help='"Player;market;Side;line;odds" (repeat)')
     for name in ("board", "check"):
         sub.choices[name].add_argument("--games", help="CSV away,home,home_spread,total")
     sub.choices["board"].add_argument("--team"); sub.choices["board"].add_argument("--player")
@@ -2569,6 +3094,7 @@ if __name__ == "__main__":
     sub.choices["log"].add_argument("--placed", required=True); sub.choices["log"].add_argument("--log", default="nba_pick_log.csv")
     sub.choices["log"].add_argument("--all", default="bets_all.csv")
     sub.choices["log"].add_argument("--slip", default="bets.csv", help="tonight's slip from check (marks VPE picks)")
+    sub.choices["log"].add_argument("--parlays", default="vpe_parlays.json", help="parlays VPE built (from parlay)")
     sub.choices["grade"].add_argument("--log", default="nba_pick_log.csv"); sub.choices["grade"].add_argument("--actuals")
     sub.choices["backtest"].add_argument("--start", required=True); sub.choices["backtest"].add_argument("--end", required=True)
     sub.choices["backtest"].add_argument("--step", type=int, default=1); sub.choices["backtest"].add_argument("--off", default="")
@@ -2578,6 +3104,7 @@ if __name__ == "__main__":
     sub.choices["parlay"].add_argument("--stake", type=float, help="$ per parlay (default 5% of bankroll)")
     sub.choices["parlay"].add_argument("--exclude", help='players to leave out "A;B" (e.g. DK price failed take-if)')
     sub.choices["parlay"].add_argument("--slip-out", default="slip.csv")
+    sub.choices["parlay"].add_argument("--parlays-out", default="vpe_parlays.json")
     sub.choices["parlay"].add_argument("--boost", type=float, help="profit boost %% (gets its own BOOST parlay)")
     sub.choices["parlay"].add_argument("--boost-book", default="draftkings", help="draftkings|fanduel (where the boost is)")
     sub.choices["log"].add_argument("--sheet-out", default="sheet_new.json", help="new rows for the Pick Log sheet")
@@ -2613,4 +3140,5 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
-     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status, "styles": cmd_styles}[a.cmd](a)
+     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status, "styles": cmd_styles,
+     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "vig": cmd_vig}[a.cmd](a)

@@ -13,11 +13,12 @@ import numpy as np
 import os
 import pandas as pd
 import re
+import sys
 import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.5"
+VERSION = "NFL v15.6"
 
 # ==================== data ====================
 
@@ -67,7 +68,7 @@ def load_injuries(season, max_age_hours=6):
 _SUFFIX = re.compile(r"\b(jr|sr|ii|iii|iv|v)\b")
 
 def norm_name(name):
-    s = str(name).lower().replace(".", "").replace("'", "").replace("’", "").replace("-", " ")
+    s = str(name).lower().replace(".", "").replace(",", " ").replace("'", "").replace("’", "").replace("-", " ")
     s = _SUFFIX.sub("", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -182,7 +183,7 @@ class UsageModel:
         if team in self._outs_cache:
             return self._outs_cache[team]
         lt = self.latest
-        cand = lt[(lt["team"] == team) & (lt["_key"].isin(self.outs))]
+        cand = lt[(lt["team"] == team) & is_out(lt["_key"], lt["team"], self.outs)]
         res = []
         for pid, r in cand.iterrows():
             rows = self._prow(pid, team)
@@ -255,7 +256,7 @@ class UsageModel:
                 if vacated < 0.02:
                     continue
                 lt = self.latest
-                mates = lt[(lt["team"] == team) & (~lt["_key"].isin(self.outs)) & (lt["week"] >= self.week - 3)
+                mates = lt[(lt["team"] == team) & ~is_out(lt["_key"], lt["team"], self.outs) & (lt["week"] >= self.week - 3)
                            & (lt["position"] != "QB")]
                 out_pos = {o["pos"] for o in outs if o[o_col] > 0.05}
                 weights = {}
@@ -745,12 +746,15 @@ class Projector:
 
 ASSUMED_HOLD_ONE_SIDED = 0.07  # one-sided DK markets (anytime TD, milestones like 60+ yds): only for the info column
 
-def injury_status(injuries, overrides, name, team, week):
-    key = norm_name(name)
-    if overrides is not None and not overrides.empty:
-        o = overrides[overrides["_key"] == key]
-        if not o.empty:
-            return str(o.iloc[-1]["status"]).title()
+LONG_TERM = {"Ir", "Injured Reserve", "Out For Season", "Pup", "Nfi", "Suspended", "Reserve"}
+
+def _override_for(overrides, key, team):
+    if overrides is None or overrides.empty:
+        return None
+    o = overrides[(overrides["_key"] == key) & (overrides["team"].isna() | (overrides["team"] == team))]
+    return None if o.empty else str(o.iloc[-1]["status"]).title()
+
+def _official_for(injuries, key, team, week):
     if injuries is None or injuries.empty:
         return None
     inj = injuries[(injuries["week"] == week) & (injuries["team"] == team)]
@@ -758,21 +762,50 @@ def injury_status(injuries, overrides, name, team, week):
     if hit.empty:
         return None
     s = hit.iloc[-1]["report_status"]
-    return None if pd.isna(s) else str(s)
+    return None if pd.isna(s) else str(s).title()
+
+def injury_status(injuries, overrides, name, team, week):
+    """Official report wins. The chat's override string only decides for long-term absences (IR, out for season,
+    PUP, suspended) or when the official report doesn't list the player yet (reports post Wed-Fri). 10/25: a stale
+    override 'Questionable' hid a real official 'Out'."""
+    key = norm_name(name)
+    ov = _override_for(overrides, key, team)
+    if ov in LONG_TERM:
+        return ov
+    off = _official_for(injuries, key, team, week)
+    return off if off is not None else ov
 
 def build_outs(injuries, overrides, week):
+    """Players the usage model treats as out, as 'name|TEAM' keys (or plain 'name' when an override has no team).
+    Same precedence as injury_status: the official report wins unless the override is a long-term absence or the
+    report doesn't list the player."""
     outs = set()
+    listed = set()
     if injuries is not None and not injuries.empty:
-        inj = injuries[(injuries["week"] == week) & injuries["report_status"].isin(["Out", "Doubtful"])]
-        outs |= set(inj["full_name"].map(norm_name))
+        wk = injuries[injuries["week"] == week]
+        listed = {(norm_name(n), t) for n, t in zip(wk["full_name"], wk["team"])}
+        inj = wk[wk["report_status"].isin(["Out", "Doubtful"])]
+        outs |= {f"{norm_name(n)}|{t}" for n, t in zip(inj["full_name"], inj["team"])}
     if overrides is not None and not overrides.empty:
         for _, o in overrides.iterrows():
             st_ = str(o["status"]).title()
-            if st_ in ("Out", "Doubtful", "Ir"):
-                outs.add(o["_key"])
-            else:
-                outs.discard(o["_key"])
+            k, t = o["_key"], (None if pd.isna(o["team"]) else o["team"])
+            on_report = any(n == k and (t is None or tt == t) for n, tt in listed)
+            if st_ in LONG_TERM or (st_ in ("Out", "Doubtful") and not on_report):
+                outs.add(f"{k}|{t}" if t else k)
     return outs
+
+def is_out(keys, teams, outs):
+    """Vectorized: name key (+ team) is in the outs set built by build_outs."""
+    return pd.Series([f"{k}|{t}" in outs or k in outs for k, t in zip(keys, teams)], index=getattr(keys, "index", None))
+
+def cal_prob(p, shrink):
+    """Raw P(over) -> calibrated. With a prob_map in CONFIG (tails-only fix, like NBA v2.3) the map is used for every
+    market except anytime TD (shrink 1.0 there: Poisson already calibrated); otherwise the flat shrink."""
+    m = CONFIG["model"].get("prob_map")
+    if m and shrink != 1.0:
+        return float(np.interp(p, m["x"], m["y"]))
+    return 0.5 + (p - 0.5) * shrink
 
 def _take_if(p, line, side, prob, shrink, cfg):
     """Worst DraftKings price / line at which this side still clears Tier 3. Lines from free odds sites are
@@ -784,9 +817,9 @@ def _take_if(p, line, side, prob, shrink, cfg):
         return min_odds, None
     be110 = implied_prob(-110)
     limit, L = None, line
-    po0 = 0.5 + (Projector.prob_over(p, line) - 0.5) * shrink
+    po0 = cal_prob(Projector.prob_over(p, line), shrink)
     for _ in range(25):
-        po = 0.5 + (Projector.prob_over(p, L) - 0.5) * shrink
+        po = cal_prob(Projector.prob_over(p, L), shrink)
         po = (1 - prob if side == "Under" else prob) + PARLAY["model_weight"] * (po - po0)  # blended, moved with the line
         pr = po if side == "Over" else 1 - po
         if pr - be110 >= c["min_edge"] and pr >= c["min_prob"]:
@@ -825,6 +858,9 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
         if p is None:
             skipped.append((r["player"], mk, "not enough games / no game this week / wrong position"))
             continue
+        if p["game_id"] in cfg.get("started", set()):
+            skipped.append((p["player"], mk, "game already played / kicked off"))
+            continue
         status = injury_status(injuries, overrides, p["player"], p["team"], proj.week)
         if status in ("Out", "Doubtful", "Ir"):
             skipped.append((p["player"], mk, f"injury: {status}"))
@@ -833,7 +869,7 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
         line = float(r["line"])
         # calibration shrink from backtest.py (not for TD markets: Poisson is already calibrated there)
         shrink = 1.0 if mk == "anytime_td" else cfg["model"].get("prob_calibration_shrink", 1.0)
-        p_model_over = 0.5 + (Projector.prob_over(p, line) - 0.5) * shrink
+        p_model_over = cal_prob(Projector.prob_over(p, line), shrink)
         oo, uo = r.get("over_odds"), r.get("under_odds")
         if pd.notna(oo) and pd.notna(uo):
             fair_over, _ = no_vig(oo, uo)
@@ -898,7 +934,7 @@ def apply_caps(evald, cfg):
     max_pp = cfg["staking"]["max_props_per_player"]
     max_pg = cfg["staking"]["max_units_per_game"]
     max_week = cfg["strategy_profiles"][cfg["strategy_profile"]]["max_units_per_week"] - cfg.get("used_units", 0.0)
-    kept, per_player, per_game, total = [], {}, {}, 0.0
+    kept, per_player, per_game, total, ng = [], {}, {}, 0.0, {}
     for _, b in bets.iterrows():
         if per_player.get(b["player"], 0) >= max_pp:
             continue
@@ -906,6 +942,9 @@ def apply_caps(evald, cfg):
             continue
         if total + b["units"] > max_week:
             continue
+        if ng.get(b["game_id"], 0) >= cfg["staking"].get("max_bets_per_game", 99):  # NBA 10/25: 69% of $ on one game
+            continue
+        ng[b["game_id"]] = ng.get(b["game_id"], 0) + 1
         kept.append(b)
         per_player[b["player"]] = per_player.get(b["player"], 0) + 1
         per_game[b["game_id"]] = per_game.get(b["game_id"], 0) + b["units"]
@@ -1029,7 +1068,8 @@ CONFIG = {
   "tiers": {"tier_1": {"min_edge": 0.04, "min_prob": 0.55, "max_units": 3.0},
             "tier_2": {"min_edge": 0.03, "min_prob": 0.52, "max_units": 2.0},
             "tier_3": {"min_edge": 0.025, "min_prob": 0.30, "max_units": 1.0}},
-  "staking": {"kelly_fraction": 0.25, "questionable_stake_mult": 0.5, "max_props_per_player": 2, "max_units_per_game": 5},
+  "staking": {"kelly_fraction": 0.25, "questionable_stake_mult": 0.5, "max_props_per_player": 2, "max_units_per_game": 5,
+              "max_bets_per_game": 2},
   "parlays": {"enabled": False, "max_legs": 3, "allow_same_game": False, "min_leg_tier": "tier_1", "units": 0.5},
 }
 
@@ -1054,10 +1094,12 @@ def _setup(a, cfg):
     return games, stats, prev, inj, week
 
 def _overrides(text):
+    """"Name:Status[:TEAM];..." -> rows. TEAM is optional; with it, a same-named player on another team isn't hit."""
     if not text:
         return None
-    rows = [x.split(":") for x in text.split(";") if ":" in x]
-    o = pd.DataFrame([(p.strip(), s.strip()) for p, s in rows], columns=["player", "status"])
+    rows = [[y.strip() for y in x.split(":")] for x in text.split(";") if ":" in x]
+    o = pd.DataFrame([(r[0], r[1], _nfl_team(r[2]) if len(r) > 2 and r[2] else None) for r in rows],
+                     columns=["player", "status", "team"])
     o["_key"] = o["player"].map(norm_name)
     return o
 
@@ -1073,6 +1115,7 @@ def cmd_check(a):
     cfg = _cfg(a)
     set_calib(getattr(a, "calib", None), SPORT)
     games, stats, prev, inj, week = _setup(a, cfg)
+    cfg["started"] = started_games(games[(games["season"] == cfg["season"]) & (games["week"] == week)]) if not getattr(a, "ignore_started", False) else set()
     ov = _overrides(a.injuries)
     outs = build_outs(inj, ov, week)
     print(f"USAGE MODEL: {len(outs)} players Out/Doubtful -> targets redistributed to teammates")
@@ -1159,6 +1202,13 @@ def merge_best(df):
         print(f"MERGE: {len(df)} rows from all sources -> {len(m)} props, best Over and best Under price kept for each")
     return m
 
+def started_games(g):
+    """Game ids already played or kicked off: a final score in the schedule OR kickoff time in the past (ET).
+    10/23: NE@CHI was played Thursday but the schedule had no score yet, so it still looked upcoming."""
+    kick = pd.to_datetime(g["gameday"].astype(str) + " " + g["gametime"].fillna("13:00").astype(str), errors="coerce")
+    now = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
+    return set(g.loc[g["result"].notna() | g["home_score"].notna() | (kick <= now), "game_id"])
+
 def slate_guard(df, a):
     """Odds pages can still show another week's games: keep only rows whose matchup (e.g. 'LA @ LV', 'DET vs GB')
     is a game in the target week; say per market how many were dropped."""
@@ -1170,7 +1220,13 @@ def slate_guard(df, a):
         return df
     g = g[(g["season"] == cfg["season"]) & (g["game_type"] == "REG")]
     week = a.week or int(g[g["home_score"].isna()]["week"].min())
-    games = {frozenset((h, w)) for h, w in zip(g[g["week"] == week]["home_team"], g[g["week"] == week]["away_team"])}
+    wk = g[g["week"] == week]
+    done = started_games(wk)
+    if done:
+        print(f"  ! SLATE GUARD: {len(done)} week-{week} game(s) already played/kicked off -> their props dropped: "
+              + ", ".join(f"{w} @ {h}" for h, w, gid in zip(wk["home_team"], wk["away_team"], wk["game_id"]) if gid in done))
+    wk = wk[~wk["game_id"].isin(done)]
+    games = {frozenset((h, w)) for h, w in zip(wk["home_team"], wk["away_team"])}
     def pair(m):
         parts = re.split(r"\s+(?:@|vs\.?|at)\s+", str(m).strip(), maxsplit=1, flags=re.I)
         return frozenset(_nfl_team(p) for p in parts) if len(parts) == 2 else None
@@ -1293,7 +1349,8 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             return r, (s or {}).get("leg_prob", (s or {}).get("prob")), sug, s
         stake, boost = float(b["stake"]), _num(b["boost_pct"])
         r.update({"bet_type": "straight", "units": round(stake / unit, 2), "stake_usd": stake,
-                  "boost_pct": boost or np.nan})
+                  "boost_pct": boost or np.nan, "face_usd": _face(b), "bonus_bet": _bonus(b),
+                  "rec_units": (s or {}).get("rec_units", 0.0) if sug else 0.0})
         if odds is None:
             r.update({"tier": "unscored", "source": "unscored: odds unreadable", "vpe_verdict": "unscored"})
             return r, None, sug, s
@@ -1303,6 +1360,10 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             r.update({"tier": "unscored", "source": "unscored: " + why, "vpe_verdict": "unscored"})
         else:
             te, v, eb, ee = rate_pick(s["prob"], odds, eff, cfg, sug)
+            mo = s.get("min_odds")
+            if mo is not None and pd.notna(mo) and american_to_decimal(odds) < american_to_decimal(mo) - 1e-9:
+                v = f"SKIP rule broken: {int(odds):+d} worse than take-if {int(mo):+d}"
+                r["note"] = (r["note"] + " [below take-if]").strip()
             r.update({"tier": te or "off_model", "source": "engine" if te else "off_model", "vpe_verdict": v,
                       "edge_base": eb, "edge": ee, "ev_per_unit": round(ev_per_unit(s["prob"], eff), 3)})
         return r, None, sug, s
@@ -1319,11 +1380,15 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         probs = [o[1] for o in out]
         teams = [frozenset((o[3]["team"], o[3]["opp"])) for o in out if o[3]]
         same_game = len(teams) != len(set(teams))
+        # a placed parlay is a VPE pick only if it is EXACTLY a parlay VPE built tonight (same legs, nothing added/removed)
+        lk = frozenset((norm_name(o[0]["player"]), o[0]["market"], o[0]["side"]) for o in out)
+        vpe_par = next((v for v in VPE_PARLAYS if frozenset((norm_name(x[0]), x[1], x[2]) for x in v["legs"]) == lk), None)
         r = {**stamp, "logged_at": now, "bet_type": "parlay", "parlay_id": f"{tag}-{p}", "market": "parlay",
              "player": " + ".join(f"{o[0]['player']} {o[0]['side']} {o[0]['line']:g} {o[0]['market']}" for o in out),
              "side": np.nan, "odds": podds, "book": _book(b0), "units": round(stake / unit, 2),
-             "stake_usd": stake, "boost_pct": boost or np.nan,
-             "suggested": "unknown" if any(o[2] is None for o in out) else ("yes" if all(o[2] for o in out) else "no"),
+             "stake_usd": stake, "boost_pct": boost or np.nan, "face_usd": _face(b0), "bonus_bet": _bonus(b0),
+             "suggested": "yes" if vpe_par else "no",
+             "rec_stake_usd": vpe_par["stake_usd"] if vpe_par else 0.0,
              "note": ("same-game legs: model treats them as independent, real odds of all hitting differ. " if same_game else "")
                      + ("" if pd.isna(b0["note"]) else str(b0["note"]))}
         if podds is None:
@@ -1331,7 +1396,10 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         else:
             eff = boosted_american(podds, boost)
             r["odds_eff"] = eff
-            if any(x is None for x in probs):
+            if same_game:
+                r.update({"tier": "sgp_correlated", "vpe_verdict": "same-game parlay: legs correlated, EV not rated "
+                          "(use the sgp command before placing)"})
+            elif any(x is None for x in probs):
                 r.update({"tier": "unscored", "vpe_verdict": "unscored (a leg has no projection)"})
             else:
                 prob = float(np.prod(probs))
@@ -1344,6 +1412,16 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         rows.append(r)
     return rows
 
+VPE_PARLAYS = []  # parlays VPE built this run (vpe_parlays.json, written by `parlay`), loaded by `log`
+
+def _face(b):
+    v = pd.to_numeric(b.get("face", np.nan) if hasattr(b, "get") else np.nan, errors="coerce")
+    return float(v) if pd.notna(v) else np.nan
+
+def _bonus(b):
+    v = str(b.get("bonus", "") if hasattr(b, "get") else "").strip().lower()
+    return "yes" if v in ("yes", "y", "true", "1", "bonus") else ""
+
 def _book(b):
     """Book from placed.csv (optional `book` column: DraftKings / FanDuel); default DraftKings."""
     v = str(b.get("book", "") if hasattr(b, "get") else "").strip()
@@ -1351,11 +1429,19 @@ def _book(b):
         v.lower().replace(" ", ""), v if v and v.lower() != "nan" else "DraftKings")
 
 def win_profit(r):
-    """Units won on a WIN at the effective (boosted) odds."""
+    """Units won on a WIN at the effective (boosted) odds. Bankroll rule: stake_usd = total CHARGED (bet + 3% Bet
+    Protect+ fee); face_usd = the bet amount the payout is based on. Bonus bet: stake_usd = the fee only and the bonus
+    stake itself is not returned."""
     o = r.get("odds_eff")
     o = r.get("odds") if o is None or pd.isna(o) else o
     if not r["units"] or o is None or pd.isna(o):
         return 0.0
+    face, charged = pd.to_numeric(r.get("face_usd"), errors="coerce"), pd.to_numeric(r.get("stake_usd"), errors="coerce")
+    if pd.notna(face) and face > 0 and pd.notna(charged) and charged > 0:
+        unit = charged / r["units"]
+        bonus = str(r.get("bonus_bet", "")).strip().lower() in ("yes", "true", "1")
+        won = face * (american_to_decimal(o) - (1 if bonus else 0)) - charged
+        return round(won / unit, 3)
     return round(r["units"] * (american_to_decimal(o) - 1), 3)
 
 def settle_parlays(log):
@@ -1506,7 +1592,7 @@ def cmd_parlay(a):
     print(pool.head(6)[cols].to_string(index=False) if len(pool) else "none")
     print(f"STAKE: ${stake:.2f} per parlay ({PARLAY['stake_pct']:.0%} of ${bank:.0f} bankroll unless --stake given)"
           + (f" | {boost:g}% profit boost -> its own BOOST parlay at {BOOK_NAME.get(bbook, bbook)}" if boost else ""))
-    keys = []
+    keys, built = [], []
     for name, target in PARLAY["targets"]:
         found, free = [], []
         for bk in PARLAY["books"]:
@@ -1548,8 +1634,22 @@ def cmd_parlay(a):
         print(f"  -> build it at {BOOK_NAME[bk]}; if its parlay odds (before boost) are below {decimal_to_american(need):+d}"
               f" or a leg is worse than take_min, rerun with --exclude")
         keys += [(c["player"], c["market"], c["side"]) for c in combo]
-    if boost:
-        print_boost(a, allp, stake, cols, keys)
+        built.append({"name": name, "target": target, "book": bk, "odds": decimal_to_american(dec), "hit": round(p, 4),
+                      "stake_usd": stake, "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]})
+    bp = print_boost(a, allp, stake, cols, keys) if boost else None
+    if bp:
+        built.append(bp)
+    # ONE-PARLAY RULE (10/21-10/26: parlays were the whole loss, -$15.14 of -$15.89): recommend ONE parlay a night:
+    # the BOOST parlay if there is one (+EV at market odds alone), else the biggest VPE could build (~10x), else ~4x.
+    if built:
+        rec = bp or max(built, key=lambda b: b["target"])
+        rec["recommended"] = True
+        print(f"\nONE-PARLAY RULE: place ONLY the {rec['name']} parlay at {BOOK_NAME[rec['book']]} "
+              f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}). Any other parlay above = reference only.")
+    else:
+        print("\nONE-PARLAY RULE: no VPE parlay tonight -> place none.")
+    import json
+    json.dump(built, open(getattr(a, "parlays_out", None) or "vpe_parlays.json", "w"), indent=1)
     if len(pool):
         keys += list(zip(pool.head(6)["player"], pool.head(6)["market"], pool.head(6)["side"]))
     if a.bets and os.path.exists(a.bets):
@@ -1784,6 +1884,8 @@ def print_boost(a, allp, stake, cols, keys):
     if a.boost_max_win:
         print(f"  (boost winnings capped at ${a.boost_max_win:g}: counted)")
     keys += [(c["player"], c["market"], c["side"]) for c in combo]
+    return {"name": f"BOOST {boost:g}%", "target": 0, "book": bbook, "odds": decimal_to_american(dec), "hit": round(p, 4),
+            "stake_usd": stake, "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]}
 
 
 
@@ -1855,7 +1957,7 @@ def cmd_final(a):
     print("=== FINAL CHECK (closing prices recorded) ===")
     print(out.to_string(index=False) if len(out) else "slip empty")
     if a.log and os.path.exists(a.log) and len(out):
-        log = pd.read_csv(a.log, dtype={"result": "object"})
+        log = read_log(a.log)
         if "closing_odds" not in log:
             log["closing_odds"] = np.nan
         n = 0
@@ -1878,7 +1980,20 @@ def cmd_final(a):
 LOG_COLS = ["season", "week", "logged_at", "player", "team", "opp", "market", "side", "line", "odds", "book", "tier",
             "units", "stake_usd", "source", "model_prob", "blend_prob", "edge", "ev_per_unit", "closing_odds",
             "actual", "result", "profit_units",
-            "bet_type", "parlay_id", "suggested", "vpe_verdict", "boost_pct", "odds_eff", "edge_base", "note"]
+            "bet_type", "parlay_id", "suggested", "vpe_verdict", "boost_pct", "odds_eff", "edge_base", "note",
+            "face_usd", "bonus_bet", "rec_units", "rec_stake_usd"]
+LOG_NUM = ["season", "week", "line", "odds", "units", "stake_usd", "model_prob", "blend_prob", "edge", "ev_per_unit", "closing_odds", "actual",
+           "profit_units", "boost_pct", "odds_eff", "edge_base", "face_usd", "rec_units", "rec_stake_usd"]
+
+def read_log(path):
+    """Pick log CSV: every column read as text first (a float written into a text column crashed pandas), then the
+    numeric ones converted."""
+    d = pd.read_csv(path, dtype=object)
+    for c in LOG_NUM:
+        if c in d:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    return d
+
 
 # ---------- Google Sheet sync: the Pick Log sheet is the source of truth ----------
 def _cell(v):
@@ -1919,7 +2034,7 @@ def cmd_sheet(a):
         df.to_csv(a.log, index=False)
         print(f"pulled {len(df)} rows -> {a.log}")
     else:
-        log = pd.read_csv(a.log, dtype={"result": "object"})
+        log = read_log(a.log)
         out = sheet_rows(log, header=True)
         json.dump(out, open(a.out, "w"))
         print(f"{len(out) - 1} rows + header -> {a.out} (write it at A1 of the tab with update_values)")
@@ -1947,10 +2062,19 @@ def cmd_log(a):
         e = ev.iloc[0]
         mp = market_prob_for(allp, player, mk, side, line, odds)
         pb = blend_leg(float(e["model_prob"]), mp, mk, side)
-        return {"prob": pb, "leg_prob": pb,
-                "team": e["team"], "opp": e["opp"]}, ""
+        e0 = None
+        if allp is not None and len(allp):
+            ex = allp[(allp["player"].map(norm_name) == norm_name(player)) & (allp["market"] == mk) & (allp["side"] == side)
+                      & (pd.to_numeric(allp["line"], errors="coerce") == float(line))]
+            e0 = ex.iloc[0] if len(ex) else None
+        return {"prob": pb, "leg_prob": pb, "team": e["team"], "opp": e["opp"],
+                "rec_units": float(e0["units"]) if e0 is not None and pd.notna(e0.get("units")) else 0.0,
+                "min_odds": e0.get("min_odds") if e0 is not None else None}, ""
 
     slip = slip_keys(a.slip)
+    import json as _j
+    pp_ = getattr(a, "parlays", None) or "vpe_parlays.json"
+    VPE_PARLAYS[:] = _j.load(open(pp_)) if os.path.exists(pp_) else []
     rows = build_log_rows(pd.read_csv(a.placed, dtype=str), score, cfg, unit, slip,
                           {"season": cfg["season"], "week": week})
     if getattr(a, "dry_run", False):
@@ -1959,7 +2083,7 @@ def cmd_log(a):
         return
     new = pd.DataFrame(rows).reindex(columns=LOG_COLS)
     if a.log and os.path.exists(a.log):
-        old = pd.read_csv(a.log, dtype={"result": "object"})
+        old = read_log(a.log)
         new = pd.concat([old, new], ignore_index=True).reindex(columns=LOG_COLS)
     new.to_csv(a.log or "pick_log.csv", index=False)
     print_logged(rows)
@@ -1969,6 +2093,70 @@ def cmd_log(a):
     if slip is None:
         print(f"  ! no slip found at {a.slip}: run `check --out bets.csv` first so VPE picks can be told apart")
     print(f"\nlogged {len(rows)} rows -> {a.log or 'pick_log.csv'} (total rows {len(new)})")
+
+
+def cmd_frames(a):
+    """App screen recording -> still frames to read (item 2: recordings are now the main price source).
+    Extracts one frame every --every seconds, drops near-duplicates (scrolling pauses), writes frames/f_0001.png ...
+    Then read the frames and transcribe them into props.csv / games.csv (formats in the skill)."""
+    import subprocess, shutil, glob
+    os.makedirs(a.out, exist_ok=True)
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "imageio-ffmpeg", "--break-system-packages"], check=False)
+            import imageio_ffmpeg
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+    tmp = os.path.join(a.out, "_raw")
+    os.makedirs(tmp, exist_ok=True)
+    subprocess.run([ff, "-loglevel", "error", "-y", "-i", a.video, "-vf", f"fps=1/{a.every},scale=-2:1280",
+                    os.path.join(tmp, "r_%05d.png")], check=True)
+    from PIL import Image
+    kept, prev = [], None
+    for f in sorted(glob.glob(os.path.join(tmp, "r_*.png"))):
+        im = Image.open(f).convert("L").resize((90, 160))
+        arr = np.asarray(im, dtype=float)
+        if prev is None or np.abs(arr - prev).mean() > a.diff:
+            kept.append(f); prev = arr
+    for i, f in enumerate(kept[:a.max], 1):
+        shutil.copy(f, os.path.join(a.out, f"f_{i:04d}.png"))
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"FRAMES: {len(kept)} distinct screens kept (of the raw frames) -> {a.out}/f_0001.png ...; "
+          f"{'first ' + str(a.max) + ' written' if len(kept) > a.max else 'all written'}")
+
+def cmd_takeif(a):
+    """TAKE / SKIP for the price the app shows right now. Straight bets: VPE's min_odds (take-if). Parlay legs: the
+    leg's take_min. Anything not tiered tonight = SKIP (not a VPE pick at any price shown)."""
+    set_calib(getattr(a, "calib", None), SPORT)
+    allp = pd.read_csv(a.all)
+    pool = parlay_pool(allp)
+    for spec in a.bet:
+        t = [x.strip() for x in spec.split(";")]
+        if len(t) < 5:
+            print(f"{spec}: need Player;market;Side;line;odds"); continue
+        pl, mk, side, line, odds = t[0], canon_market(t[1]) or t[1], t[2].title(), float(t[3]), _odds(t[4])
+        k = norm_name(pl)
+        h = allp[(allp["player"].map(norm_name) == k) & (allp["market"] == mk) & (allp["side"] == side)
+                 & (pd.to_numeric(allp["line"], errors="coerce") == line)]
+        lg = pool[(pool["player"].map(norm_name) == k) & (pool["market"] == mk) & (pool["side"] == side)
+                  & (pd.to_numeric(pool["line"], errors="coerce") == line)] if len(pool) else pool
+        tag = f"{pl} {side} {line:g} {mk} @ {odds:+d}"
+        if h.empty:
+            print(f"{tag}: SKIP - not in tonight's run (different line? rerun check with this line)"); continue
+        r = h.iloc[0]
+        if pd.notna(r.get("tier")) and str(r.get("tier")) not in ("", "nan"):
+            mo = int(r["min_odds"]) if pd.notna(r.get("min_odds")) else None
+            ok = mo is None or american_to_decimal(odds) >= american_to_decimal(mo) - 1e-9
+            print(f"{tag}: {'TAKE' if ok else 'SKIP'} straight (take-if {mo:+d}, win chance {r['blend_prob']:.1%})" if mo is not None
+                  else f"{tag}: TAKE straight (win chance {r['blend_prob']:.1%})")
+        elif len(lg):
+            tm_ = int(lg.iloc[0]["take_min"])
+            ok = american_to_decimal(odds) >= american_to_decimal(tm_) - 1e-9
+            print(f"{tag}: {'TAKE' if ok else 'SKIP'} as a parlay leg only (take_min {tm_:+d}, leg prob {lg.iloc[0]['leg_prob']:.1%})")
+        else:
+            print(f"{tag}: SKIP - not a VPE pick at any price (win chance {r['blend_prob']:.1%}, needs {implied_prob(odds):.1%} + edge)")
 
 
 def cmd_status(a):
@@ -2052,7 +2240,7 @@ def cmd_board(a):
 def cmd_grade(a):
     cfg = _cfg(a)
     stats = load_stats(cfg["season"], max_age_hours=1)
-    log = pd.read_csv(a.log)
+    log = read_log(a.log)
     for c in ("result", "actual", "profit_units", "closing_odds", "odds_eff", "bet_type", "parlay_id"):
         if c not in log.columns: log[c] = None
     log.to_csv(a.log, index=False)
@@ -2108,6 +2296,13 @@ if __name__ == "__main__":
     sub.choices["log"].add_argument("--dry-run", action="store_true", help="rate the bets only, log nothing")
     for k, t in (("--boost-min-legs", int), ("--boost-max-legs", int), ("--boost-min-odds", float), ("--boost-max-win", float)):
         sub.choices["parlay"].add_argument(k, type=t)
+    sub.choices["log"].add_argument("--parlays", default="vpe_parlays.json", help="parlays VPE built (from parlay)")
+    sub.choices["parlay"].add_argument("--parlays-out", default="vpe_parlays.json")
+    fr = sub.add_parser("frames"); fr.add_argument("--video", required=True); fr.add_argument("--out", default="frames")
+    fr.add_argument("--every", type=float, default=1.0); fr.add_argument("--diff", type=float, default=6.0)
+    fr.add_argument("--max", type=int, default=60)
+    tk = sub.add_parser("takeif"); tk.add_argument("--all", default="bets_all.csv"); tk.add_argument("--calib")
+    tk.add_argument("--bet", action="append", required=True, help='"Player;market;Side;line;odds" (repeat)')
     ss = sub.add_parser("status")
     ss.add_argument("--week", type=int); ss.add_argument("--season", type=int); ss.add_argument("--bankroll", type=float)
     ss.add_argument("--profile"); ss.add_argument("--props", default="props.csv"); ss.add_argument("--injuries-file", default="inj.txt")
@@ -2134,5 +2329,6 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status}[a.cmd](a)
+     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status,
+     "takeif": cmd_takeif, "frames": cmd_frames}[a.cmd](a)
 
