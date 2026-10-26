@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.8"
+VERSION = "NFL v15.8.1"
 
 # ==================== data ====================
 
@@ -1888,7 +1888,7 @@ def cmd_learn(a):
 
 
 # ---------- MENU (v15.8): one view of the week's best options (no same-game sim in NFL yet) ----------
-MENU = {"props_per_game": 3}
+MENU = {"top_overall": 10, "min_edge": 0.015, "props_per_game": 3}
 
 
 def cmd_menu(a):
@@ -1897,6 +1897,28 @@ def cmd_menu(a):
     allp = pd.read_csv(a.all)
     pool = parlay_pool(allp)
     print("\n" + "=" * 70 + "\nVPE MENU - best options this week (ranked inside each section)\n" + "=" * 70)
+    # 0. overall ranking: every scored prop on the slate with a real edge at its price (not held, not out), best first
+    print("\n0) BEST PROPS OVERALL (every game, ranked by edge at the listed price; ★ = on the staked slip)")
+    on_slip = set()
+    if a.bets and os.path.exists(a.bets):
+        bb = pd.read_csv(a.bets)
+        on_slip = {(r["player"], r["market"], r["side"]) for _, r in bb.iterrows()}
+    ov = allp.copy()
+    for c in ("edge", "blend_prob", "odds", "market_gap"):
+        ov[c] = pd.to_numeric(ov.get(c), errors="coerce")
+    ok = (ov["edge"] >= MENU["min_edge"]) & ov["odds"].between(-200, 200) & (ov["market_gap"].fillna(0) <= 0.15)
+    if "base_min" in ov:
+        ok &= pd.to_numeric(ov["base_min"], errors="coerce").fillna(99) >= 20
+    if "injury" in ov:
+        ok &= ~ov["injury"].fillna("").astype(str).str.contains("Out|Doubtful", case=False)
+    ov = ov[ok].sort_values("edge", ascending=False).head(MENU["top_overall"])
+    if ov.empty:
+        print("   none qualify")
+    for i, (_, r) in enumerate(ov.iterrows(), 1):
+        star = "★" if (r["player"], r["market"], r["side"]) in on_slip else " "
+        tk = f" | take if odds >= {int(r['min_odds']):+d}" if pd.notna(r.get("min_odds")) else ""
+        print(f"  {i:>2}. {star} {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['book']})"
+              f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%}{tk}")
     print("\n1) BEST STRAIGHT BETS (the staked slip; max 2 per game)")
     if a.bets and os.path.exists(a.bets):
         b = pd.read_csv(a.bets)

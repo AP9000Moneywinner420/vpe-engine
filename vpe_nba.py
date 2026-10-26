@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.5.0"
+VERSION = "NBA v2.5.1"
 
 # ==================== data ====================
 
@@ -2948,7 +2948,7 @@ def cmd_sgp(a):
 # ---------- MENU (v2.5): one view of the night's best options ----------
 # 1) best straight bets (the staked slip)  2) best cross-game parlay (the ONE-PARLAY RULE pick)
 # 3) per game: best props + best same-game "story" parlay (legs that move together, joint chance from the 20k-game sim)
-MENU = {"props_per_game": 3, "sgp_cands": 6, "sgp_min_dec": 3.0, "sgp_max_legs": 4, "sgp_min_ev": 0.10}
+MENU = {"top_overall": 10, "min_edge": 0.015, "props_per_game": 3, "sgp_cands": 6, "sgp_min_dec": 3.0, "sgp_max_legs": 4, "sgp_min_ev": 0.10}
 
 
 def _story(legs, home):
@@ -2971,6 +2971,28 @@ def cmd_menu(a):
     pool = parlay_pool(allp)
     date, state, sched = _setup(a, cfg)
     print("\n" + "=" * 70 + "\nVPE MENU - best options tonight (ranked inside each section)\n" + "=" * 70)
+    # 0. overall ranking: every scored prop on the slate with a real edge at its price (not held, not out), best first
+    print("\n0) BEST PROPS OVERALL (every game, ranked by edge at the listed price; ★ = on the staked slip)")
+    on_slip = set()
+    if a.bets and os.path.exists(a.bets):
+        bb = pd.read_csv(a.bets)
+        on_slip = {(r["player"], r["market"], r["side"]) for _, r in bb.iterrows()}
+    ov = allp.copy()
+    for c in ("edge", "blend_prob", "odds", "market_gap"):
+        ov[c] = pd.to_numeric(ov.get(c), errors="coerce")
+    ok = (ov["edge"] >= MENU["min_edge"]) & ov["odds"].between(-200, 200) & (ov["market_gap"].fillna(0) <= 0.15)
+    if "base_min" in ov:
+        ok &= pd.to_numeric(ov["base_min"], errors="coerce").fillna(99) >= 20
+    if "injury" in ov:
+        ok &= ~ov["injury"].fillna("").astype(str).str.contains("Out|Doubtful", case=False)
+    ov = ov[ok].sort_values("edge", ascending=False).head(MENU["top_overall"])
+    if ov.empty:
+        print("   none qualify")
+    for i, (_, r) in enumerate(ov.iterrows(), 1):
+        star = "★" if (r["player"], r["market"], r["side"]) in on_slip else " "
+        tk = f" | take if odds >= {int(r['min_odds']):+d}" if pd.notna(r.get("min_odds")) else ""
+        print(f"  {i:>2}. {star} {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['book']})"
+              f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%}{tk}")
     # 1. straights
     print("\n1) BEST STRAIGHT BETS (the staked slip; max 2 per game)")
     if a.bets and os.path.exists(a.bets):
