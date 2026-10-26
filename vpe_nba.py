@@ -2152,7 +2152,7 @@ def cmd_learn(a):
     import json, datetime
     set_calib(a.calib, SPORT)
     LEARNED["tail"], LEARNED["gate"] = None, {}   # learn from the base blend, never from its own fixes
-    vals = _values(a.json)
+    vals = [r for j in a.json for r in _values(j)]   # several 2000-row reads, oldest first
     rows = [list(r) + [""] * (len(SHADOW_COLS) - len(r)) for r in vals if r and str(r[0]) != "key"]
     start = _key_ord(LEARN["start"][SPORT])
     seen, data = set(), []
@@ -3266,7 +3266,7 @@ if __name__ == "__main__":
     ss.add_argument("--injuries-file", default="inj.txt"); ss.add_argument("--calib", default="calib_tab.json")
     ss.add_argument("--shadow", default="shadow_new.json"); ss.add_argument("--ignore-tip", action="store_true")
     ss.add_argument("--v1-before", type=int); ss.add_argument("--v1-after", type=int)
-    ln = sub.add_parser("learn"); ln.add_argument("--json", required=True, help="Shadow window (get_values JSON)")
+    ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
     sw = sub.add_parser("shadow")
