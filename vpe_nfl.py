@@ -17,6 +17,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
+VERSION = "NFL v15.5"
 
 # ==================== data ====================
 
@@ -1048,7 +1049,7 @@ def _setup(a, cfg):
     stats = load_stats(season)
     prev = load_stats(season - 1, max_age_hours=24 * 30)
     inj = load_injuries(season)
-    print(f"DATA: season {season}, target week {week}, box scores through week {int(stats['week'].max())}, "
+    print(f"DATA [{VERSION}]: season {season}, target week {week}, box scores through week {int(stats['week'].max())}, "
           f"official injury report for week {week}: {'YES' if week in set(inj.get('week', [])) else 'NOT YET'}")
     return games, stats, prev, inj, week
 
@@ -1206,7 +1207,7 @@ def cmd_lines(a):
     df = pd.DataFrame(out, columns=["player", "market", "line", "over_odds", "under_odds", "book", "matchup"])
     df = slate_guard(df, a)
     df = merge_best(df)
-    df.drop(columns="matchup").to_csv(a.out, index=False)
+    df.to_csv(a.out, index=False)  # matchup kept: the RUN STATUS gate reads it
     dk = df["book"].str.contains("draftkings", case=False).sum()
     print(f"LINES: {len(df)} rows from {len(a.src)} market pages -> {a.out} ({dk} rows priced at DraftKings, "
           f"rest best-of-market) | by market: " + ", ".join(f"{k} {v}" for k, v in df["market"].value_counts().items()))
@@ -1658,7 +1659,12 @@ def write_shadow(evald, key, path):
     if evald is None or evald.empty or not path:
         return
     s = shadow_rows(evald, key)
-    json.dump([[_cell(v) for v in r] for r in s.itertuples(index=False, name=None)], open(path, "w"))
+    rows = [[_cell(v) for v in r] for r in s.itertuples(index=False, name=None)]
+    json.dump(rows, open(path, "w"))
+    stem = path[:-5] if path.endswith(".json") else path
+    for i in range(0, len(rows), 100):
+        json.dump(rows[i:i + 100], open(f"{stem}_{i // 100 + 1}.json", "w"))
+    print(f"SHADOW chunks: {(len(rows) + 99) // 100} files of <= 100 rows ({stem}_1.json ...); append each in order")
     print(f"SHADOW: {len(s)} lines -> {path}\n  >>> REQUIRED NEXT STEP: append_values {path} to 'Shadow NFL'!A1 and confirm Calib V2 grew by {len(s)}."
           " Skipping this breaks VPE's learning loop.")
 
@@ -1964,6 +1970,65 @@ def cmd_log(a):
         print(f"  ! no slip found at {a.slip}: run `check --out bets.csv` first so VPE picks can be told apart")
     print(f"\nlogged {len(rows)} rows -> {a.log or 'pick_log.csv'} (total rows {len(new)})")
 
+
+def cmd_status(a):
+    """RUN STATUS gate (NFL): same idea as NBA. GO / PARTIAL (gaps named) / HOLD (no picks)."""
+    import json
+    cfg = _cfg(a)
+    g = load_games()
+    g = g[(g["season"] == cfg["season"]) & (g["game_type"] == "REG")]
+    week = a.week or int(g[g["home_score"].isna()]["week"].min())
+    wk = g[(g["week"] == week) & g["home_score"].isna()]
+    games = {frozenset((h, w)) for h, w in zip(wk["home_team"], wk["away_team"])}
+    rows, hold, partial = [], [], []
+    def add(name, ok, detail, level="partial"):
+        rows.append((name, ok, detail))
+        if not ok:
+            (hold if level == "hold" else partial).append(name)
+    add("SLATE", len(games) > 0, f"week {week}: {len(games)} games not yet played", "hold")
+    stats = load_stats(cfg["season"])
+    last = int(stats["week"].max()) if len(stats) else 0
+    add("STATS", last >= week - 1, f"stats through week {last}" + ("" if last >= week - 1 else f", week {week - 1} missing"))
+    cov, n = {}, 0
+    if a.props and os.path.exists(a.props):
+        pr = pd.read_csv(a.props, dtype=str).fillna("")
+        n = len(pr)
+        if "matchup" in pr:
+            pair = lambda m: (lambda ps: frozenset(_nfl_team(x) for x in ps) if len(ps) == 2 else None)(
+                re.split(r"\s+(?:@|vs\.?|at)\s+", str(m).strip(), maxsplit=1, flags=re.I))
+            for mk, gg in pr.groupby("market"):
+                cov[mk] = len({pair(m) for m in gg["matchup"]} & games)
+    best = max(cov.values()) if cov else 0
+    add("LINES", best > 0 and best >= len(games), (" | ".join(f"{k} {v}/{len(games)}" for k, v in sorted(cov.items()))
+        or "no props file / no matchup column") + f" ({n} rows)", "hold" if best == 0 else "partial")
+    inj = load_injuries(cfg["season"])
+    official = week in set(inj.get("week", []))
+    news = a.injuries_file and os.path.exists(a.injuries_file) and open(a.injuries_file).read().strip() != ""
+    add("INJURIES", bool(news), f"official report {'YES' if official else 'NOT YET'}; news list "
+        + ("built" if news else "MISSING (usage model and Out filter blind)"), "hold")
+    if a.calib and os.path.exists(a.calib):
+        w, _, nn = load_calib(a.calib, SPORT)
+        add("CALIB", True, f"{nn} graded lines, model weight {w:.0%}")
+    else:
+        add("CALIB", False, "Calib tab not loaded (prior 40% model weight used)")
+    exp = len(json.load(open(a.shadow))) if a.shadow and os.path.exists(a.shadow) else None
+    if exp is None:
+        add("SHADOW", False, "no shadow_new.json (check not run?)")
+    elif a.v2_before is None or a.v2_after is None:
+        add("SHADOW", False, f"{exp} lines NOT confirmed saved: pass --v2-before/--v2-after after appending")
+    else:
+        got = a.v2_after - a.v2_before
+        add("SHADOW", got == exp, f"{got}/{exp} lines saved" + ("" if got == exp else (" -> append the missing chunk(s), re-check"
+            if got < exp else " -> too many rows: a chunk was appended twice; delete the duplicate rows")))
+    verdict = "HOLD" if hold else ("PARTIAL" if partial else "GO")
+    print(f"RUN STATUS [{VERSION}] week {week}: {verdict}")
+    for name, ok, detail in rows:
+        print(f"  {'OK ' if ok else 'XX '} {name:9s} {detail}")
+    if hold:
+        print(f"  -> HOLD: no picks until fixed: {', '.join(hold)}")
+    elif partial:
+        print(f"  -> PARTIAL: picks allowed; name these gaps on the slip: {', '.join(partial)}")
+
 def cmd_board(a):
     cfg = _cfg(a)
     games, stats, prev, inj, week = _setup(a, cfg)
@@ -2043,6 +2108,11 @@ if __name__ == "__main__":
     sub.choices["log"].add_argument("--dry-run", action="store_true", help="rate the bets only, log nothing")
     for k, t in (("--boost-min-legs", int), ("--boost-max-legs", int), ("--boost-min-odds", float), ("--boost-max-win", float)):
         sub.choices["parlay"].add_argument(k, type=t)
+    ss = sub.add_parser("status")
+    ss.add_argument("--week", type=int); ss.add_argument("--season", type=int); ss.add_argument("--bankroll", type=float)
+    ss.add_argument("--profile"); ss.add_argument("--props", default="props.csv"); ss.add_argument("--injuries-file", default="inj.txt")
+    ss.add_argument("--calib", default="calib_tab.json"); ss.add_argument("--shadow", default="shadow_new.json")
+    ss.add_argument("--v2-before", type=int); ss.add_argument("--v2-after", type=int)
     sw = sub.add_parser("shadow")
     sw.add_argument("--json", required=True, help="get_values JSON of the Shadow tab window")
     sw.add_argument("--first-row", type=int, required=True, help="sheet row of the first row in --json")
@@ -2064,5 +2134,5 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow}[a.cmd](a)
+     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status}[a.cmd](a)
 

@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
+VERSION = "NBA v2.1.6"
 
 # ==================== data ====================
 
@@ -911,7 +912,7 @@ def _setup(a, cfg):
     state.pv_box = prev
     n_games = cur["game_id"].nunique() if len(cur) else 0
     last = cur["date"].max().date() if len(cur) else "none yet"
-    print(f"DATA: season {season - 1}-{str(season)[2:]}, slate date {date.date()}, this-season box scores: {n_games} games "
+    print(f"DATA [{VERSION}]: season {season - 1}-{str(season)[2:]}, slate date {date.date()}, this-season box scores: {n_games} games "
           f"(through {last}); last season loaded as prior; schedule: {len(sched)} games")
     return date, state, sched
 
@@ -1962,6 +1963,84 @@ def cmd_grade(a):
             clv = c["closing_odds"].astype(float).map(implied_prob) - c["odds"].astype(float).map(implied_prob)
             print(f"CLV: {len(c)} bets with a closing price | beat the close {(clv > 0).mean():.0%} | avg {clv.mean():+.3f} prob pts")
 
+
+def cmd_status(a):
+    """RUN STATUS gate: one block at the top of every slip, same checks in every chat and on every model.
+    GO = all clear · PARTIAL = picks allowed, gaps named · HOLD = no picks (say why, fix, rerun)."""
+    import json
+    D = pd.Timestamp(a.date) if a.date else today_et()
+    season = season_for(D)
+    sched = load_schedule(season)
+    now = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
+    day = sched[sched["date"] == D] if len(sched) else sched
+    left = day[day["tip"] > now] if (len(day) and not a.ignore_tip) else day
+    tonight = {frozenset((h, w)) for h, w in zip(left["home"], left["away"])}
+    rows, hold, partial = [], [], []
+
+    def add(name, ok, detail, level="partial"):
+        rows.append((name, ok, detail))
+        if not ok:
+            (hold if level == "hold" else partial).append(name)
+
+    add("SLATE", len(tonight) > 0, f"{len(tonight)} games left on {D.date()}" + ("" if len(tonight) else " (nothing to bet)"), "hold")
+    # stats: last night's games must be in the box scores
+    box = load_box(season)
+    last_box = box["date"].max() if len(box) else None
+    prev_days = sched[(sched["date"] < D)]["date"] if len(sched) else pd.Series(dtype="datetime64[ns]")
+    need = prev_days.max() if len(prev_days) else None
+    fresh = need is None or (last_box is not None and last_box >= need)
+    add("STATS", fresh, f"box scores through {last_box.date() if last_box is not None else 'none'}"
+        + ("" if fresh else f", missing {need.date()} (file rebuilds ~7:30 AM ET)"))
+    # lines
+    cov, n_rows = {}, 0
+    if a.props and os.path.exists(a.props):
+        pr = pd.read_csv(a.props, dtype=str).fillna("")
+        n_rows = len(pr)
+        if "matchup" in pr:
+            for mk, g in pr.groupby("market"):
+                cov[canon_market(mk) or mk] = len({frozenset(parse_matchup(m)[:2]) for m in g["matchup"]} & tonight)
+    games_lined = max(cov.values()) if cov else 0
+    add("LINES", games_lined > 0 and games_lined >= len(tonight),
+        (" | ".join(f"{k} {v}/{len(tonight)}" for k, v in sorted(cov.items())) or "no props file") + f" ({n_rows} rows)",
+        "hold" if games_lined == 0 else "partial")
+    # injuries
+    inj_ok, inj_n = False, 0
+    if a.injuries_file and os.path.exists(a.injuries_file):
+        txt = open(a.injuries_file).read().strip()
+        inj_n = len([x for x in txt.split(";") if x.strip()])
+        inj_ok = inj_n > 0 or txt.upper() == "NONE"
+    add("INJURIES", inj_ok, f"{inj_n} players listed" if inj_ok else "no injury list built (usage model and Out filter blind)", "hold")
+    # spreads
+    g = load_games_file(a.games) if a.games else None
+    have = {frozenset((h, w)) for h, w in zip(g["home"], g["away"])} if g is not None else set()
+    ns = len(have & tonight)
+    add("SPREADS", ns == len(tonight) and len(tonight) > 0, f"{ns}/{len(tonight)} games (missing = no blowout adjustment)")
+    # calibration loaded
+    if a.calib and os.path.exists(a.calib):
+        w, _, n = load_calib(a.calib, SPORT)
+        add("CALIB", True, f"{n} graded lines, model weight {w:.0%}")
+    else:
+        add("CALIB", False, "Calib tab not loaded (prior 40% model weight used)")
+    # shadow save
+    exp = None
+    if a.shadow and os.path.exists(a.shadow):
+        exp = len(json.load(open(a.shadow)))
+    if exp is None:
+        add("SHADOW", False, "no shadow_new.json (check not run?)")
+    elif a.v1_before is None or a.v1_after is None:
+        add("SHADOW", False, f"{exp} lines NOT confirmed saved: pass --v1-before/--v1-after after appending")
+    else:
+        got = a.v1_after - a.v1_before
+        add("SHADOW", got == exp, f"{got}/{exp} lines saved" + ("" if got == exp else (" -> append the missing chunk(s), re-check" if got < exp else " -> too many rows: a chunk was appended twice; delete the duplicate rows")))
+    verdict = "HOLD" if hold else ("PARTIAL" if partial else "GO")
+    print(f"RUN STATUS [{VERSION}] {D.date()}: {verdict}")
+    for name, ok, detail in rows:
+        print(f"  {'OK ' if ok else 'XX '} {name:9s} {detail}")
+    if hold:
+        print(f"  -> HOLD: no picks until fixed: {', '.join(hold)}")
+    elif partial:
+        print(f"  -> PARTIAL: picks allowed; name these gaps on the slip: {', '.join(partial)}")
+
 def cmd_backtest(a):
     """Walk-forward test on a finished season: project every player-game from data before that day, compare to what
     happened. Reports projection error vs a plain season average and probability calibration at average-based lines."""
@@ -2078,6 +2157,11 @@ if __name__ == "__main__":
     sub.choices["log"].add_argument("--dry-run", action="store_true", help="rate the bets only, log nothing")
     for k, t in (("--boost-min-legs", int), ("--boost-max-legs", int), ("--boost-min-odds", float), ("--boost-max-win", float)):
         sub.choices["parlay"].add_argument(k, type=t)
+    ss = sub.add_parser("status")
+    ss.add_argument("--date"); ss.add_argument("--props", default="props.csv"); ss.add_argument("--games", default="games.csv")
+    ss.add_argument("--injuries-file", default="inj.txt"); ss.add_argument("--calib", default="calib_tab.json")
+    ss.add_argument("--shadow", default="shadow_new.json"); ss.add_argument("--ignore-tip", action="store_true")
+    ss.add_argument("--v1-before", type=int); ss.add_argument("--v1-after", type=int)
     sw = sub.add_parser("shadow")
     sw.add_argument("--json", required=True, help="get_values JSON of the Shadow tab window")
     sw.add_argument("--first-row", type=int, required=True, help="sheet row of the first row in --json")
@@ -2099,4 +2183,4 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
-     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow}[a.cmd](a)
+     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "status": cmd_status}[a.cmd](a)
