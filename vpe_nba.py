@@ -2404,7 +2404,7 @@ def cmd_log(a):
         e0 = ex.iloc[0] if len(ex) else None
         return {"prob": pb, "leg_prob": pb, "team": h["team"], "opp": h["opp"],
                 "rec_units": float(e0["units"]) if e0 is not None and pd.notna(e0.get("units")) else 0.0,
-                "min_odds": e0.get("min_odds") if e0 is not None else None}, ""
+                "min_odds": e0.get("min_odds") if e0 is not None and pd.notna(e0.get("tier")) and str(e0.get("tier")) not in ("", "nan") else None}, ""
 
     slip = slip_keys(a.slip)
     import json as _j

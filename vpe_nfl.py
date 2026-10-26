@@ -1055,8 +1055,11 @@ CONFIG = {
             "model_weight_vs_market": 0.4,
             # Weeks 3-6 backtest, actual / projected: pass att x1.11, completions x1.07, pass yds x1.04 (QBs were
             # projected low -> fake Under edges on QB props). ~75% of each gap applied.
-            "mean_calib": {"pass_att": 1.08, "pass_comp": 1.05, "pass_yds": 1.03, "receptions": 1.02,
-                           "rush_att": 1.03, "anytime_td": 0.93}, "prob_calibration_shrink": 0.75, "max_market_gap": 0.15,
+            # v15.6 two-season walk-forward check (2024 + 2025, ~20k player-weeks): pass_att x1.08 and rush_att x1.03
+            # over-shot in BOTH seasons (Overs predicted 4-12 pts too often) -> 1.0; pass_comp mixed -> kept.
+            # Tails-only probability map tested like NBA: made NFL worse both ways -> not used (flat 0.75 shrink stays).
+            "mean_calib": {"pass_att": 1.0, "pass_comp": 1.05, "pass_yds": 1.03, "receptions": 1.02,
+                           "rush_att": 1.0, "anytime_td": 0.93}, "prob_calibration_shrink": 0.75, "max_market_gap": 0.15,
             "usage_alloc_share_weight": 0.3, "usage_retention_tgt": 0.7, "usage_retention_car": 0.0,
             "usage_model_weight_games": 3, "backup_qb_efficiency": 0.9,
             "situational": {"wind_mph": 15, "cold_f": 35, "wind": {"pass": 0.88, "rec": 0.88, "rush": 1.05},
@@ -2069,7 +2072,7 @@ def cmd_log(a):
             e0 = ex.iloc[0] if len(ex) else None
         return {"prob": pb, "leg_prob": pb, "team": e["team"], "opp": e["opp"],
                 "rec_units": float(e0["units"]) if e0 is not None and pd.notna(e0.get("units")) else 0.0,
-                "min_odds": e0.get("min_odds") if e0 is not None else None}, ""
+                "min_odds": e0.get("min_odds") if e0 is not None and pd.notna(e0.get("tier")) and str(e0.get("tier")) not in ("", "nan") else None}, ""
 
     slip = slip_keys(a.slip)
     import json as _j
