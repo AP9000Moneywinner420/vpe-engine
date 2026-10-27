@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.8.2"
+VERSION = "NFL v15.8.3"
 
 # ==================== data ====================
 
@@ -1163,6 +1163,8 @@ def cmd_check(a):
     if a.out:
         picks.assign(season=cfg["season"], week=week).to_csv(a.out, index=False)
         evald.to_csv(a.out.replace(".csv", "_all.csv"), index=False)
+        os.makedirs("runs", exist_ok=True)
+        evald.to_csv(f"runs/bets_all_W{week}_{pd.Timestamp.now(tz='America/New_York'):%a%H%M%S}.csv", index=False)
         print(f"\nsaved bets -> {a.out}")
     write_shadow(evald, f"{cfg['season']}-W{week}", a.shadow_out)
 
@@ -1462,6 +1464,43 @@ def settle_parlays(log):
             log.loc[i, "result"], log.loc[i, "profit_units"] = "WIN", win_profit(log.loc[i])
         else:
             log.loc[i, "result"] = "REPRICE"
+    return log
+
+
+# ---------- cash-out tracker (v2.5.3 / v15.8.3): what holding to the end would have paid ----------
+# A cash-out row keeps result CASHOUT and the profit actually taken. Grading fills held_result / held_profit_units
+# (as if held) and cashout_cost = held - taken (positive = cashing out cost money, negative = it saved money).
+def settle_cashouts(log, actual_of):
+    """actual_of(row) -> the player's stat for a straight bet (None if not available yet)."""
+    for c in ("held_result", "held_profit_units", "cashout_cost"):
+        if c not in log.columns:
+            log[c] = np.nan
+    log["held_result"] = log["held_result"].astype(object)
+    cash = log[(log["result"].astype(str).str.upper() == "CASHOUT") & log["held_result"].isna()]
+    for i in cash.index:
+        r = log.loc[i]
+        held = None
+        if str(r.get("bet_type")) == "parlay":
+            legs = log.loc[(log["bet_type"] == "leg") & (log["parlay_id"] == r["parlay_id"]), "result"]
+            if legs.empty or legs.isna().any():
+                continue
+            held = "LOSS" if (legs == "LOSS").any() else ("WIN" if (legs == "WIN").all() else None)
+        elif r["market"] in MARKETS:
+            act = actual_of(r)
+            if act is None:
+                continue
+            held = "PUSH" if act == float(r["line"]) else ("WIN" if (act > float(r["line"])) == (r["side"] == "Over") else "LOSS")
+        if held is None:
+            continue
+        hp = win_profit(r) if held == "WIN" else (-float(r["units"]) if held == "LOSS" else 0.0)
+        taken = float(pd.to_numeric(r["profit_units"], errors="coerce") or 0.0)
+        log.loc[i, ["held_result", "held_profit_units", "cashout_cost"]] = [held, round(hp, 2), round(hp - taken, 2)]
+    c = log[log["result"].astype(str).str.upper() == "CASHOUT"]
+    if len(c):
+        k = pd.to_numeric(c["cashout_cost"], errors="coerce")
+        print(f"CASH-OUTS: {len(c)} | taken {pd.to_numeric(c['profit_units'], errors='coerce').sum():+.2f} | if held "
+              f"{pd.to_numeric(c['held_profit_units'], errors='coerce').sum():+.2f} | cost of cashing out {k.sum():+.2f}"
+              f" ({(k > 0).sum()} cost money, {(k < 0).sum()} saved money, {k.isna().sum()} not settled yet)")
     return log
 
 def print_logged(rows):
@@ -2195,9 +2234,9 @@ LOG_COLS = ["season", "week", "logged_at", "player", "team", "opp", "market", "s
             "units", "stake_usd", "source", "model_prob", "blend_prob", "edge", "ev_per_unit", "closing_odds",
             "actual", "result", "profit_units",
             "bet_type", "parlay_id", "suggested", "vpe_verdict", "boost_pct", "odds_eff", "edge_base", "note",
-            "face_usd", "bonus_bet", "rec_units", "rec_stake_usd"]
+            "face_usd", "bonus_bet", "rec_units", "rec_stake_usd", "held_result", "held_profit_units", "cashout_cost"]
 LOG_NUM = ["season", "week", "line", "odds", "units", "stake_usd", "model_prob", "blend_prob", "edge", "ev_per_unit", "closing_odds", "actual",
-           "profit_units", "boost_pct", "odds_eff", "edge_base", "face_usd", "rec_units", "rec_stake_usd"]
+           "profit_units", "boost_pct", "odds_eff", "edge_base", "face_usd", "rec_units", "rec_stake_usd", "held_profit_units", "cashout_cost"]
 
 def read_log(path):
     """Pick log CSV: every column read as text first (a float written into a text column crashed pandas), then the
@@ -2460,6 +2499,14 @@ def cmd_grade(a):
     log.to_csv(a.log, index=False)
     week = a.week or int(stats["week"].max())
     log = grade(a.log, stats, cfg["season"], week)
+    if log is not None and len(log):
+        st = stats.assign(_key=stats["player_display_name"].map(norm_name))
+
+        def _actual(r):
+            b = st[(st["_key"] == norm_name(r["player"])) & (st["week"] == pd.to_numeric(r.get("week"), errors="coerce"))]
+            return None if b.empty else float(b[MARKETS[r["market"]]["cols"]].fillna(0).sum(axis=1).iloc[0])
+        log = settle_cashouts(log, _actual)
+        log.to_csv(a.log, index=False)
     pd.set_option("display.width", 250); pd.set_option("display.max_columns", 30)
     print(log[["week", "player", "market", "side", "line", "odds", "odds_eff", "units", "suggested", "actual", "result",
                "profit_units"]].to_string(index=False))

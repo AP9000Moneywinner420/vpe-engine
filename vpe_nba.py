@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.5.2"
+VERSION = "NBA v2.5.3"
 
 # ==================== data ====================
 
@@ -1605,6 +1605,10 @@ def cmd_check(a):
     if a.out:
         picks.assign(date=str(date.date())).to_csv(a.out, index=False)
         ev.assign(date=str(date.date())).to_csv(a.out.replace(".csv", "_all.csv"), index=False)
+        # run-stamped copy: a later rerun overwrites bets_all.csv, but `log` still finds bets from this run (10/26: 4 bets
+        # from a replaced 6:00 slate were logged "unscored")
+        os.makedirs("runs", exist_ok=True)
+        ev.assign(date=str(date.date())).to_csv(f"runs/bets_all_{date.date()}_{pd.Timestamp.now(tz='America/New_York'):%H%M%S}.csv", index=False)
         print(f"\nsaved bets -> {a.out} (all lines -> {a.out.replace('.csv', '_all.csv')})")
     write_shadow(ev, str(date.date()), a.shadow_out)
 
@@ -1799,6 +1803,43 @@ def settle_parlays(log):
             log.loc[i, "result"], log.loc[i, "profit_units"] = "WIN", win_profit(log.loc[i])
         else:
             log.loc[i, "result"] = "REPRICE"
+    return log
+
+
+# ---------- cash-out tracker (v2.5.3 / v15.8.3): what holding to the end would have paid ----------
+# A cash-out row keeps result CASHOUT and the profit actually taken. Grading fills held_result / held_profit_units
+# (as if held) and cashout_cost = held - taken (positive = cashing out cost money, negative = it saved money).
+def settle_cashouts(log, actual_of):
+    """actual_of(row) -> the player's stat for a straight bet (None if not available yet)."""
+    for c in ("held_result", "held_profit_units", "cashout_cost"):
+        if c not in log.columns:
+            log[c] = np.nan
+    log["held_result"] = log["held_result"].astype(object)
+    cash = log[(log["result"].astype(str).str.upper() == "CASHOUT") & log["held_result"].isna()]
+    for i in cash.index:
+        r = log.loc[i]
+        held = None
+        if str(r.get("bet_type")) == "parlay":
+            legs = log.loc[(log["bet_type"] == "leg") & (log["parlay_id"] == r["parlay_id"]), "result"]
+            if legs.empty or legs.isna().any():
+                continue
+            held = "LOSS" if (legs == "LOSS").any() else ("WIN" if (legs == "WIN").all() else None)
+        elif r["market"] in MARKETS:
+            act = actual_of(r)
+            if act is None:
+                continue
+            held = "PUSH" if act == float(r["line"]) else ("WIN" if (act > float(r["line"])) == (r["side"] == "Over") else "LOSS")
+        if held is None:
+            continue
+        hp = win_profit(r) if held == "WIN" else (-float(r["units"]) if held == "LOSS" else 0.0)
+        taken = float(pd.to_numeric(r["profit_units"], errors="coerce") or 0.0)
+        log.loc[i, ["held_result", "held_profit_units", "cashout_cost"]] = [held, round(hp, 2), round(hp - taken, 2)]
+    c = log[log["result"].astype(str).str.upper() == "CASHOUT"]
+    if len(c):
+        k = pd.to_numeric(c["cashout_cost"], errors="coerce")
+        print(f"CASH-OUTS: {len(c)} | taken {pd.to_numeric(c['profit_units'], errors='coerce').sum():+.2f} | if held "
+              f"{pd.to_numeric(c['held_profit_units'], errors='coerce').sum():+.2f} | cost of cashing out {k.sum():+.2f}"
+              f" ({(k > 0).sum()} cost money, {(k < 0).sum()} saved money, {k.isna().sum()} not settled yet)")
     return log
 
 def print_logged(rows):
@@ -2472,9 +2513,9 @@ LOG_COLS = ["season", "date", "logged_at", "player", "team", "opp", "market", "s
             "units", "stake_usd", "source", "model_prob", "edge", "ev_per_unit", "closing_odds", "actual", "result",
             "profit_units",
             "bet_type", "parlay_id", "suggested", "vpe_verdict", "boost_pct", "odds_eff", "edge_base", "note",
-            "face_usd", "bonus_bet", "rec_units", "rec_stake_usd"]
+            "face_usd", "bonus_bet", "rec_units", "rec_stake_usd", "held_result", "held_profit_units", "cashout_cost"]
 LOG_NUM = ["season", "line", "odds", "units", "stake_usd", "model_prob", "edge", "ev_per_unit", "closing_odds", "actual",
-           "profit_units", "boost_pct", "odds_eff", "edge_base", "face_usd", "rec_units", "rec_stake_usd"]
+           "profit_units", "boost_pct", "odds_eff", "edge_base", "face_usd", "rec_units", "rec_stake_usd", "held_profit_units", "cashout_cost"]
 
 def read_log(path):
     """Pick log CSV: every column read as text first (a float written into a text column crashed pandas), then the
@@ -2529,6 +2570,22 @@ def cmd_sheet(a):
         json.dump(out, open(a.out, "w"))
         print(f"{len(out) - 1} rows + header -> {a.out} (write it at A1 of the tab with update_values)")
 
+def _all_runs(path):
+    """This run's bets_all.csv first, then every earlier run of the same night (runs/), newest first: a bet from a
+    replaced slate is still scored with the projection it was picked from."""
+    import glob
+    frames = [pd.read_csv(path)] if os.path.exists(path) else []
+    d0 = str(frames[0]["date"].iloc[0]) if frames and "date" in frames[0] and len(frames[0]) else None
+    for p in sorted(glob.glob(os.path.join(os.path.dirname(path) or ".", "runs", "bets_all_*.csv")), reverse=True):
+        if d0 is None or os.path.basename(p).startswith(f"bets_all_{d0}_"):
+            frames.append(pd.read_csv(p))
+    if not frames:
+        return pd.DataFrame()
+    d = pd.concat(frames, ignore_index=True)
+    if len(frames) > 1:
+        print(f"LOG: projections from {len(frames)} runs tonight (this run first, then earlier ones)")
+    return d.drop_duplicates(["player", "market", "side", "line"], keep="first").reset_index(drop=True)
+
 def cmd_log(a):
     set_calib(getattr(a, "calib", None), SPORT)
     """Log bets actually placed (from DraftKings screenshots), including bets VPE did not suggest (profit boosts,
@@ -2536,7 +2593,7 @@ def cmd_log(a):
     cfg = _cfg(a)
     unit = cfg["bankroll"] * cfg["unit_pct_of_bankroll"]
     shrink = cfg["model"]["prob_calibration_shrink"]
-    allp = pd.read_csv(a.all) if os.path.exists(a.all) else pd.DataFrame()
+    allp = _all_runs(a.all)
 
     def score(player, mk, side, line, odds):
         hit = allp[(allp["player"].map(norm_name) == norm_name(player)) & (allp["market"] == mk)] if len(allp) else allp
@@ -2590,9 +2647,11 @@ def cmd_grade(a):
         for c in ["pts", "reb", "ast", "fg3m", "stl", "blk", "tov"]:
             act[c] = pd.to_numeric(act.get(c, 0), errors="coerce").fillna(0)
         box = act.assign(played=True)
+        box_all = box
     else:
         season = season_for(date or today_et())
         box = load_box(season, max_age_hours=1)
+        box_all = box
         if len(box) and date is not None:
             box = box[box["date"] == date]
     mask = log["result"].isna() & (log["date"].astype(str) == str(date.date()) if date is not None else log["result"].isna())
@@ -2614,6 +2673,15 @@ def cmd_grade(a):
         log.loc[i, "result"] = res
         log.loc[i, "profit_units"] = (win_profit(r) if res == "WIN" else (-r["units"] if res == "LOSS" else 0.0))
     log = settle_parlays(log)
+
+    def _actual(r):
+        b = box_all[box_all["_key"] == norm_name(r["player"])]
+        if "date" in b and pd.notna(r.get("date")):
+            b = b[b["date"] == pd.Timestamp(str(r["date"]))]
+        if b.empty or not bool(b["played"].iloc[0]):
+            return None
+        return float(b[MARKETS[r["market"]]].sum(axis=1).iloc[0])
+    log = settle_cashouts(log, _actual)
     log.to_csv(a.log, index=False)
     pd.set_option("display.width", 250)
     print(log[["date", "player", "market", "side", "line", "odds", "odds_eff", "units", "suggested", "actual", "result",
