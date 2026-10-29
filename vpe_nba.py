@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.8.0"
+VERSION = "NBA v2.9.0"
 
 # ==================== data ====================
 
@@ -1683,8 +1683,9 @@ def slip_keys(path):
     if not path or not os.path.exists(path):
         return None
     s = pd.read_csv(path)
-    return {(norm_name(p), canon_market(m) or m, str(sd).title()) for p, m, sd in zip(s.get("player", []),
-            s.get("market", []), s.get("side", []))}
+    kinds = s["kind"] if "kind" in s else ["pick"] * len(s)
+    return {(norm_name(p), canon_market(m) or m, str(sd).title()): str(k) for p, m, sd, k in zip(s.get("player", []),
+            s.get("market", []), s.get("side", []), kinds)}
 
 def rate_pick(prob, odds, eff_odds, cfg, suggested):
     """VPE's verdict at the price actually taken. Returns (tier at effective price, verdict, edge at base, edge at eff)."""
@@ -1718,12 +1719,13 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
     def leg_or_straight(b, as_leg):
         mk = canon_market(b["market"])
         side, line, odds = str(b["side"]).title(), float(b["line"]), _odds(b["odds"])
-        sug = None if slip is None else (norm_name(b["player"]), mk, side) in slip
+        kind = None if slip is None else slip.get((norm_name(b["player"]), mk, side))
+        sug = None if slip is None else kind is not None
         s, why = score(b["player"], mk, side, line, odds if odds is not None else -110) if mk else (None, "unknown market")
         note = "" if pd.isna(b["note"]) else str(b["note"])
         r = {**stamp, "logged_at": now, "player": b["player"], "market": mk or b["market"], "side": side, "line": line,
              "odds": odds, "book": _book(b), "note": note,
-             "suggested": "unknown" if sug is None else ("yes" if sug else "no")}
+             "suggested": "unknown" if sug is None else ("lean" if kind == "lean" else ("yes" if sug else "no"))}
         if s:
             r.update({"team": s["team"], "opp": s["opp"], "model_prob": round(s["prob"], 3), "blend_prob": round(s["prob"], 3)})
         if as_leg:
@@ -1735,7 +1737,7 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         stake, boost = float(b["stake"]), _num(b["boost_pct"])
         r.update({"bet_type": "straight", "units": round(stake / unit, 2), "stake_usd": stake,
                   "boost_pct": boost or np.nan, "face_usd": _face(b), "bonus_bet": _bonus(b),
-                  "rec_units": (s or {}).get("rec_units", 0.0) if sug else 0.0})
+                  "rec_units": LEAN["units"] if kind == "lean" else ((s or {}).get("rec_units", 0.0) if sug else 0.0)})
         if odds is None:
             r.update({"tier": "unscored", "source": "unscored: odds unreadable", "vpe_verdict": "unscored"})
             return r, None, sug, s
@@ -1745,6 +1747,8 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             r.update({"tier": "unscored", "source": "unscored: " + why, "vpe_verdict": "unscored"})
         else:
             te, v, eb, ee = rate_pick(s["prob"], odds, eff, cfg, sug)
+            if kind == "lean":
+                v = "VPE lean (best available, no edge)" if not te else "VPE lean (+EV at the price taken)"
             mo = s.get("min_odds")
             if mo is not None and pd.notna(mo) and american_to_decimal(odds) < american_to_decimal(mo) - 1e-9:
                 v = f"SKIP rule broken: {int(odds):+d} worse than take-if {int(mo):+d}"
@@ -1772,7 +1776,7 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
              "player": " + ".join(f"{o[0]['player']} {o[0]['side']} {o[0]['line']:g} {o[0]['market']}" for o in out),
              "side": np.nan, "odds": podds, "book": _book(b0), "units": round(stake / unit, 2),
              "stake_usd": stake, "boost_pct": boost or np.nan, "face_usd": _face(b0), "bonus_bet": _bonus(b0),
-             "suggested": "yes" if vpe_par else "no",
+             "suggested": ("lean" if vpe_par.get("lean") else "yes") if vpe_par else "no",
              "rec_stake_usd": vpe_par["stake_usd"] if vpe_par else 0.0,
              "note": ("same-game legs: model treats them as independent, real odds of all hitting differ. " if same_game else "")
                      + ("" if pd.isna(b0["note"]) else str(b0["note"]))}
@@ -1788,7 +1792,9 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
                 r.update({"tier": "unscored", "vpe_verdict": "unscored (a leg has no projection)"})
             else:
                 prob = float(np.prod(probs))
-                te, v, eb, ee = rate_pick(prob, podds, eff, cfg, r["suggested"] == "yes" or (None if r["suggested"] == "unknown" else False))
+                te, v, eb, ee = rate_pick(prob, podds, eff, cfg, r["suggested"] in ("yes", "lean") or (None if r["suggested"] == "unknown" else False))
+                if r["suggested"] == "lean":
+                    v = "VPE lean parlay (best available, no edge)" if ee <= 0 else "VPE lean parlay (+EV at the price taken)"
                 if v == "small +EV, below tiers":
                     v = "+EV parlay" if eb > 0 else "+EV only with boost"
                 r.update({"model_prob": round(prob, 3), "blend_prob": round(prob, 3), "tier": te or "off_model",
@@ -1928,6 +1934,50 @@ def market_prob_for(allp, player, mk, side, line, odds):
             return float(h.iloc[0]["market_prob"])
     return min(implied_prob(odds) / 1.045, 0.97)
 
+# ---------- best available (v2.9 / v15.11): never a bare "no bets" ----------
+# When nothing clears the edge bar, VPE still says which of tonight's lines are the least-bad to play, labeled LEAN.
+# Why: a night with no bets teaches the learning loop nothing new about placed bets and CLV, and boosts get used
+# either way. Leans are logged as suggested = "lean" (their own group in the Summary), never mixed with VPE picks.
+LEAN = {"min_edge": -0.04,   # leans may be up to 4 pts below break-even (anything worse is listed as a pass)
+        "min_prob": 0.50, "straights": 3, "units": 0.5, "parlay_target": 4.0, "parlay_max_legs": 3}
+
+def lean_pool(allp, exclude=()):
+    return parlay_pool(allp, exclude, min_edge=LEAN["min_edge"], min_prob=LEAN["min_prob"])
+
+def lean_straights(allp, exclude, unit_usd):
+    """Top straight bets by edge (one per game) when the staked slip is empty."""
+    d = lean_pool(allp, exclude)
+    if d.empty:
+        return d
+    d = d.sort_values(["leg_edge", "leg_prob"], ascending=False).drop_duplicates("game_id").head(LEAN["straights"]).copy()
+    d["bet_odds"] = [decimal_to_american(x) for x in d["best_dec"]]
+    d["units"] = LEAN["units"]
+    d["stake_usd"] = round(LEAN["units"] * unit_usd, 2)
+    d["cost_usd"] = (d["leg_edge"] * d["stake_usd"]).round(2)
+    return d
+
+def lean_parlay(allp, exclude):
+    """Least-bad ~4x parlay (highest EV, one leg per game) when no +EV parlay exists."""
+    pool = lean_pool(allp, exclude)
+    if pool.empty:
+        return None
+    cand = pool.sort_values("leg_edge", ascending=False).head(PARLAY["pool"]).to_dict("records")
+    best = None
+    for bk in PARLAY["books"]:
+        col = "dec_" + bk
+        for n in range(2, LEAN["parlay_max_legs"] + 1):
+            for combo in itertools.combinations(cand, n):
+                if len({str(c["game_id"]) for c in combo}) < n:
+                    continue
+                dec = float(np.prod([c[col] for c in combo]))
+                if dec < LEAN["parlay_target"]:
+                    continue
+                p = float(np.prod([c["leg_prob"] for c in combo]))
+                ev = p * dec - 1
+                if best is None or ev > best[0] + 1e-9 or (abs(ev - best[0]) <= 1e-9 and p > best[1]):
+                    best = (ev, p, dec, combo, bk)
+    return best
+
 def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     """Legs a parlay may use (one per player), ranked by leg prob. #1-3 Gold, #4-6 Silver."""
     d = allp.copy()
@@ -2061,15 +2111,57 @@ def cmd_parlay(a):
     bp = print_boost(a, allp, stake, cols, keys) if boost else None
     if bp:
         built.append(bp)
+    excl = [x for x in (a.exclude or "").split(";") if x.strip()]
+    lean_keys = [tuple(l[:3]) for l in bp["legs"]] if bp and bp.get("lean") else []
+    if not any(b["target"] for b in built):
+        lp = lean_parlay(allp, excl)
+        print(f"\n=== LEAN - BEST AVAILABLE PARLAY (~{LEAN['parlay_target']:g}x): VPE can't beat these lines tonight ===")
+        if lp:
+            ev, p, dec, combo, bk = lp
+            print(f"  PLACE AT {BOOK_NAME[bk].upper()} | {len(combo)} legs | est. odds {decimal_to_american(dec):+d} | "
+                  f"${stake:.2f} pays ~${stake * dec:.2f} | hit chance {p:.1%} | EV {ev:+.0%} (expected cost ~${-ev * stake:.2f})")
+            print(pd.DataFrame(combo)[cols].to_string(index=False))
+            lean_keys += [(c["player"], c["market"], c["side"]) for c in combo]
+            built.append({"name": f"LEAN ~{LEAN['parlay_target']:g}x", "target": 0, "book": bk, "lean": True,
+                          "odds": decimal_to_american(dec), "hit": round(p, 4), "ev": round(ev, 3), "stake_usd": stake,
+                          "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]})
+        else:
+            print(f"  none: no legs within {-LEAN['min_edge']:.0%} of break-even tonight")
+    has_bets, lean_straight = False, set()
+    if a.bets and os.path.exists(a.bets):
+        bb = pd.read_csv(a.bets)
+        has_bets = len(bb[bb["tier"].notna()] if "tier" in bb else bb) > 0
+    if not has_bets:
+        unit_usd = bank * CONFIG["unit_pct_of_bankroll"]
+        ls = lean_straights(allp, excl, unit_usd)
+        print(f"\n=== LEAN - BEST AVAILABLE STRAIGHTS: VPE says none of tonight's lines beat the book; "
+              f"if you play, these are closest ({LEAN['units']:g}u each, one per game) ===")
+        if len(ls):
+            for _, r in ls.iterrows():
+                print(f"  {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} "
+                      f"({int(r['bet_odds']):+d} at {r['bet_at']}) | win {r['leg_prob']:.1%} | edge {r['leg_edge']:+.1%} | "
+                      f"{r['units']:g}u (${r['stake_usd']:.2f}) | take only at {int(r['bet_odds']):+d} or better")
+            lean_keys += list(zip(ls["player"], ls["market"], ls["side"]))
+            lean_straight = set(zip(ls["player"], ls["market"], ls["side"]))
+        else:
+            print(f"  none: no line within {-LEAN['min_edge']:.0%} of break-even")
+        ls.to_csv(getattr(a, "leans_out", None) or "leans.csv", index=False)
+    elif os.path.exists(getattr(a, "leans_out", None) or "leans.csv"):
+        os.remove(getattr(a, "leans_out", None) or "leans.csv")
     # ONE-PARLAY RULE (10/21-10/26: parlays were the whole loss, -$15.14 of -$15.89): recommend ONE parlay a night:
     # the BOOST parlay if there is one (+EV at market odds alone), else the biggest VPE could build (~10x), else ~4x.
+    real = [b for b in built if not b.get("lean")]
     if built:
-        rec = bp or max(built, key=lambda b: b["target"])
+        # boost parlay (real, then lean) > biggest real parlay > lean parlay
+        rec = (bp if bp and not bp.get("lean") else None) or (max(real, key=lambda b: b["target"]) if real else None) \
+            or bp or built[-1]
         rec["recommended"] = True
+        tag = (" - LEAN: no edge, the least-bad play with what we're given; logged as a VPE lean"
+               if rec.get("lean") else "")
         print(f"\nONE-PARLAY RULE: place ONLY the {rec['name']} parlay at {BOOK_NAME[rec['book']]} "
-              f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}). Any other parlay above = reference only.")
+              f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}){tag}. Any other parlay above = reference only.")
     else:
-        print("\nONE-PARLAY RULE: no VPE parlay tonight -> place none.")
+        print("\nONE-PARLAY RULE: nothing within reach tonight (no legs close to break-even) -> place none.")
     import json
     json.dump(built, open(getattr(a, "parlays_out", None) or "vpe_parlays.json", "w"), indent=1)
     if len(pool):
@@ -2077,7 +2169,10 @@ def cmd_parlay(a):
     if a.bets and os.path.exists(a.bets):
         b = pd.read_csv(a.bets)
         keys += list(zip(b["player"], b["market"], b["side"]))
-    pd.DataFrame(sorted(set(keys)), columns=["player", "market", "side"]).to_csv(a.slip_out, index=False)
+    # a lean straight stays a lean even if the same prop is also a leg somewhere (it is a -EV straight bet)
+    sk = pd.DataFrame(sorted(set(keys) - lean_straight), columns=["player", "market", "side"]).assign(kind="pick")
+    lk = pd.DataFrame(sorted((set(lean_keys) - set(keys)) | lean_straight), columns=["player", "market", "side"]).assign(kind="lean")
+    pd.concat([sk, lk], ignore_index=True).to_csv(a.slip_out, index=False)
     print(f"\nslip of every VPE leg/pick -> {a.slip_out} (use with log --slip and final --slip)")
     print("NOTE: legs treated as independent. Hit chances lean on the market on purpose; the model only tilts them.")
 
@@ -2466,7 +2561,7 @@ def load_calib_table(table, sport):
 # ---------- profit boosts: the one edge that holds even if the model has none ----------
 # At market prices a 2-3 leg parlay is +EV with a 20%+ boost and a 4-leg with 25%+; 5 legs needs ~30%. So a boost goes
 # on its own short parlay (most likely legs, checked +EV at market-only odds), not on the 10x parlay.
-def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, max_win=None):
+def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, max_win=None, need_market_ev=True):
     col = "dec_" + book
     # low-vig legs first: value at market odds (no-vig chance x this book's price), not the shortest prices
     ranked = pool.assign(_mv=pool["market_prob"] * pool[col]).sort_values(["_mv", "leg_prob"], ascending=False)
@@ -2489,13 +2584,13 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
             dec_eff = dec + extra / stake
             p = float(np.prod([c["leg_prob"] for c in combo]))
             p_mkt = float(np.prod([c["market_prob"] for c in combo]))
-            if p_mkt * dec_eff < 1:  # must be +EV even if the model adds nothing
+            if need_market_ev and p_mkt * dec_eff < 1:  # must be +EV even if the model adds nothing
                 continue
             # least risk for the payout: maximize long-run bankroll growth at a 5% stake (penalizes longshots)
             g = p * math.log(1 + 0.05 * (dec_eff - 1)) + (1 - p) * math.log(0.95)
             if best is None or g > best[6] + 1e-12:
                 best = (p * dec_eff - 1, p, p_mkt, dec, dec_eff, combo, g)
-    return best[:6] if best and best[6] > 0 else None
+    return best[:6] if best and (best[6] > 0 or not need_market_ev) else None
 
 
 def print_boost(a, allp, stake, cols, keys):
@@ -2504,9 +2599,16 @@ def print_boost(a, allp, stake, cols, keys):
     min_dec = american_to_decimal(a.boost_min_odds) if a.boost_min_odds else 1.0
     r = boost_parlay(pool, bbook, boost, stake, a.boost_min_legs or 2, a.boost_max_legs or 4, min_dec, a.boost_max_win)
     print(f"\n=== BOOST PARLAY ({boost:g}% profit boost at {BOOK_NAME.get(bbook, bbook)}) ===")
+    lean = False
     if not r:
         print("  no combination is +EV at market odds with this boost (too small, or min odds/legs too strict)")
-        return
+        r = boost_parlay(pool, bbook, boost, stake, a.boost_min_legs or 2, a.boost_max_legs or 4, min_dec,
+                         a.boost_max_win, need_market_ev=False)
+        if not r:
+            print("  and no legs qualify even as a lean")
+            return
+        lean = True
+        print("  LEAN - BEST AVAILABLE BOOST: no edge, but if you use this boost tonight, this is the least-bad way")
     ev, p, p_mkt, dec, dec_eff, combo = r
     print(f"  PLACE AT {BOOK_NAME.get(bbook, bbook).upper()} | {len(combo)} legs | est. odds {decimal_to_american(dec):+d} -> "
           f"{decimal_to_american(dec_eff):+d} boosted | ${stake:.2f} pays ~${stake * dec_eff:.2f} | hit chance {p:.1%} "
@@ -2515,8 +2617,10 @@ def print_boost(a, allp, stake, cols, keys):
     print(pd.DataFrame(combo)[cols].to_string(index=False))
     if a.boost_max_win:
         print(f"  (boost winnings capped at ${a.boost_max_win:g}: counted)")
-    keys += [(c["player"], c["market"], c["side"]) for c in combo]
-    return {"name": f"BOOST {boost:g}%", "target": 0, "book": bbook, "odds": decimal_to_american(dec), "hit": round(p, 4),
+    if not lean:
+        keys += [(c["player"], c["market"], c["side"]) for c in combo]
+    return {"name": f"BOOST {boost:g}%" + (" (LEAN)" if lean else ""), "target": 0, "book": bbook,
+            "odds": decimal_to_american(dec), "hit": round(p, 4), "lean": lean, "ev": round(ev, 3),
             "stake_usd": stake, "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]}
 
 
@@ -3177,7 +3281,13 @@ def cmd_menu(a):
                 print(f"   {r['player']} ({r['team']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}) vs {r['opp']}"
                       f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%} | {r['units']}u")
         else:
-            print("   none qualify tonight")
+            print("   none beat the book tonight")
+            lf = "leans.csv"
+            if os.path.exists(lf) and len(pd.read_csv(lf)):
+                print("   LEAN - best available (no edge; if you play, play these):")
+                for _, r in pd.read_csv(lf).iterrows():
+                    print(f"   ~ {r['player']} ({r['team']}) {r['side']} {r['line']} {r['market']} ({int(r['bet_odds']):+d} at {r['bet_at']})"
+                          f" vs {r['opp']} | win {r['leg_prob']:.1%} | edge {r['leg_edge']:+.1%} | {r['units']:g}u")
     else:
         print("   (run check first)")
     # 2. cross-game parlay
@@ -3185,7 +3295,8 @@ def cmd_menu(a):
     pp = a.parlays if a.parlays and os.path.exists(a.parlays) else None
     rec = next((x for x in json.load(open(pp)) if x.get("recommended")), None) if pp else None
     if rec:
-        print(f"   {rec['name']} at {BOOK_NAME[rec['book']]} {rec['odds']:+d} | hit {rec['hit']:.1%} | ${rec['stake_usd']:.2f}")
+        print(f"   {rec['name']} at {BOOK_NAME[rec['book']]} {rec['odds']:+d} | hit {rec['hit']:.1%} | ${rec['stake_usd']:.2f}"
+              + (" | LEAN: no edge, least-bad play" if rec.get("lean") else ""))
         for l in rec["legs"]:
             print(f"     - {l[0]} {l[2]} {l[3]} {l[1]}")
     else:
