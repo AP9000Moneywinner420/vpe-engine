@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.9"
+VERSION = "NFL v15.10"
 
 # ==================== data ====================
 
@@ -2048,6 +2048,38 @@ def cmd_sweep(a):
           " Quote one line in the header: NEWS: N searches, M changes (names) or NEWS: N searches, no changes.")
 
 
+# ---------- CLV capture (v15.10): closing price for every bet actually placed this week ----------
+# NFL has no alt-line anchoring yet, so the closing no-vig chance is read at the SAME line (or one within 0.5).
+def cmd_close(a):
+    log = read_log(a.log)
+    raw = pd.concat([pd.read_csv(p, dtype=str).fillna("") for p in a.props], ignore_index=True)
+    raw["mk"] = raw["market"].map(lambda m: canon_market(m) or m)
+    raw["_key"] = raw["player"].map(norm_name)
+    for c in ("closing_odds", "line", "odds", "week"):
+        log[c] = pd.to_numeric(log.get(c), errors="coerce")
+    bt = log["bet_type"].fillna("straight").astype(str)
+    m = (log["week"] == a.week) & log["closing_odds"].isna() & bt.isin(["straight", "leg"])
+    n = 0
+    for i in log[m].index:
+        r = log.loc[i]
+        c = raw[(raw["_key"] == norm_name(r["player"])) & (raw["mk"] == r["market"]) & (raw["over_odds"] != "") & (raw["under_odds"] != "")]
+        if c.empty or pd.isna(r["line"]):
+            continue
+        c = c.assign(d=(c["line"].astype(float) - float(r["line"])).abs()).sort_values("d")
+        if c.iloc[0]["d"] > 0.5:
+            continue
+        po = no_vig(float(c.iloc[0]["over_odds"]), float(c.iloc[0]["under_odds"]))[0]
+        p = min(max(po if str(r["side"]).title() == "Over" else 1 - po, 0.02), 0.98)
+        log.loc[i, "closing_odds"] = decimal_to_american(1 / p)
+        n += 1
+    log.to_csv(a.log, index=False)
+    d = log[log["closing_odds"].notna() & log["odds"].notna() & (log["week"] == a.week)]
+    print(f"CLOSE week {a.week}: closing price written to {n} bets/legs")
+    if len(d):
+        clv = d["closing_odds"].map(lambda x: 1 / american_to_decimal(x)) - d["odds"].map(implied_prob)
+        print(f"CLV week {a.week}: {len(d)} bets/legs | beat the close {(clv > 0).mean():.0%} | avg {clv.mean():+.1%}")
+
+
 def shadow_rows(allp, key):
     """One row per line scored this run (Over view): what the model and the market said before the game."""
     out = {}
@@ -2632,6 +2664,8 @@ if __name__ == "__main__":
     sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
     sw_.add_argument("--parlays", default="vpe_parlays.json"); sw_.add_argument("--top", type=int, default=10)
     sw_.add_argument("--heavy", action="store_true", help="final check: every player with a qualifying line")
+    cl_ = sub.add_parser("close"); cl_.add_argument("--log", default="pick_log.csv"); cl_.add_argument("--props", nargs="+", required=True)
+    cl_.add_argument("--week", type=int, required=True)
     ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
@@ -2656,6 +2690,6 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "status": cmd_status,
+     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "close": cmd_close, "status": cmd_status,
      "takeif": cmd_takeif, "frames": cmd_frames}[a.cmd](a)
 

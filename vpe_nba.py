@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.7.0"
+VERSION = "NBA v2.8.0"
 
 # ==================== data ====================
 
@@ -2587,6 +2587,13 @@ def cmd_final(a):
     pd.set_option("display.width", 250)
     print("=== FINAL CHECK (closing prices recorded) ===")
     print(out.to_string(index=False) if len(out) else "slip empty")
+    if a.log and os.path.exists(a.log) and a.props and os.path.exists(a.props):
+        lg_ = read_log(a.log)
+        cpr_ = _read_props([a.props])
+        lg_, n_ = fill_closing(lg_, cpr_[cpr_["market"].notna()], str(today_et().date()), _cfg(a))
+        lg_.to_csv(a.log, index=False)
+        print(f"CLV: closing price written to {n_} placed bets/legs (every bet tonight, not only the slip)")
+        clv_report(lg_, str(today_et().date()))
     if a.log and os.path.exists(a.log) and len(out):
         log = read_log(a.log)
         if "closing_odds" not in log:
@@ -3243,6 +3250,73 @@ def cmd_menu(a):
               f"TAKE only if the app's SGP price is >= {need:+d} (EV +{MENU['sgp_min_ev']:.0%}); a boost counts")
 
 
+# ---------- CLV capture (v2.8): closing price for every bet actually placed ----------
+# Before: `final` only checked VPE's slip and wrote a closing price only when the closing line was EXACTLY the line
+# bet, so placed bets (menu props, boost legs, own picks) almost never got one -> CLV was blank on every row.
+# Now every unsettled straight bet and parlay leg of the night gets the no-vig closing chance of ITS side at ITS line
+# (read off the player's closing main O/U line, same anchoring as alt lines), stored as a fair American price.
+# CLV = closing fair chance - break-even of the price taken (> 0 = beat the close).
+def fill_closing(log, close_props, date, cfg):
+    if close_props is None or close_props.empty:
+        return log, 0
+    cp = close_props.copy()
+    cp["_key"] = cp["player"].map(norm_name)
+    mains = {}
+    for _, r in cp.iterrows():
+        if r["market"] is not None and pd.notna(r["over_odds"]) and pd.notna(r["under_odds"]):
+            mains.setdefault((r["_key"], r["market"]), []).append((float(r["line"]), no_vig(r["over_odds"], r["under_odds"])[0]))
+    for c in ("closing_odds", "line", "odds"):
+        log[c] = pd.to_numeric(log.get(c), errors="coerce")
+    bt = log["bet_type"].fillna("straight").astype(str)
+    m = (log["date"].astype(str) == str(date)) & log["closing_odds"].isna() & bt.isin(["straight", "leg"]) & log["market"].isin(list(MARKETS))
+    n = 0
+    for i in log[m].index:
+        r = log.loc[i]
+        main = mains.get((norm_name(r["player"]), r["market"]))
+        if not main or pd.isna(r["line"]):
+            continue
+        po = anchored_market_over(r["market"], float(r["line"]), main, cfg)
+        if po is None:
+            continue
+        p = po if str(r["side"]).title() == "Over" else 1 - po
+        p = min(max(p, 0.02), 0.98)
+        log.loc[i, "closing_odds"] = decimal_to_american(1 / p)
+        n += 1
+    return log, n
+
+
+def clv_report(log, date=None):
+    d = log.copy()
+    for c in ("closing_odds", "odds"):
+        d[c] = pd.to_numeric(d.get(c), errors="coerce")
+    d = d[d["closing_odds"].notna() & d["odds"].notna()]
+    if date is not None:
+        d = d[d["date"].astype(str) == str(date)]
+    if d.empty:
+        print("CLV: no bets with a closing price yet")
+        return
+    clv = d["closing_odds"].map(lambda x: 1 / american_to_decimal(x)) - d["odds"].map(implied_prob)
+    print(f"CLV{' ' + str(date) if date else ''}: {len(d)} bets/legs | beat the close {(clv > 0).mean():.0%} | avg {clv.mean():+.1%}"
+          f" (closing chance minus the break-even of the price taken)")
+    for (_, r), c in sorted(zip(d.iterrows(), clv), key=lambda x: -x[1]):
+        print(f"   {r['player']} {r['side']} {r['line']} {r['market']} @ {int(r['odds']):+d} -> fair close {int(r['closing_odds']):+d}  CLV {c:+.1%}")
+
+
+def cmd_close(a):
+    """Closing prices for tonight's PLACED bets: props_close.csv (main O/U lines, both sides) + the pick log -> closing_odds."""
+    cfg = _cfg(a)
+    date = str(pd.Timestamp(a.date).date()) if a.date else str(today_et().date())
+    log = read_log(a.log)
+    close = _read_props(a.props) if a.props else pd.DataFrame()
+    if "market" in close:
+        close = close[close["market"].notna()]
+    log, n = fill_closing(log, close, date, cfg)
+    log.to_csv(a.log, index=False)
+    print(f"CLOSE {date}: closing price written to {n} bets/legs in {a.log}"
+          + ("" if n else " (none matched: the closing file needs each bet player's MAIN O/U line with both prices)"))
+    clv_report(log, date)
+
+
 def cmd_vig(a):
     """Measure the hold on one-sided 'X+' prices (FanDuel milestones) against each player's main two-sided line:
     hold = book implied / fair (fair = main line's no-vig chance carried to the milestone through the implied mean)."""
@@ -3571,6 +3645,8 @@ if __name__ == "__main__":
     sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
     sw_.add_argument("--parlays", default="vpe_parlays.json"); sw_.add_argument("--top", type=int, default=10)
     sw_.add_argument("--heavy", action="store_true", help="final check: every player with a qualifying line")
+    cl_ = sub.add_parser("close"); cl_.add_argument("--log", default="nba_pick_log.csv"); cl_.add_argument("--props", nargs="+")
+    cl_.add_argument("--date")
     ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
@@ -3595,5 +3671,5 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
-     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "status": cmd_status, "styles": cmd_styles,
+     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "close": cmd_close, "status": cmd_status, "styles": cmd_styles,
      "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "vig": cmd_vig}[a.cmd](a)
