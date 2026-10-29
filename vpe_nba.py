@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.5.3"
+VERSION = "NBA v2.6.0"
 
 # ==================== data ====================
 
@@ -2265,6 +2265,64 @@ def cmd_learn(a):
           f" next to calib_tab.json before check/parlay/final/takeif.")
 
 
+# ---------- NEWS SWEEP (v2.6 / v15.9): who to check in the news before anything is placed ----------
+# Every run: one news search per game + one per player VPE would put money on (slip, the parlay, top props, SGP legs).
+# What the searches find goes into inj.txt (Out / Doubtful / Questionable / Limited) and `check` is rerun, so a minutes
+# restriction mentioned in a presser but missing from the injury page still reaches the projection.
+SWEEP = {"top": 10, "per_game_queries": 1}
+
+
+def cmd_sweep(a):
+    import json
+    allp = pd.read_csv(a.all) if os.path.exists(a.all) else pd.DataFrame()
+    if allp.empty:
+        print("SWEEP: no scored lines (run check first)")
+        return
+    for c in ("edge", "odds", "market_gap"):
+        allp[c] = pd.to_numeric(allp.get(c), errors="coerce")
+    why = {}
+
+    def add(p, reason):
+        why.setdefault(p, [])
+        if reason not in why[p]:
+            why[p].append(reason)
+    if a.bets and os.path.exists(a.bets) and os.path.getsize(a.bets) > 0:
+        bb = pd.read_csv(a.bets)
+        for p in (bb["player"] if "player" in bb else []):
+            add(p, "straight bet")
+    if a.parlays and os.path.exists(a.parlays):
+        for par in json.load(open(a.parlays)):
+            for l in par.get("legs", []):
+                add(l[0], "parlay leg" + (" (THE parlay)" if par.get("recommended") else ""))
+    top = allp[(allp["edge"] >= 0.015) & allp["odds"].between(-200, 200) & (allp["market_gap"].fillna(0) <= 0.15)]
+    for p in top.sort_values("edge", ascending=False)["player"].drop_duplicates().head(a.top):
+        add(p, "top prop")
+    if a.heavy:  # final check: every player with a qualifying line
+        for p in top["player"].drop_duplicates():
+            add(p, "qualifying line")
+    team_of = allp.drop_duplicates("player").set_index("player")
+    games = {}
+    for p in why:
+        if p not in team_of.index:
+            continue
+        r = team_of.loc[p]
+        g = " vs ".join(sorted([str(r["team"]), str(r["opp"])]))
+        games.setdefault(g, []).append(p)
+    rank = lambda p: (0 if any(w.startswith(("straight", "parlay")) for w in why[p]) else 1, p)
+    n_q = 0
+    print(f"NEWS SWEEP ({'HEAVY - final check' if a.heavy else 'every run'}): {len(why)} players in {len(games)} games")
+    for g, ps in sorted(games.items()):
+        print(f"\n  {g}")
+        print(f'    search: "{g.replace(" vs ", " ")} injury news minutes restriction today"')
+        n_q += 1
+        for p in sorted(ps, key=rank):
+            print(f'    - {p:<26} ({", ".join(why[p])})  search: "{p} status tonight minutes"')
+            n_q += 1
+    print(f"\n{n_q} searches. Any player reported out / doubtful / questionable / on a minutes limit / coming off the bench"
+          " in a new role -> add to inj.txt (Out, Doubtful, Questionable, Limited) and rerun check + parlay + menu."
+          " Quote one line in the header: NEWS: N searches, M changes (names) or NEWS: N searches, no changes.")
+
+
 def shadow_rows(allp, key):
     """One row per line scored this run (Over view): what the model and the market said before the game."""
     out = {}
@@ -3469,6 +3527,9 @@ if __name__ == "__main__":
     mn.add_argument("--bets", default="bets.csv"); mn.add_argument("--parlays", default="vpe_parlays.json")
     mn.add_argument("--games", default="games.csv"); mn.add_argument("--injuries", default="")
     mn.add_argument("--calib", default="calib_tab.json")
+    sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
+    sw_.add_argument("--parlays", default="vpe_parlays.json"); sw_.add_argument("--top", type=int, default=10)
+    sw_.add_argument("--heavy", action="store_true", help="final check: every player with a qualifying line")
     ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
@@ -3493,5 +3554,5 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
-     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "status": cmd_status, "styles": cmd_styles,
+     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "status": cmd_status, "styles": cmd_styles,
      "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "vig": cmd_vig}[a.cmd](a)
