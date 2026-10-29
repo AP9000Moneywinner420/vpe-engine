@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.6.0"
+VERSION = "NBA v2.7.0"
 
 # ==================== data ====================
 
@@ -597,6 +597,12 @@ class State:
                 t_ = pd.DataFrame({"pid": allg["pid"].to_numpy(), "z2": (allg[s_].to_numpy() - mu_) ** 2 / v_}).groupby("pid")["z2"].agg(["sum", "count"])
                 ex["disp_" + s_] = t_["sum"] / t_["count"]
                 ex["disp_n"] = t_["count"]
+            # minutes when he starts vs comes off the bench (this season + last): what a news role change moves him to
+            sb_ = allg.groupby(["pid", "starter"])["min"].agg(["mean", "count"]).unstack("starter")
+            for flag_, nm_ in ((True, "start"), (False, "bench")):
+                if ("mean", flag_) in sb_.columns:
+                    ex[nm_ + "_min"] = sb_[("mean", flag_)]
+                    ex[nm_ + "_n"] = sb_[("count", flag_)]
         self.extra = ex
 
     def find(self, name):
@@ -737,7 +743,7 @@ def blowout_factor(spread, starter, cfg):
         return float(np.sum(w * f[idx]) / np.sum(w))
     return expect(-float(spread)) / expect(0.0)
 
-def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None):
+def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None, news=None):
     """sl: DataFrame indexed by pid with team, opp, home, b2b, spread. Returns means and variances per market."""
     m = cfg["model"]
     flags = flags or {}
@@ -798,6 +804,27 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None):
     sl["returning"] = back
     sl["missed"] = miss_
     mins = mins * np.where(lim, np.minimum(m["restricted_min_mult"], rmult), rmult)
+    # news roles (v2.7, from the news sweep): Starting / Bench move minutes 60% of the way to his own minutes in starts /
+    # bench games (3+ such games, else +15% / -20%); "Cap N" = a reported minutes limit. Only hard facts from news.
+    sl["news_note"] = ""
+    if news:
+        ex_ = state.extra
+        mv_ = mins.copy()
+        for pid_, (kind_, val_) in news.items():
+            if pid_ not in mv_.index:
+                continue
+            cur_ = float(mv_[pid_])
+            if kind_ == "cap":
+                new_ = min(cur_, float(val_))
+            else:
+                col_ = "start" if kind_ == "start" else "bench"
+                n_ = float(ex_[col_ + "_n"].get(pid_, 0) or 0) if col_ + "_n" in ex_ else 0.0
+                tgt_ = float(ex_[col_ + "_min"].get(pid_)) if n_ >= 3 else cur_ * (1.15 if kind_ == "start" else 0.8)
+                new_ = 0.4 * cur_ + 0.6 * tgt_
+                new_ = max(cur_, new_) if kind_ == "start" else min(cur_, new_)
+            mv_[pid_] = new_
+            sl.loc[pid_, "news_note"] = f"news: {'starting' if kind_ == 'start' else 'bench' if kind_ == 'bench' else f'minutes cap {val_:g}'} ({cur_:.0f}->{new_:.0f} min)"
+        mins = mv_
     sl["proj_min"] = np.minimum(mins * sl["nt_min"], m["max_minutes"])
     pace = (state.pace.reindex(sl["opp"]).to_numpy() / state.lg_pace) if flags.get("pace", True) else 1.0
     pace_f = np.power(pace, m["pace_elasticity"])
@@ -1335,7 +1362,21 @@ def _prepare(state, sched, date, props_players, injuries, games, cfg, sure_names
             pid = state.find(r["player"])
             if pid is not None:
                 lim.add(pid)
-    proj = project(state, sl, outs, rosters, cfg, sure=sure, limited=lim) if len(sl) else pd.DataFrame()
+    news = {}
+    if injuries is not None and len(injuries):
+        for _, r in injuries.iterrows():
+            st_ = str(r["status"]).strip().lower()
+            kind_ = "start" if st_ in ("starting", "start", "starter") else "bench" if st_ in ("bench", "reserve", "off bench") else None
+            mm_ = re.match(r"(cap|mins|minutes)\s*(\d+)", st_)
+            if kind_ is None and not mm_:
+                continue
+            pid = state.find(r["player"])
+            if pid is not None:
+                news[pid] = ("cap", float(mm_.group(2))) if mm_ else (kind_, None)
+    proj = project(state, sl, outs, rosters, cfg, sure=sure, limited=lim, news=news) if len(sl) else pd.DataFrame()
+    if len(proj) and "news_note" in proj and "usage_note" in proj:
+        proj["usage_note"] = [(u + ("; " if u and n else "") + n) if isinstance(u, str) else n
+                              for u, n in zip(proj["usage_note"].fillna(""), proj["news_note"].fillna(""))]
     return proj, overrides, outs
 
 # ==================== commands ====================
