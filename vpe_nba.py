@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.9.0"
+VERSION = "NBA v2.10.0"
 
 # ==================== data ====================
 
@@ -2324,6 +2324,52 @@ def _learn_adjust(p, market_p, market=None, side=None):
     return float(p[0]) if scalar else p
 
 
+# ---------- situational watch (v2.10): home / away / back-to-back, checked on live results every morning ----------
+# Tested 10/29 on 2024-25 + 2025-26 (455k player-game-markets, + DK totals): player-specific and team-specific home/away
+# and B2B splits, opponent defense home vs road and opponent-on-B2B all failed (no better than noise); a league-wide B2B
+# trim on rebounds/assists was ~1-2% before DK totals and ~0 after (the market already prices tired legs). So nothing is
+# applied. Instead every graded live line is split by home / away / 2nd night of a B2B, per market, and VPE's predicted
+# Over rate is compared with what hit. REPORT ONLY: a split is flagged for the upgrade chat once n >= 800 and |z| >= 3.
+WATCH = {"n_flag": 800, "z_flag": 3.0}
+
+def situational_watch(d, q, today):
+    if d.empty:
+        return []
+    try:
+        dates = sorted({str(k)[:10] for k in d["key"]})
+        boxes = [load_box(s, max_age_hours=24) for s in sorted({season_for(pd.Timestamp(x)) for x in dates})]
+        box = pd.concat([b for b in boxes if len(b)], ignore_index=True)
+    except Exception as e:
+        print(f"  situational watch: box scores unavailable ({e})")
+        return []
+    box = box[box["played"]]
+    td = set(zip(box["team"], box["date"]))
+    ctx = box.drop_duplicates(["_key", "date"]).set_index(["_key", "date"])[["team", "home"]]
+    keys = pd.MultiIndex.from_arrays([d["player"].map(norm_name), pd.to_datetime(d["key"].str[:10])])
+    c = ctx.reindex(keys)
+    home = c["home"].to_numpy()
+    b2b = np.array([(t, dt - pd.Timedelta(days=1)) in td if isinstance(t, str) else False
+                    for t, dt in zip(c["team"], keys.get_level_values(1))])
+    known = pd.notna(c["team"]).to_numpy()
+    rows = []
+    print("  situational watch (VPE's Over rate said -> hit; report only, nothing applied):")
+    for lab, m0 in (("home", known & (home == True)), ("away", known & (home == False)), ("b2b", known & b2b)):
+        for mk in sorted(d["market"].unique()):
+            m = m0 & (d["market"].to_numpy() == mk)
+            n = int(m.sum())
+            if n < 50:
+                continue
+            said, got = float(q[m].mean()), float(d["over"].to_numpy()[m].mean())
+            z = (got - said) / max(np.sqrt(said * (1 - said) / n), 1e-9)
+            flag = "FLAG for upgrade chat" if n >= WATCH["n_flag"] and abs(z) >= WATCH["z_flag"] else "ok"
+            rows.append([SPORT, "watch", f"{lab}|{mk}", round(got - said, 4), n, f"said {said:.1%} hit {got:.1%} z {z:+.1f} {flag}", today])
+            if flag != "ok" or lab == "b2b":
+                print(f"    {lab:<5} {mk:<6} said {said:.1%} hit {got:.1%}  n={n:<5} z={z:+.1f} {flag}")
+    flagged = [r for r in rows if "FLAG" in r[5]]
+    print(f"    {len(rows)} splits checked (home {int((known & (home == True)).sum())} / away {int((known & (home == False)).sum())}"
+          f" / b2b {int((known & b2b).sum())} lines) -> " + (f"{len(flagged)} FLAGGED" if flagged else "nothing flagged: model holds up"))
+    return rows
+
 def cmd_learn(a):
     """Shadow window + Calib tab -> Learned tab (tail fixes + market gates). Prints what changed and why."""
     import json, datetime
@@ -2342,7 +2388,7 @@ def cmd_learn(a):
             continue
         seen.add(u)
         data.append({"market": r[2], "pm": float(r[6]), "pk": float(r[7]), "over": int(float(r[9])),
-                     "oo": str(r[4]).strip(), "uo": str(r[5]).strip()})
+                     "oo": str(r[4]).strip(), "uo": str(r[5]).strip(), "key": k, "player": r[1]})
     d = pd.DataFrame(data).tail(LEARN["window"])
     prev = {(r["kind"], str(r["key"])): r for r in _learned_rows(a.learned) if str(r.get("sport", "")).upper() == SPORT}
     today = datetime.date.today().isoformat()
@@ -2396,6 +2442,7 @@ def cmd_learn(a):
             out.append([SPORT, "gate", key, lvl, n, f"said {pred:.1%} hit {got:.1%} z {z:+.1f}", today])
             if lvl or was or n >= LEARN["gate_n"]:
                 print(f"    {key:<22} said {pred:.1%} hit {got:.1%}  n={n:<4} z={z:+.1f} -> {tag}")
+    out += situational_watch(d, q, today)
     json.dump(out, open(a.out, "w"))
     print(f"Learned table -> {a.out}: clear 'Learned {SPORT}'!A:G, then write it at 'Learned {SPORT}'!A1. Save it as learned_tab.json"
           f" next to calib_tab.json before check/parlay/final/takeif.")
