@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.11"
+VERSION = "NFL v15.12"
 
 # ==================== data ====================
 
@@ -919,6 +919,27 @@ def used_units(log_path, mask_fn):
     m = mask_fn(d) & (d.get("bet_type", pd.Series("straight", index=d.index)).fillna("straight") != "leg")
     return round(float(pd.to_numeric(d.loc[m, "units"], errors="coerce").fillna(0).sum()), 2)
 
+# ---------- locked prices (v2.11 / v15.12): the user's own recording = the price he gets ----------
+# When every line comes from the user's DraftKings / FanDuel recording or screenshots (book = draftkings or fanduel,
+# not a best-of-market "a/b" pair), VPE treats those prices as fixed: no take-if conditions, no "bet only if the app
+# shows X", no TAKE/SKIP step. The edge is computed once, at the recorded price, and a bet either is a pick or isn't.
+LOCK = {"on": False, "books": ""}
+
+def detect_lock(books):
+    b = pd.Series(books).astype(str).str.lower().str.replace(" ", "", regex=False)
+    on = len(b) > 0 and b.isin(["draftkings", "fanduel"]).all()
+    LOCK["on"], LOCK["books"] = bool(on), " + ".join(sorted({BOOK_NAME_L.get(x, x) for x in b.unique()})) if on else ""
+    return LOCK["on"]
+
+def lock_from(allp):
+    """Read the lock flag that `check` saved into bets_all.csv."""
+    v = allp.get("locked") if allp is not None and len(allp) else None
+    LOCK["on"] = bool(v is not None and v.astype(str).str.lower().isin(["true", "1"]).any())
+    LOCK["books"] = str(allp["locked_books"].dropna().iloc[0]) if LOCK["on"] and "locked_books" in allp and allp["locked_books"].notna().any() else ""
+    return LOCK["on"]
+
+BOOK_NAME_L = {"draftkings": "DraftKings", "fanduel": "FanDuel"}
+
 def apply_caps(evald, cfg):
     if evald.empty:
         return evald
@@ -927,7 +948,8 @@ def apply_caps(evald, cfg):
         bets = bets[bets["market_gap"] <= cfg["model"].get("max_market_gap", 0.15)]
     # carries aren't redistributed, so RB rush props on a team with an Out RB are judgment calls, not auto-stakes
     bets = bets[~bets["usage_note"].fillna("").str.contains("backfield shift")]
-    bets["score"] = bets["ev_per_unit"] * bets["units"]
+    # v2.11: among bets that clear the edge bar at their price, the strongest prop (win chance) gets the cap room first
+    bets["score"] = bets["blend_prob"] + 1e-3 * bets["ev_per_unit"] * bets["units"]
     bets = bets.sort_values("score", ascending=False)
     # one side per player-market
     bets = bets.drop_duplicates(["player", "market"])
@@ -1130,6 +1152,8 @@ def cmd_check(a):
     cap = cfg["strategy_profiles"][cfg["strategy_profile"]]["max_units_per_week"]
     print(f"CAP: {cfg['used_units']:g}u already staked in week {week} (pick log) -> {max(cap - cfg['used_units'], 0):g}u of {cap}u left this week")
     lines = pd.read_csv(a.props)
+    if detect_lock(lines["book"] if "book" in lines else []):
+        print(f"PRICES LOCKED: every line is from your {LOCK['books']} recording/screenshots -> bet them as shown (no take-if)")
     evald, skipped = evaluate_lines(lines, proj, inj, ov, cfg)
     if not evald.empty:
         evald["market_gap"] = (evald["model_prob"] - evald["market_prob"]).abs().round(3)
@@ -1146,8 +1170,9 @@ def cmd_check(a):
     print("\n=== BETS (after caps) ===")
     print(picks[["tier", "player", "team", "opp", "market", "side", "line", "odds", "book", "mean", "blend_prob", "edge",
                  "units", "min_odds", "line_limit"]].to_string(index=False) if not picks.empty else "none")
-    print("  take-if: bet at DraftKings only if DK's line is no worse than line_limit (Over: <=, Under: >=) "
-          "AND DK's odds are min_odds or better. Otherwise it's a pass.")
+    if not LOCK["on"]:
+        print("  take-if: bet at DraftKings only if DK's line is no worse than line_limit (Over: <=, Under: >=) "
+              "AND DK's odds are min_odds or better. Otherwise it's a pass.")
     if not evald.empty:
         held = evald[evald["tier"].notna() & ((evald["market_gap"] > cfg["model"]["max_market_gap"])
                                               | evald["usage_note"].fillna("").str.contains("backfield shift"))]
@@ -1162,6 +1187,7 @@ def cmd_check(a):
     print(skipped.to_string(index=False) if not skipped.empty else "none")
     if a.out:
         picks.assign(season=cfg["season"], week=week).to_csv(a.out, index=False)
+        evald = evald.assign(locked=LOCK["on"], locked_books=LOCK["books"])
         evald.to_csv(a.out.replace(".csv", "_all.csv"), index=False)
         os.makedirs("runs", exist_ok=True)
         evald.to_csv(f"runs/bets_all_W{week}_{pd.Timestamp.now(tz='America/New_York'):%a%H%M%S}.csv", index=False)
@@ -1370,7 +1396,7 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             if kind == "lean":
                 v = "VPE lean (best available, no edge)" if not te else "VPE lean (+EV at the price taken)"
             mo = s.get("min_odds")
-            if mo is not None and pd.notna(mo) and american_to_decimal(odds) < american_to_decimal(mo) - 1e-9:
+            if not LOCK["on"] and mo is not None and pd.notna(mo) and american_to_decimal(odds) < american_to_decimal(mo) - 1e-9:
                 v = f"SKIP rule broken: {int(odds):+d} worse than take-if {int(mo):+d}"
                 r["note"] = (r["note"] + " [below take-if]").strip()
             r.update({"tier": te or "off_model", "source": "engine" if te else "off_model", "vpe_verdict": v,
@@ -1569,7 +1595,7 @@ def lean_straights(allp, exclude, unit_usd):
     d = lean_pool(allp, exclude)
     if d.empty:
         return d
-    d = d.sort_values(["leg_edge", "leg_prob"], ascending=False).drop_duplicates("game_id").head(LEAN["straights"]).copy()
+    d = d.sort_values(["leg_prob", "leg_edge"], ascending=False).drop_duplicates("game_id").head(LEAN["straights"]).copy()
     d["bet_odds"] = [decimal_to_american(x) for x in d["best_dec"]]
     d["units"] = LEAN["units"]
     d["stake_usd"] = round(LEAN["units"] * unit_usd, 2)
@@ -1670,6 +1696,8 @@ def best_parlay(pool, target, book, boost=0.0, under_share=None):
 def cmd_parlay(a):
     set_calib(getattr(a, "calib", None), SPORT)
     allp = pd.read_csv(a.all)
+    if lock_from(allp):
+        print(f"PRICES LOCKED ({LOCK['books']} recording): legs are priced as recorded; no take-if")
     pool = parlay_pool(allp, [x for x in (a.exclude or "").split(";") if x.strip()])
     bank = a.bankroll or CONFIG["bankroll"]
     stake = a.stake if a.stake else max(1.0, round(bank * PARLAY["stake_pct"] * 2) / 2)
@@ -1677,7 +1705,7 @@ def cmd_parlay(a):
     pd.set_option("display.width", 260); pd.set_option("display.max_columns", 30)
     cols = [c for c in ("rank", "medal", "player", "team", "opp", "market", "side", "line", "odds", "src_book",
                         "price_dk", "price_fd", "bet_at", "leg_prob", "model_prob", "market_prob", "leg_edge",
-                        "take_min", "line_limit") if c in pool]
+                        "take_min", "line_limit") if c in pool and not (LOCK["on"] and c in ("take_min", "line_limit"))]
     print(f"LEG POOL: {len(pool)} legs qualify | leg prob = {PARLAY['model_weight']:.0%} model + "
           f"{1 - PARLAY['model_weight']:.0%} market | edge >= {PARLAY['min_edge']:.1%} at DK/FD price | "
           f"gap <= {PARLAY['max_gap']:.0%} | odds {PARLAY['min_odds']} to +{PARLAY['max_odds']}")
@@ -1723,8 +1751,11 @@ def cmd_parlay(a):
               f"EV {p * dec_eff - 1:+.0%} | Unders {sum(c['side'] == 'Under' for c in combo)}")
         print(pd.DataFrame(combo)[cols].to_string(index=False))
         need = 1 + (target - 1) / (1 + boost / 100) if bnote else target
-        print(f"  -> build it at {BOOK_NAME[bk]}; if its parlay odds (before boost) are below {decimal_to_american(need):+d}"
-              f" or a leg is worse than take_min, rerun with --exclude")
+        if LOCK["on"]:
+            print(f"  -> build it at {BOOK_NAME[bk]} as recorded")
+        else:
+            print(f"  -> build it at {BOOK_NAME[bk]}; if its parlay odds (before boost) are below {decimal_to_american(need):+d}"
+                  f" or a leg is worse than take_min, rerun with --exclude")
         keys += [(c["player"], c["market"], c["side"]) for c in combo]
         built.append({"name": name, "target": target, "book": bk, "odds": decimal_to_american(dec), "hit": round(p, 4),
                       "stake_usd": stake, "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]})
@@ -1760,7 +1791,7 @@ def cmd_parlay(a):
             for _, r in ls.iterrows():
                 print(f"  {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} "
                       f"({int(r['bet_odds']):+d} at {r['bet_at']}) | win {r['leg_prob']:.1%} | edge {r['leg_edge']:+.1%} | "
-                      f"{r['units']:g}u (${r['stake_usd']:.2f}) | take only at {int(r['bet_odds']):+d} or better")
+                      f"{r['units']:g}u (${r['stake_usd']:.2f})" + ("" if LOCK["on"] else f" | take only at {int(r['bet_odds']):+d} or better"))
             lean_keys += list(zip(ls["player"], ls["market"], ls["side"]))
             lean_straight = set(zip(ls["player"], ls["market"], ls["side"]))
         else:
@@ -2029,6 +2060,7 @@ def cmd_menu(a):
     import json
     set_calib(getattr(a, "calib", None), SPORT)
     allp = pd.read_csv(a.all)
+    lock_from(allp)
     pool = parlay_pool(allp)
     print("\n" + "=" * 70 + "\nVPE MENU - best options this week (ranked inside each section)\n" + "=" * 70)
     # 0. overall ranking: every scored prop on the slate with a real edge at its price (not held, not out), best first
@@ -2045,19 +2077,19 @@ def cmd_menu(a):
         ok &= pd.to_numeric(ov["base_min"], errors="coerce").fillna(99) >= 20
     if "injury" in ov:
         ok &= ~ov["injury"].fillna("").astype(str).str.contains("Out|Doubtful", case=False)
-    ov = ov[ok].sort_values("edge", ascending=False).head(MENU["top_overall"])
+    ov = ov[ok].sort_values(["blend_prob", "edge"], ascending=False).head(MENU["top_overall"])
     if ov.empty:
         print("   none qualify")
     for i, (_, r) in enumerate(ov.iterrows(), 1):
         star = "★" if (r["player"], r["market"], r["side"]) in on_slip else " "
-        tk = f" | take if odds >= {int(r['min_odds']):+d}" if pd.notna(r.get("min_odds")) else ""
+        tk = f" | take if odds >= {int(r['min_odds']):+d}" if pd.notna(r.get("min_odds")) and not LOCK["on"] else ""
         print(f"  {i:>2}. {star} {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['book']})"
               f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%}{tk}")
     print("\n1) BEST STRAIGHT BETS (the staked slip; max 2 per game)")
     if a.bets and os.path.exists(a.bets):
         b = pd.read_csv(a.bets)
         b = b[b["tier"].notna()] if "tier" in b else b
-        for _, r in b.sort_values("edge", ascending=False).iterrows():
+        for _, r in b.sort_values(["blend_prob", "edge"], ascending=False).iterrows():
             print(f"   {r['player']} ({r['team']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}) vs {r['opp']}"
                   f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%} | {r['units']}u")
         if b.empty:
@@ -2087,9 +2119,9 @@ def cmd_menu(a):
     for gid, g in pool.groupby("game_id", sort=False):
         r0 = g.iloc[0]
         print(f"\n  {r0['team']} vs {r0['opp']}")
-        for _, r in g.sort_values("leg_edge", ascending=False).head(MENU["props_per_game"]).iterrows():
+        for _, r in g.sort_values(["leg_prob", "leg_edge"], ascending=False).head(MENU["props_per_game"]).iterrows():
             print(f"    prop: {r['player']} {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['bet_at']}) | win {r['leg_prob']:.1%}"
-                  f" | edge {r['leg_edge']:+.1%} | take if odds >= {int(r['take_min']):+d}")
+                  f" | edge {r['leg_edge']:+.1%}" + ("" if LOCK["on"] else f" | take if odds >= {int(r['take_min']):+d}"))
 
 
 # ---------- NEWS SWEEP (v2.6 / v15.9): who to check in the news before anything is placed ----------
@@ -2505,6 +2537,7 @@ def cmd_log(a):
     proj = Projector(stats, prev, games, cfg["season"], week, cfg, outs=outs, weather=_weather(a.weather), plays=plays)
     unit = cfg["bankroll"] * cfg["unit_pct_of_bankroll"]
     allp = pd.read_csv(a.all) if a.all and os.path.exists(a.all) else None
+    lock_from(allp)
 
     def score(player, mk, side, line, odds):
         one = pd.DataFrame([{"player": player, "market": mk, "line": line,
@@ -2585,6 +2618,10 @@ def cmd_takeif(a):
     leg's take_min. Anything not tiered tonight = SKIP (not a VPE pick at any price shown)."""
     set_calib(getattr(a, "calib", None), SPORT)
     allp = pd.read_csv(a.all)
+    if lock_from(allp):
+        print(f"PRICES LOCKED: tonight's lines are your {LOCK['books']} recording, so every VPE pick is a TAKE as recorded"
+              " (no price check needed)")
+    lock_from(allp)
     pool = parlay_pool(allp)
     for spec in a.bet:
         t = [x.strip() for x in spec.split(";")]
