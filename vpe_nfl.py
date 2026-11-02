@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.12"
+VERSION = "NFL v15.13"
 
 # ==================== data ====================
 
@@ -1432,6 +1432,9 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             eff = boosted_american(podds, boost)
             r["odds_eff"] = eff
             if same_game:
+                # v2.12: SGPs are RATE-ONLY; even one VPE rated TAKE is logged apart from VPE picks (11/1: a +146u SGP
+                # win was sitting inside "VPE pick" profit)
+                r["suggested"], r["rec_stake_usd"] = "sgp", 0.0
                 r.update({"tier": "sgp_correlated", "vpe_verdict": "same-game parlay: legs correlated, EV not rated "
                           "(use the sgp command before placing)"})
             elif any(x is None for x in probs):
@@ -1916,7 +1919,7 @@ def blend_leg(model_p, market_p, market=None, side=None):
 #     150+ lines) VPE trusts the model half as much there; 10+ pts under (z <= -3) it defers fully to the market (no bet).
 #     A gate lifts itself when the recent window recovers. The core projection math is never touched.
 LEARN = {"start": {"NBA": "2026-10-26", "NFL": "2026-W1"}, "window": 8000, "n0_tail": 600, "tail_cap": 0.04,
-         "tail_bins": [0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0], "bet_edge": 0.025, "gate_n": 150}
+         "tail_bins": [0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0], "bet_edge": 0.025, "gate_n": 150, "est_hold": 1.045}
 LEARNED = {"tail": None, "gate": {}}
 LEARNED_COLS = ["sport", "kind", "key", "value", "n", "note", "updated"]
 
@@ -2022,13 +2025,15 @@ def cmd_learn(a):
     for side in ("Over", "Under"):
         odds = d["oo"] if side == "Over" else d["uo"]
         ok = odds.str.match(r"^[+-]?\d+(\.0)?$")
-        if not ok.any():
-            continue
         p_side = np.where(side == "Over", q, 1 - q)
-        be = np.full(len(d), np.nan)
+        # v2.12: recorded "X+" milestone ladders have no Under price (10/26-11/1: 1,225 of 1,357 Shadow lines), so the
+        # Under gates never saw a bet. A side with no posted price gets a break-even estimated from the no-vig market
+        # chance + a normal 4.5% hold, so every Under VPE would have liked is checked.
+        pk_side = d["pk"].to_numpy() if side == "Over" else 1 - d["pk"].to_numpy()
+        be = np.clip(pk_side * LEARN["est_hold"], 0.02, 0.97)
         be[ok.to_numpy()] = [implied_prob(float(o)) for o in odds[ok]]
         y = d["over"].to_numpy() if side == "Over" else 1 - d["over"].to_numpy()
-        bet = ok.to_numpy() & (p_side - be >= LEARN["bet_edge"])
+        bet = np.isfinite(be) & (p_side - be >= LEARN["bet_edge"])
         for mk in sorted(d["market"].unique()):
             m = bet & (d["market"].to_numpy() == mk)
             n = int(m.sum())
