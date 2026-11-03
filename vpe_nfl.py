@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.13"
+VERSION = "NFL v15.14"
 
 # ==================== data ====================
 
@@ -2180,10 +2180,13 @@ def cmd_sweep(a):
         print(f'    search: "{g.replace(" vs ", " ")} injury news minutes restriction today"')
         n_q += 1
         for p in sorted(ps, key=rank):
-            print(f'    - {p:<26} ({", ".join(why[p])})  search: "{p} status tonight minutes"')
+            print(f'    - {p:<26} ({", ".join(why[p])})  search: "{p} status tonight minutes rotation role"')
             n_q += 1
     print(f"\n{n_q} searches. Any player reported out / doubtful / questionable / on a minutes limit / coming off the bench"
           " in a new role -> add to inj.txt (Out, Doubtful, Questionable, Limited) and rerun check + parlay + menu."
+          "\n  ROLE-LOSS news = Limited (no Overs, minutes x0.8) even with no injury: out of the rotation, a DNP-CD in his last"
+          " game, G League assignment, demoted / losing minutes to a teammate, team declined his option or he is being"
+          " shopped/waived (11/2: Collier's option declined that day -> 12 garbage-time minutes)."
           " Quote one line in the header: NEWS: N searches, M changes (names) or NEWS: N searches, no changes.")
 
 

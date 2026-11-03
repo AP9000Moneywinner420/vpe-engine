@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.12.0"
+VERSION = "NBA v2.13.0"
 
 # ==================== data ====================
 
@@ -826,6 +826,17 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None, 
             sl.loc[pid_, "news_note"] = f"news: {'starting' if kind_ == 'start' else 'bench' if kind_ == 'bench' else f'minutes cap {val_:g}'} ({cur_:.0f}->{new_:.0f} min)"
         mins = mv_
     sl["proj_min"] = np.minimum(mins * sl["nt_min"], m["max_minutes"])
+    # v2.13 bench pull: a bench player (started < half his games) projected ABOVE his last 3 games' minutes plays less
+    # than projected (2024-25 and 2025-26: projected 5+ min over his last 3 -> played ~3 min less, stats ~4% under the
+    # model, Overs hit ~4 pts less often). Pull 20% of that gap back (fit on one season, tested on the other, both ways;
+    # 11/2 Isaiah Collier: bench guard, last season's 26 mpg prior kept his minutes up, he played 12).
+    bp = m.get("bench_l3_pull", 0.0)
+    if flags.get("bench_pull", True) and bp and "min_l3" in state.extra:
+        l3 = state.extra["min_l3"].reindex(sl.index).to_numpy(dtype=float)
+        sr = pd.to_numeric(sl["start_rate"], errors="coerce").fillna(1.0).to_numpy()
+        gap = np.where(np.isfinite(l3) & (sr < 0.5), np.maximum(sl["proj_min"].to_numpy() - l3, 0.0), 0.0)
+        sl["proj_min"] = sl["proj_min"].to_numpy() - bp * gap
+        sl["bench_trim"] = np.round(bp * gap, 1)
     pace = (state.pace.reindex(sl["opp"]).to_numpy() / state.lg_pace) if flags.get("pace", True) else 1.0
     pace_f = np.power(pace, m["pace_elasticity"])
     home_f = np.where(sl["home"].fillna(False).astype(bool), sit["home_rate"], sit["away_rate"]) if flags.get("home", True) else 1.0
@@ -1243,7 +1254,7 @@ CONFIG = {
             "pace_prior_games": 10, "pace_elasticity": 1.0,
             "usage_min_out_minutes": 12, "usage_rep_factor": 0.85, "team_minutes": 240.7, "min_norm_alpha": 0.5,
             "bench_allowance_max": 35, "norm_mode": "bench", "bench_pivot": 40, "unknown_play_rate": 0.6, "team_total_prior_games": 8, "partial_beta_mult": 0.5, "partial_scale_cap": 1.0, "usage_mult_cap": 1.3,
-            "usage_beta": {"default": 0.5}, "wo_min_games": 3, "max_minutes": 40,
+            "usage_beta": {"default": 0.5}, "wo_min_games": 3, "max_minutes": 40, "bench_l3_pull": 0.2,
             # measured on 2024-25 + 2025-26 regular seasons (~40k player-games): players who suit up on the 2nd night of
             # a back-to-back show no minutes/per-minute drop (the B2B effect is rest DNPs -> injury report), so 1.0;
             # home +0.7% / away -0.7% per-minute scoring; minutes vs final margin for starters (28+ mpg) and bench.
@@ -2535,10 +2546,13 @@ def cmd_sweep(a):
         print(f'    search: "{g.replace(" vs ", " ")} injury news minutes restriction today"')
         n_q += 1
         for p in sorted(ps, key=rank):
-            print(f'    - {p:<26} ({", ".join(why[p])})  search: "{p} status tonight minutes"')
+            print(f'    - {p:<26} ({", ".join(why[p])})  search: "{p} status tonight minutes rotation role"')
             n_q += 1
     print(f"\n{n_q} searches. Any player reported out / doubtful / questionable / on a minutes limit / coming off the bench"
           " in a new role -> add to inj.txt (Out, Doubtful, Questionable, Limited) and rerun check + parlay + menu."
+          "\n  ROLE-LOSS news = Limited (no Overs, minutes x0.8) even with no injury: out of the rotation, a DNP-CD in his last"
+          " game, G League assignment, demoted / losing minutes to a teammate, team declined his option or he is being"
+          " shopped/waived (11/2: Collier's option declined that day -> 12 garbage-time minutes)."
           " Quote one line in the header: NEWS: N searches, M changes (names) or NEWS: N searches, no changes.")
 
 
