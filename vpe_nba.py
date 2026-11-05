@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.13.0"
+VERSION = "NBA v2.14.0"
 
 # ==================== data ====================
 
@@ -586,6 +586,8 @@ class State:
             srt = cp.sort_values(["date", "game_id"])
             ex["start_l2"] = srt.groupby("pid").tail(2).groupby("pid")["starter"].mean()
             ex["min_l3"] = srt.groupby("pid").tail(3).groupby("pid")["min"].mean()
+            l10 = srt.groupby("pid").tail(10).groupby("pid")["min"]
+            ex["min_sd10"], ex["min_lo10"], ex["min_hi10"], ex["min_m10"] = l10.std(), l10.min(), l10.max(), l10.mean()
         allg = pd.concat([x for x in (cp, prev_box[prev_box["played"]] if prev_box is not None and len(prev_box) else None)
                           if x is not None and len(x)]) if (len(cp) or (prev_box is not None and len(prev_box))) else None
         if allg is not None:
@@ -1067,6 +1069,48 @@ def anchored_market_over(mk, line, main, cfg, sdm=1.0):
     return prob_over(m, (a * m + b * m * m) * sdm ** 2, mk, line)
 
 
+# ---------- role risk (v2.14): how sturdy is his role? A LABEL, never part of the math ----------
+# Two props can both say 60%: one on a locked-in starter, one on a bench player whose minutes swing 12-24 (11/2 Collier).
+# Measured on 2024-25 + 2025-26 (~38k player-games): chance he plays under 70% of his projected minutes, by his minutes
+# swing over the last 10 games (CV = std / mean). Same pattern both seasons:
+#   starter CV<0.15 ~5% | starter CV 0.15-0.3 ~6-10% | starter CV>=0.3 ~15% | bench CV 0.1-0.2 ~11% | bench CV>=0.2 ~14-21%
+#   bench projected 3+ min above his last 3 ~18%. STABLE ~5%, OK ~6-11%, SHAKY ~14-21% (or news / absence / new team).
+ROLE = {"stable_cv": 0.15, "bench_cv": 0.20, "starter_cv": 0.30, "min_games": 3, "trim": 0.6}
+
+def _rr(r):
+    """' | role STABLE' style tag for printed lines (empty when the run predates v2.14)."""
+    v = r.get("role_risk") if hasattr(r, "get") else None
+    return f" | role {v}" if isinstance(v, str) and v else ""
+
+def role_risk(p):
+    why = []
+    g = lambda k, d=np.nan: p.get(k, d)
+    f_ = lambda v, d: d if v is None or (isinstance(v, float) and np.isnan(v)) else float(v)
+    sr, sd, m10, l3 = f_(g("start_rate"), 1.0), f_(g("min_sd10"), np.nan), f_(g("min_m10"), np.nan), f_(g("min_l3"), np.nan)
+    lo, hi, n = f_(g("min_lo10"), np.nan), f_(g("min_hi10"), np.nan), int(f_(g("n_cur"), 0))
+    cv = sd / m10 if np.isfinite(sd) and np.isfinite(m10) and m10 > 0 else np.nan
+    bench = sr < 0.5
+    if bool(g("limited", False)):
+        why.append("Limited (minutes cap / role-loss news)")
+    if bool(g("returning", False)):
+        why.append("back from an absence")
+    if str(g("news_note", "") or "").strip() not in ("", "nan", "None"):
+        why.append("news role change")
+    if bool(g("new_team", False)):
+        why.append("new team")
+    if n < ROLE["min_games"]:
+        why.append(f"only {n} games this season")
+    if np.isfinite(cv) and cv >= (ROLE["bench_cv"] if bench else ROLE["starter_cv"]):
+        why.append(f"{'bench' if bench else 'starter'}, minutes swing {lo:.0f}-{hi:.0f}")
+    if bench and f_(g("bench_trim"), 0.0) >= ROLE["trim"]:
+        why.append("projected above his last 3 games")
+    swing = f", swing {lo:.0f}-{hi:.0f}" if np.isfinite(lo) else ""
+    if why:
+        return "SHAKY", "; ".join(why) + " (~15-20% chance of a minutes collapse)"
+    if not bench and np.isfinite(cv) and cv < ROLE["stable_cv"]:
+        return "STABLE", f"starter{swing} (~5% chance of a minutes collapse)"
+    return "OK", f"{'bench' if bench else 'starter'}{swing} (~6-11%)"
+
 def evaluate(props, proj, injuries, cfg):
     unit_pct, kf = cfg["unit_pct_of_bankroll"], cfg["staking"]["kelly_fraction"]
     profile = cfg["strategy_profiles"][cfg["strategy_profile"]]
@@ -1138,6 +1182,7 @@ def evaluate(props, proj, injuries, cfg):
                 if units < 0.25:
                     tier, units = None, 0.0
             mo, ll = _take_if(mu, var, mk, line, side, prob, shrink, cfg)
+            rr_ = role_risk(p)
             rows.append({"player": p["name"], "team": p["team"], "opp": p["opp"], "home": p["home"],
                          "game_id": p["game_id"], "market": mk, "side": side, "line": line, "odds": int(odds),
                          "book": r.get("book", "draftkings"), "mean": round(mu, 2), "var": round(var, 3),
@@ -1153,7 +1198,8 @@ def evaluate(props, proj, injuries, cfg):
                          "arch": p.get("arch", ""), "opp_style": p.get("opp_style", ""),
                          "style_f": round(float(np.prod([p["af_" + c] for c in MARKETS[mk] if "af_" + c in p])), 3),
                          "env": round(float(p.get("env", 1.0)), 3), "limited": bool(p.get("limited", False)),
-                         "returning": bool(p.get("returning", False))})
+                         "returning": bool(p.get("returning", False)),
+                         "role_risk": rr_[0], "role_why": rr_[1]})
     ev = pd.DataFrame(rows)
     if len(ev):
         ev["market_gap"] = (ev["model_prob"] - ev["market_prob"]).abs().round(3)
@@ -1655,7 +1701,8 @@ def cmd_check(a):
     print("\n=== BETS (after caps) ===")
     if not picks.empty:
         print(picks[["tier", "player", "team", "opp", "market", "side", "line", "odds", "book", "mean", "proj_min",
-                     "model_prob", "blend_prob", "edge", "units", "min_odds", "line_limit"]].to_string(index=False))
+                     "model_prob", "blend_prob", "edge", "units", "min_odds", "line_limit", "role_risk"]].to_string(index=False))
+        print("\nROLE RISK (label only, not in the math): " + " | ".join(f"{r['player']}: {r['role_risk']} - {r['role_why']}" for _, r in picks.iterrows()))
         print("\n" + picks[["player", "market", "dvp", "pace_f", "b2b", "spread", "new_team", "usage_note"]].to_string(index=False))
     else:
         print("none")
@@ -2099,7 +2146,7 @@ def cmd_parlay(a):
     pd.set_option("display.width", 260); pd.set_option("display.max_columns", 30)
     cols = [c for c in ("rank", "medal", "player", "team", "opp", "market", "side", "line", "odds", "src_book",
                         "price_dk", "price_fd", "bet_at", "leg_prob", "model_prob", "market_prob", "leg_edge",
-                        "take_min", "line_limit") if c in pool and not (LOCK["on"] and c in ("take_min", "line_limit"))]
+                        "take_min", "line_limit", "role_risk") if c in pool and not (LOCK["on"] and c in ("take_min", "line_limit"))]
     print(f"LEG POOL: {len(pool)} legs qualify | leg prob = {PARLAY['model_weight']:.0%} model + "
           f"{1 - PARLAY['model_weight']:.0%} market | edge >= {PARLAY['min_edge']:.1%} at DK/FD price | "
           f"gap <= {PARLAY['max_gap']:.0%} | odds {PARLAY['min_odds']} to +{PARLAY['max_odds']}")
@@ -2185,7 +2232,7 @@ def cmd_parlay(a):
             for _, r in ls.iterrows():
                 print(f"  {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} "
                       f"({int(r['bet_odds']):+d} at {r['bet_at']}) | win {r['leg_prob']:.1%} | edge {r['leg_edge']:+.1%} | "
-                      f"{r['units']:g}u (${r['stake_usd']:.2f})" + ("" if LOCK["on"] else f" | take only at {int(r['bet_odds']):+d} or better"))
+                      f"{r['units']:g}u (${r['stake_usd']:.2f})" + ("" if LOCK["on"] else f" | take only at {int(r['bet_odds']):+d} or better") + _rr(r))
             lean_keys += list(zip(ls["player"], ls["market"], ls["side"]))
             lean_straight = set(zip(ls["player"], ls["market"], ls["side"]))
         else:
@@ -3370,7 +3417,7 @@ def cmd_menu(a):
         star = "★" if (r["player"], r["market"], r["side"]) in on_slip else " "
         tk = f" | take if odds >= {int(r['min_odds']):+d}" if pd.notna(r.get("min_odds")) and not LOCK["on"] else ""
         print(f"  {i:>2}. {star} {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['book']})"
-              f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%}{tk}")
+              f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%}{tk}{_rr(r)}")
     # 1. straights
     print("\n1) BEST STRAIGHT BETS (the staked slip; max 2 per game)")
     if a.bets and os.path.exists(a.bets):
@@ -3379,7 +3426,7 @@ def cmd_menu(a):
         if len(b):
             for _, r in b.sort_values(["blend_prob", "edge"], ascending=False).iterrows():
                 print(f"   {r['player']} ({r['team']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}) vs {r['opp']}"
-                      f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%} | {r['units']}u")
+                      f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%} | {r['units']}u{_rr(r)}")
         else:
             print("   none beat the book tonight")
             lf = "leans.csv"
@@ -3387,7 +3434,7 @@ def cmd_menu(a):
                 print("   LEAN - best available (no edge; if you play, play these):")
                 for _, r in pd.read_csv(lf).iterrows():
                     print(f"   ~ {r['player']} ({r['team']}) {r['side']} {r['line']} {r['market']} ({int(r['bet_odds']):+d} at {r['bet_at']})"
-                          f" vs {r['opp']} | win {r['leg_prob']:.1%} | edge {r['leg_edge']:+.1%} | {r['units']:g}u")
+                          f" vs {r['opp']} | win {r['leg_prob']:.1%} | edge {r['leg_edge']:+.1%} | {r['units']:g}u{_rr(r)}")
     else:
         print("   (run check first)")
     # 2. cross-game parlay
@@ -3419,7 +3466,7 @@ def cmd_menu(a):
         top = g.sort_values(["leg_prob", "leg_edge"], ascending=False).head(MENU["props_per_game"])
         for _, r in top.iterrows():
             print(f"    prop: {r['player']} {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['bet_at']}) | win {r['leg_prob']:.1%}"
-                  f" | edge {r['leg_edge']:+.1%}" + ("" if LOCK["on"] else f" | take if odds >= {int(r['take_min']):+d}"))
+                  f" | edge {r['leg_edge']:+.1%}" + ("" if LOCK["on"] else f" | take if odds >= {int(r['take_min']):+d}") + _rr(r))
         c = g[g["player"].isin(sim_ok["player"])].head(MENU["sgp_cands"]).to_dict("records")
         legs = []
         for x in c:
