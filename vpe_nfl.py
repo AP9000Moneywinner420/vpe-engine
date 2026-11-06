@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.14"
+VERSION = "NFL v15.15"
 
 # ==================== data ====================
 
@@ -297,8 +297,9 @@ class UsageModel:
 
         eff_f = 1.0
         if qb_out and market in ("rec_yds", "receptions", "rush_rec_yds", "anytime_td") and pos != "QB":
-            eff_f = self.cfg.get("backup_qb_efficiency", 0.9)
-            notes.append(f"backup QB x{eff_f}")
+            eff_f = self.cfg.get("backup_qb_efficiency", 1.0)
+            if eff_f != 1.0:
+                notes.append(f"backup QB x{eff_f}")
         who = ", ".join(o["name"] for o in (outs + qb_out))
         res = (extra, eff_f, (f"OUT: {who} | " + "; ".join(notes)) if notes else "")
         self._cache[key] = res
@@ -601,6 +602,49 @@ class Projector:
         self._opp_cache[key] = f
         return f
 
+    # ---------- v15.15 blind spots: things the book prices into the line that VPE's stats can't see ----------
+    # 11/5 BAL vs JAX: 3rd-string QB Joe Fagnano (10/18, 60 yds) in a downpour; VPE took two Overs on BAL receivers.
+    # Emergency QB = the team's usual starter is out and the next QB has < 200 pass attempts (2025 + 2026). Measured on
+    # 2023-25 (167 team-games): team receiving yards x0.95, receptions x0.94, but swinging -16% to +4% by season. The
+    # line already drops for it while VPE's history doesn't, so a model "edge" on an Over there is mostly fake.
+    def qb_situation(self, team):
+        if not hasattr(self, "_qb_cache"):
+            self._qb_cache = {}
+        if team in self._qb_cache:
+            return self._qb_cache[team]
+        res = None
+        lt = self.usage.latest
+        tq = lt[(lt["team"] == team) & (lt["position"] == "QB")]
+        if len(tq):
+            out_mask = is_out(tq["_key"], tq["team"], self.usage.outs)
+            starters_out = [o for o in self.usage.team_outs(team) if o["pos"] == "QB" and o["att"] >= 0.5]
+            if starters_out:
+                att = lambda pid: float(self.s.loc[self.s["player_id"] == pid, "attempts"].fillna(0).sum()) + (
+                    float(self.prev.loc[self.prev["player_id"] == pid, "attempts"].fillna(0).sum()) if self.prev is not None else 0.0)
+                avail = [(att(pid), pid, r["player_display_name"]) for pid, r in tq[~out_mask].iterrows()]
+                nxt = max(avail) if avail else (0.0, None, "unknown QB")
+                if nxt[0] < self.cfg.get("emergency_qb_att", 200):
+                    res = {"name": nxt[2], "att": int(nxt[0]), "out": ", ".join(o["name"] for o in starters_out)}
+        self._qb_cache[team] = res
+        return res
+
+    def blind_spot(self, team, market):
+        """Reason the Over side can't be trusted for this prop (heavy rain/snow, emergency QB), else ''."""
+        why = []
+        if market in ("pass_yds", "pass_tds", "pass_comp", "pass_att", "rec_yds", "receptions", "rush_rec_yds"):
+            g = self.games[(self.games["week"] == self.week)
+                           & ((self.games["home_team"] == team) | (self.games["away_team"] == team))]
+            if len(g) and str(g.iloc[0].get("roof", "outdoors")) not in ("dome", "closed"):
+                for t in (g.iloc[0]["home_team"], g.iloc[0]["away_team"]):
+                    w = self.weather.get(t)
+                    if w and len(w) > 2 and w[2]:
+                        why.append(f"heavy {w[2]} forecast")
+                        break
+            q = self.qb_situation(team)
+            if q:
+                why.append(f"emergency QB {q['name']} ({q['att']} career att; {q['out']} out)")
+        return "; ".join(why)
+
     # ---------- situational (measured on 2025-26 player-games, applied at ~60% strength) ----------
     def situational(self, team, market):
         sc = self.cfg.get("situational", {})
@@ -619,7 +663,7 @@ class Projector:
         wind, temp = r.get("wind"), r.get("temp")
         for t in (r["home_team"], r["away_team"]):
             if t in self.weather:
-                wind, temp = self.weather[t]
+                wind, temp = self.weather[t][:2]
         if outdoor and pd.notna(wind) and wind >= sc["wind_mph"]:
             f *= sc["wind"][group]; notes.append(f"wind {wind:.0f}mph x{sc['wind'][group]}")
         if outdoor and pd.notna(temp) and temp <= sc["cold_f"]:
@@ -671,6 +715,12 @@ class Projector:
         new_base = max(base + use_add, 0.01)
         use_f = new_base / base if base > 0.01 else 1.0
         sit_f, sit_note = self.situational(team, market)
+        q = self.qb_situation(team) if market in ("rec_yds", "receptions", "rush_rec_yds") and pos != "QB" else None
+        if q:
+            eq = self.cfg.get("emergency_qb_efficiency", 0.95)
+            sit_f *= eq
+            sit_note = "; ".join(x for x in (sit_note, f"emergency QB {q['name']} x{eq}") if x)
+        blind = self.blind_spot(team, market)
         sch_f, sch_note = self.scheme.factor(pid, mu["opp"], market) if self.scheme else (1.0, "")
         mc = self.cfg.get("mean_calib", {}).get(market, 1.0)  # measured bias fix (Weeks 3-6 backtest)
         mean = max(new_base * opp_f * env_f * eff_f * sit_f * sch_f * mc, 0.01)
@@ -690,7 +740,7 @@ class Projector:
             "prior_avg": None if prior is None else round(prior, 2),
             "opp_factor": round(opp_f, 3), "env_factor": round(env_f, 3),
             "usage_factor": round(use_f * eff_f, 3), "usage_note": use_note,
-            "situation_factor": round(sit_f, 3), "situation_note": sit_note,
+            "situation_factor": round(sit_f, 3), "situation_note": sit_note, "blind_spot": blind,
             "scheme_factor": round(sch_f, 3), "scheme_note": sch_note,
             "mean": round(mean, 2), "sd": None if sd is None else round(sd, 2), "dist": m["dist"],
             "median": round(self.median(mean, sd, m["dist"]), 1),
@@ -887,6 +937,8 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
             tier = _tier(edge, prob, cfg)
             if tier == "tier_3" and not profile["allow_tier3"]:
                 tier = None
+            if tier and side == "Over" and p.get("blind_spot"):
+                tier = None  # v15.15: the line already reflects rain / an emergency QB; VPE's history doesn't
             units = 0.0
             if tier:
                 units = min(kf * kelly_fraction(prob, odds) / unit_pct, cfg["tiers"][tier]["max_units"])
@@ -898,7 +950,7 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
             rows.append({
                 **{k: p[k] for k in ("player", "team", "pos", "opp", "game_id", "market", "mean", "median",
                                      "season_avg", "last3_avg", "prior_avg", "opp_factor", "env_factor", "usage_factor",
-                                     "usage_note", "situation_factor", "situation_note", "scheme_factor", "scheme_note", "games")},
+                                     "usage_note", "situation_factor", "situation_note", "blind_spot", "scheme_factor", "scheme_note", "games")},
                 "line": line, "side": side, "odds": int(odds), "book": r.get("book", ""),
                 "model_prob": round(pm, 3), "market_prob": round(fair_over if side == "Over" else 1 - fair_over, 3),
                 "blend_prob": round(prob, 3), "breakeven": round(implied_prob(odds), 3),
@@ -1083,7 +1135,8 @@ CONFIG = {
             "mean_calib": {"pass_att": 1.0, "pass_comp": 1.05, "pass_yds": 1.03, "receptions": 1.02,
                            "rush_att": 1.0, "anytime_td": 0.93}, "prob_calibration_shrink": 0.75, "max_market_gap": 0.15,
             "usage_alloc_share_weight": 0.3, "usage_retention_tgt": 0.7, "usage_retention_car": 0.0,
-            "usage_model_weight_games": 3, "backup_qb_efficiency": 0.9,
+            "usage_model_weight_games": 3, "backup_qb_efficiency": 1.0, "emergency_qb_att": 200,
+            "emergency_qb_efficiency": 0.95,
             "situational": {"wind_mph": 15, "cold_f": 35, "wind": {"pass": 0.88, "rec": 0.88, "rush": 1.05},
                             "cold": {"pass": 0.97, "rec": 0.93, "rush": 1.05}, "div": {"pass": 0.98, "rec": 0.98, "rush": 1.0}},
             "scheme": {"enabled": True, "strength": 1.0, "prev_season_weight": 0.5, "coverage_trust": 0.5,
@@ -1129,11 +1182,13 @@ def _overrides(text):
     return o
 
 def _weather(text):
+    """"BUF:18:30;BAL:8:55:rain" = team:wind_mph:temp_F[:rain|snow] (4th field = heavy rain or snow forecast)."""
     w = {}
     for part in (text or "").split(";"):
-        if part.count(":") == 2:
-            t, wind, temp = part.split(":")
-            w[t.strip().upper()] = (float(wind), float(temp))
+        bits = [b.strip() for b in part.split(":")]
+        if len(bits) in (3, 4) and bits[0]:
+            prec = bits[3].lower() if len(bits) == 4 and bits[3].lower() in ("rain", "snow") else ""
+            w[bits[0].upper()] = (float(bits[1]), float(bits[2]), prec)
     return w
 
 def cmd_check(a):
@@ -1638,6 +1693,8 @@ def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
         d = d[d["market_gap"].fillna(1) <= PARLAY["max_gap"]]
     if "usage_note" in d:
         d = d[~d["usage_note"].fillna("").astype(str).str.contains("backfield shift")]
+    if "blind_spot" in d:  # v15.15: no Over legs on rain / emergency-QB props
+        d = d[~((d["side"] == "Over") & d["blind_spot"].fillna("").astype(str).str.len().gt(0))]
     if "base_min" in d:
         d = d[d["base_min"] >= PARLAY["min_minutes"]]
     if "proj_min" in d and "base_min" in d:  # NBA: projected minutes cut 15%+ (blowout/usage) -> unstable leg
@@ -2778,7 +2835,7 @@ if __name__ == "__main__":
     sub.choices["board"].add_argument("--injuries", help='"Name:Out;Name:Questionable"')
     sub.choices["board"].add_argument("--usage-only", action="store_true", help="only players whose usage changed")
     for name in ("check", "board"):
-        sub.choices[name].add_argument("--weather", help='outdoor forecasts "BUF:18:30;CHI:12:40" = team:wind_mph:temp_F')
+        sub.choices[name].add_argument("--weather", help='outdoor forecasts "BUF:18:30;BAL:8:55:rain" = team:wind_mph:temp_F[:rain|snow]')
     sub.choices["board"].add_argument("--scheme", action="store_true", help="add blitz/coverage/box matchup (slower)")
     sub.choices["grade"].add_argument("--log", required=True)
     sub.choices["lines"].add_argument("--src", action="append", required=True,
