@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.15"
+VERSION = "NFL v15.16"
 
 # ==================== data ====================
 
@@ -744,6 +744,10 @@ class Projector:
             "scheme_factor": round(sch_f, 3), "scheme_note": sch_note,
             "mean": round(mean, 2), "sd": None if sd is None else round(sd, 2), "dist": m["dist"],
             "median": round(self.median(mean, sd, m["dist"]), 1),
+            "_x": {"n": n, "wmean": _r(wmean, 2), "decay": self.cfg["recency_decay"], "prior": _r(prior, 2), "prior_n": prior_n,
+                   "k": _r(k, 2), "base": _r(base, 2), "use_add": _r(use_add, 2), "eff": _r(eff_f, 3), "sit": _r(sit_f, 3),
+                   "mc": _r(mc, 3), "itt": _r(mu["itt"], 1), "itt_avg": _r(self.team_avg_itt.get(team), 1),
+                   "sd": None if sd is None else _r(sd, 2), "dist": m["dist"]},
         }
 
     # ---------- probabilities ----------
@@ -789,7 +793,7 @@ class Projector:
                     att = self.s[self.s["player_id"] == pid]["attempts"].mean()
                     if att < 15:
                         continue
-                out.append(p)
+                out.append({k_: v_ for k_, v_ in p.items() if k_ != "_x"})
         return pd.DataFrame(out)
 
 # ==================== selection ====================
@@ -919,15 +923,20 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
         line = float(r["line"])
         # calibration shrink from backtest.py (not for TD markets: Poisson is already calibrated there)
         shrink = 1.0 if mk == "anytime_td" else cfg["model"].get("prob_calibration_shrink", 1.0)
-        p_model_over = cal_prob(Projector.prob_over(p, line), shrink)
+        raw_over = Projector.prob_over(p, line)
+        p_model_over = cal_prob(raw_over, shrink)
         oo, uo = r.get("over_odds"), r.get("under_odds")
+        fair_how = "2way"
         if pd.notna(oo) and pd.notna(uo):
             fair_over, _ = no_vig(oo, uo)
         else:
+            fair_how = "1way"
             side_odds = oo if pd.notna(oo) else uo
             fair = implied_prob(side_odds) / (1 + ASSUMED_HOLD_ONE_SIDED)
             fair_over = fair if pd.notna(oo) else 1 - fair
         p_over = blend_leg(p_model_over, fair_over, mk, "Over")
+        xj = _json.dumps({**p["_x"], "oo": None if pd.isna(oo) else int(oo), "uo": None if pd.isna(uo) else int(uo),
+                          "p": why_prob(p_model_over, fair_over, mk, fair_how, raw_over)})  # v15.16: for `explain`
 
         for side, odds, prob, pm in (("Over", oo, p_over, p_model_over), ("Under", uo, 1 - p_over, 1 - p_model_over)):
             if pd.isna(odds):
@@ -956,7 +965,7 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
                 "blend_prob": round(prob, 3), "breakeven": round(implied_prob(odds), 3),
                 "edge": round(edge, 3), "ev_per_unit": round(ev, 3), "tier": tier, "units": units,
                 "injury": status or "",
-                **dict(zip(("min_odds", "line_limit"), _take_if(p, line, side, prob, shrink, cfg))),
+                **dict(zip(("min_odds", "line_limit"), _take_if(p, line, side, prob, shrink, cfg))), "x": xj,
             })
     return pd.DataFrame(rows), pd.DataFrame(skipped, columns=["player", "market", "reason"])
 
@@ -2818,6 +2827,266 @@ def cmd_grade(a):
         for k, v in s.items():
             print(f"\n== {k} ==\n{v.to_string()}")
 
+
+# ---------- v2.15 / v15.16: the full logic behind every prop VPE suggests (`explain`) ----------
+# `check` stores each prop's whole chain in the "x" column of bets_all.csv: minutes (NBA) or base average (NFL), every
+# factor, the distribution, the model's chance, the market's chance, the learned mix, the price, the tier and the stake.
+# `explain` prints it as one card per suggested prop (straights, parlay legs, leans). Pure reporting: no number changes.
+import json as _json
+
+
+def _r(v, d=3):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(v, d) if math.isfinite(v) else None
+
+
+def why_prob(pm_over, fair_over, mk, fair_how, raw_over):
+    """The win-chance chain for the Over (the Under is its mirror), exactly as blend_leg computed it."""
+    w = float(PARLAY["model_weight"])
+    mix = w * pm_over + (1 - w) * fair_over
+    b = float((PARLAY.get("side_bias") or {}).get(mk, 0.0) or 0.0)
+    g = int((LEARNED.get("gate") or {}).get(f"{mk}|Over", 0))
+    fin = float(blend_leg(pm_over, fair_over, mk, "Over"))
+    return {"raw": _r(raw_over, 4), "cal": _r(pm_over, 4), "fair": _r(fair_over, 4), "how": fair_how, "w": _r(w, 3),
+            "mix": _r(mix, 4), "bias": _r(b, 4), "gate": g, "learn": _r(fin - (mix + b), 4), "fin": _r(fin, 4)}
+
+
+def _pc(v):
+    return "-" if v is None or (isinstance(v, float) and not math.isfinite(v)) else f"{float(v):.1%}"
+
+
+def _xm(v):
+    return "-" if v is None else f"x{float(v):.2f}"
+
+
+def _tier_text(r, x, cfg):
+    prob, odds, side = float(r["blend_prob"]), int(r["odds"]), r["side"]
+    edge = prob - implied_prob(odds)
+    T = cfg["tiers"]
+    rule = " | ".join(f"T{t[-1]} edge>={T[t]['min_edge']:.1%}" + (f" & win>={T[t]['min_prob']:.0%}" if T[t]["min_prob"] > 0 else "")
+                      for t in ("tier_1", "tier_2", "tier_3"))
+    nominal = _tier(edge, prob, cfg)
+    tier = r.get("tier") if isinstance(r.get("tier"), str) else None
+    if tier:
+        return f"{tier.replace('_', ' ').upper()} ({rule})", tier
+    if nominal:
+        why = []
+        if side == "Over" and str(r.get("blind_spot", "") or "") not in ("", "nan"):
+            why.append(f"blind spot: {r['blind_spot']} -> no Overs")
+        if side == "Over" and (str(r.get("limited", "")).lower() in ("true", "1") or str(r.get("returning", "")).lower() in ("true", "1")):
+            why.append("minutes restriction / just back from an absence -> no Overs")
+        smax = cfg["staking"].get("straight_max_odds")
+        if smax and odds > smax:
+            why.append(f"long shot over +{smax}")
+        if nominal == "tier_3" and not cfg["strategy_profiles"][cfg["strategy_profile"]]["allow_tier3"]:
+            why.append("Tier 3 off in this profile")
+        return f"clears {nominal.replace('_', ' ')} on edge but blocked: {'; '.join(why) or 'stake rounds below 0.25u'}", None
+    need = T["tier_3"]["min_edge"] - edge
+    return f"no tier: edge {edge:+.1%} is {need:.1%} short of Tier 3 ({rule})", None
+
+
+def _stake_text(r, cfg, tier):
+    if not tier:
+        return "no stake (no tier)"
+    prob, odds = float(r["blend_prob"]), int(r["odds"])
+    f = kelly_fraction(prob, odds)
+    kf, up = cfg["staking"]["kelly_fraction"], cfg["unit_pct_of_bankroll"]
+    raw = kf * f / up
+    cap = cfg["tiers"][tier]["max_units"]
+    q = str(r.get("injury", "") or "")
+    qn = f" x{cfg['staking']['questionable_stake_mult']} ({q})" if q in ("Questionable", "Gtd", "Game Time Decision") else ""
+    return (f"full Kelly {f:.1%} of bankroll x {kf:g} (quarter-Kelly) / {up:.0%} per unit = {raw:.2f}u, cap {cap:g}u{qn}, "
+            f"rounded to 0.25u = {float(r['units']):g}u")
+
+
+def _held_text(r, cfg):
+    gap = abs(float(r["model_prob"]) - float(r["market_prob"]))
+    mg = cfg["model"].get("max_market_gap", 0.15)
+    out = [f"model vs market gap {gap:.1%} ({'HELD: over ' + format(mg, '.0%') if gap > mg else 'ok, under ' + format(mg, '.0%')})"]
+    if "backfield shift" in str(r.get("usage_note", "")):
+        out.append("HELD: backfield shift")
+    bm = r.get("base_min")
+    if bm is not None and pd.notna(bm) and float(bm) < cfg["model"].get("min_minutes_to_bet", 0):
+        out.append(f"HELD: only {float(bm):.0f} base minutes")
+    return "; ".join(out)
+
+
+def _leg_text(r):
+    """How the parlay engine prices this leg at DraftKings and FanDuel."""
+    sb = side_book(r["book"], r["side"])
+    decs = {b: _dec(r["odds"]) - (0 if sb == b else PARLAY["haircut"]) for b in PARLAY["books"]}
+    bk = max(decs, key=decs.get)
+    lp = float(blend_leg(float(r["model_prob"]), float(r["market_prob"]), r["market"], r["side"]))
+    pr = " / ".join(f"{BOOK_NAME[b]} {decimal_to_american(d):+d}{'' if sb == b else ' (est.)'}" for b, d in decs.items())
+    return f"leg prob {lp:.1%} (same mix, {r['side']}-side learned fix) | {pr} -> best {BOOK_NAME[bk]} -> leg edge {lp - 1 / decs[bk]:+.1%} (needs {PARLAY['min_edge']:+.1%})"
+
+
+def _head_nba(r, x):
+    L, m, c = [], x["m"], x["c"]
+    steps = [("season base", m.get("base")), ("teammates out", m.get("usage")), ("last-3 games pull", m.get("role")),
+             ("games without the missing teammate", m.get("wo")), ("back-to-back", m.get("b2b")), ("blowout risk", m.get("blow")),
+             ("restriction / back from absence", m.get("restrict")), ("news role", m.get("news")),
+             ("new team / 48-min cap", m.get("nt")), ("bench pull", m.get("final"))]
+    chain, prev = [], None
+    for nm, v in steps:
+        if v is None:
+            continue
+        if prev is None:
+            chain.append(f"{v:.1f} {nm}")
+        elif abs(v - prev) >= 0.05:
+            chain.append(f"{v - prev:+.1f} {nm}")
+        prev = v
+    L.append("  1 MINUTES    " + " -> ".join(chain) + f" = {m['final']:.1f} projected")
+    ctx = []
+    if c.get("l3") is not None: ctx.append(f"last 3 games {c['l3']:.1f}")
+    if c.get("m10") is not None: ctx.append(f"last 10 {c['m10']:.1f} +/- {c.get('sd10') or 0:.1f}")
+    if c.get("sr") is not None: ctx.append(f"started {c['sr']:.0%} of games")
+    ctx.append(f"{c.get('n')} games this season")
+    if c.get("days") is not None: ctx.append(f"{int(c['days'])} days since last game")
+    if c.get("news"): ctx.append(c["news"])
+    if c.get("usage"): ctx.append("usage: " + c["usage"])
+    L.append("               " + " | ".join(ctx))
+    g = x["g"]
+    tot = f"implied {g['implied']:.1f} pts vs {g['base']:.1f} expected" if g.get("implied") is not None and g.get("base") else "no game total"
+    L.append(f"  2 GAME       {'home' if g.get('home') else 'away'}{' | 2nd night of a back-to-back' if g.get('b2b') else ''} | "
+             f"spread {g.get('spread')} | total {g.get('total')} ({tot}) | style: {g.get('arch')} vs {g.get('opp_style')} defense")
+    parts = []
+    for s, v in x["s"].items():
+        parts.append(f"  3 {s.upper():<4} RATE {v['raw']:.3f}/min x usage {_xm(v['use'])} | DvP {_xm(v['dvp'])} | pace {_xm(g['pace'])} | "
+                     f"home/away {_xm(g['hf'])} | B2B {_xm(g['b2br'])} | new team {_xm(g['ntr'])} | style {_xm(v['af'])} | "
+                     f"game total {_xm(v['ef'])}  -> {m['final']:.1f} min x = {v['mu']:.2f}")
+    L += parts
+    return L
+
+
+def _head_nfl(r, x):
+    L = []
+    n, k = x.get("n"), x.get("k")
+    pr = (f"2025 prior {x['prior']:.1f}/game ({x['prior_n']} games, worth {k:g} games)" if x.get("prior_n")
+          else f"position baseline {x['prior']:.1f} (no 2025 sample, worth {k:g} games)")
+    L.append(f"  1 BASE       2026: {n} games, recency-weighted {x['wmean']:.1f} (each older game x{x['decay']:g}; season avg "
+             f"{r['season_avg']}, last 3 {r['last3_avg']}) + {pr} = {x['base']:.1f}")
+    L.append(f"  2 USAGE      {x['use_add']:+.1f}/game from injured teammates, efficiency {_xm(x['eff'])}"
+             + (f" ({r['usage_note']})" if str(r.get("usage_note", "") or "") not in ("", "nan") else " (no change)"))
+    env = (f"implied {x['itt']:.1f} pts vs his team's usual {x['itt_avg']:.1f}" if x.get("itt") and x.get("itt_avg") else "no game line")
+    sit = str(r.get("situation_note", "") or "")
+    sch = str(r.get("scheme_note", "") or "")
+    L.append(f"  3 FACTORS    matchup {_xm(r['opp_factor'])} ({r['opp']} vs {r['pos']}s) | game script {_xm(r['env_factor'])} ({env}) | "
+             f"situation {_xm(x['sit'])}{' (' + sit + ')' if sit not in ('', 'nan') else ''} | scheme {_xm(r['scheme_factor'])}"
+             f"{' (' + sch + ')' if sch not in ('', 'nan') else ''} | mean calibration {_xm(x['mc'])}")
+    return L
+
+
+def explain_card(r, x, labels, cfg):
+    side, line, odds = r["side"], float(r["line"]), int(r["odds"])
+    flip = (lambda v: v) if side == "Over" else (lambda v: None if v is None else 1 - v)
+    sg = 1 if side == "Over" else -1
+    book = BOOK_NAME.get(str(r.get("book", "")).lower(), r.get("book", ""))
+    L = [f"=== {r['player']} ({r['team']} vs {r['opp']}) - {side} {line:g} {r['market']} {odds:+d} {book} ===",
+         "  ROLE: " + " + ".join(labels)]
+    L += _head_nba(r, x) if SPORT == "NBA" else _head_nfl(r, x)
+    mean, sd = float(r["mean"]), x.get("sd")
+    L.append(f"  4 PROJECTION mean {mean:.1f} vs line {line:g} ({mean - line:+.1f})"
+             + (f" | median {r['median']}" if "median" in r and pd.notna(r.get("median")) else "")
+             + (f" | sd {sd:.1f}" if sd else "") + f" | {x.get('dist')} distribution")
+    p = x["p"]
+    L.append(f"  5 MODEL      raw P({side} {line:g}) {_pc(flip(p['raw']))} -> calibrated {_pc(flip(p['cal']))} (backtest calibration)")
+    fo = lambda v: "-" if v is None else f"{int(v):+d}"
+    how = {"2way": f"no-vig of both sides (Over {fo(x.get('oo'))} / Under {fo(x.get('uo'))})", "anchor": "read off his main O/U line (alt/milestone price)",
+           "1way": "one-sided price minus estimated vig"}.get(p["how"], p["how"])
+    L.append(f"  6 MARKET     no-vig {side} {_pc(flip(p['fair']))} - {how}")
+    gate = {0: "", 1: " (gate HALF: model trusted half)", 2: " (gate PAUSED: market only)"}.get(p.get("gate", 0), "")
+    L.append(f"  7 WIN CHANCE {p['w']:.0%} model x {_pc(flip(p['cal']))} + {1 - p['w']:.0%} market x {_pc(flip(p['fair']))} = "
+             f"{_pc(flip(p['mix']))} | Over-rate fix {sg * (p['bias'] or 0):+.1%} | learned tail/gate {sg * (p['learn'] or 0):+.1%}{gate}"
+             f" = {_pc(float(r['blend_prob']))}")
+    be = implied_prob(odds)
+    tt, tier = _tier_text(r, x, cfg)
+    if not tier and any("LEG" in l for l in labels):
+        tt += f" - as a parlay leg it only needs {PARLAY['min_edge']:+.1%} (line 11)"
+    L.append(f"  8 PRICE      {odds:+d} -> break-even {be:.1%} -> edge {float(r['blend_prob']) - be:+.1%} -> {tt}")
+    L.append(f"  9 STAKE      {_stake_text(r, cfg, tier)}")
+    risk = [_held_text(r, cfg)]
+    if str(r.get("role_risk", "") or "") not in ("", "nan"):
+        risk.insert(0, f"role {r['role_risk']} ({r.get('role_why', '')})")
+    if str(r.get("injury", "") or "") not in ("", "nan"):
+        risk.append(f"injury: {r['injury']}")
+    if str(r.get("blind_spot", "") or "") not in ("", "nan"):
+        risk.append(f"blind spot: {r['blind_spot']}")
+    L.append(f" 10 RISK       " + " | ".join(risk))
+    if any("LEG" in l for l in labels):
+        L.append(f" 11 PARLAY LEG {_leg_text(r)}")
+    L.append(f"  IN ONE LINE: projects {mean:.1f} vs {line:g} -> model {_pc(flip(p['cal']))}, market {_pc(flip(p['fair']))} -> "
+             f"VPE {_pc(float(r['blend_prob']))} vs {be:.1%} needed = {float(r['blend_prob']) - be:+.1%}")
+    return "\n".join(L)
+
+
+def cmd_explain(a):
+    set_calib(getattr(a, "calib", None), SPORT)
+    allp = pd.read_csv(a.all)
+    lock_from(allp)
+    cfg = CONFIG
+    if "x" not in allp:
+        print("EXPLAIN: bets_all.csv has no breakdown column (written by an older engine) -> rerun check, then explain")
+        return
+    want = {}  # (player, market, side, line or None) -> labels
+
+    def add(pl, mk, sd, ln, label):
+        want.setdefault((pl, mk, sd, None if ln is None or pd.isna(ln) else float(ln)), []).append(label)
+    if a.player:
+        mk = canon_market(a.market) if a.market else None
+        for nm in [s for s in a.player.split(";") if s.strip()]:
+            d = allp[allp["player"].map(norm_name) == norm_name(nm)]
+            if mk:
+                d = d[d["market"] == mk]
+            if a.side:
+                d = d[d["side"].str.lower() == a.side.lower()]
+            if d.empty:
+                print(f"EXPLAIN: no scored line for {nm}" + (f" {mk}" if mk else ""))
+            for _, r in d.iterrows():
+                add(r["player"], r["market"], r["side"], r["line"], "asked")
+    else:
+        if a.bets and os.path.exists(a.bets):
+            for _, r in pd.read_csv(a.bets).iterrows():
+                add(r["player"], r["market"], r["side"], r["line"], f"STRAIGHT BET {float(r['units']):g}u ({r['tier']})")
+        if a.parlays and os.path.exists(a.parlays):
+            for pz in _json.load(open(a.parlays)):
+                tag = "THE parlay to place" if pz.get("recommended") else "reference only"
+                for i, lg in enumerate(pz["legs"], 1):
+                    add(lg[0], lg[1], lg[2], lg[3], f"LEG {i} of {pz['name']} parlay at {BOOK_NAME.get(pz['book'], pz['book'])} ({tag})")
+        if a.leans and os.path.exists(a.leans):
+            ls = pd.read_csv(a.leans)
+            for _, r in ls.iterrows():
+                add(r["player"], r["market"], r["side"], r["line"], f"LEAN straight {float(r.get('units', 0.5)):g}u (best available, no edge)")
+        have = {(k[0], k[1], k[2]) for k in want}
+        if a.slip and os.path.exists(a.slip):
+            for _, r in pd.read_csv(a.slip).iterrows():
+                if (r["player"], r["market"], r["side"]) not in have:
+                    add(r["player"], r["market"], r["side"], None, "top of the parlay leg pool (menu pick)" if r.get("kind") != "lean" else "lean leg")
+    if not want:
+        print("EXPLAIN: nothing suggested in this run (no bets.csv / vpe_parlays.json / leans.csv / slip.csv rows)")
+        return
+    order = lambda kv: (0 if any(l.startswith("STRAIGHT") for l in kv[1]) else 1 if any("THE parlay" in l for l in kv[1])
+                        else 2 if any(l.startswith("LEAN") for l in kv[1]) else 3)
+    print(f"EXPLAIN [{VERSION}]: full logic for {len(want)} suggested props (straights, the parlay's legs, leans, other legs)\n")
+    for (pl, mk, sd, ln), labels in sorted(want.items(), key=order):
+        d = allp[(allp["player"] == pl) & (allp["market"] == mk) & (allp["side"] == sd)]
+        if ln is not None:
+            d = d[(pd.to_numeric(d["line"], errors="coerce") - ln).abs() < 1e-6]
+        if d.empty:
+            print(f"=== {pl} {sd} {ln} {mk}: not in bets_all.csv (rerun check) ===\n")
+            continue
+        r = d.sort_values("blend_prob", ascending=False).iloc[0].to_dict()
+        try:
+            x = _json.loads(r["x"])
+        except Exception:
+            print(f"=== {pl} {sd} {mk}: no breakdown stored ===\n")
+            continue
+        print(explain_card(r, x, labels, cfg) + "\n")
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Verified Prop Engine - NFL (in-chat edition)")
@@ -2892,6 +3161,10 @@ if __name__ == "__main__":
     sh.add_argument("--mode", choices=["pull", "push"], required=True)
     sh.add_argument("--json", default="sheet_tab.json"); sh.add_argument("--log", required=True)
     sh.add_argument("--out", default="sheet_all.json")
+    ex_ = sub.add_parser("explain")
+    for k, v in (("--all", "bets_all.csv"), ("--bets", "bets.csv"), ("--parlays", "vpe_parlays.json"), ("--leans", "leans.csv"),
+                 ("--slip", "slip.csv"), ("--calib", None), ("--player", None), ("--market", None), ("--side", None)):
+        ex_.add_argument(k, default=v)
     f = sub.add_parser("final")
     for k, v in (("--slip", "slip.csv"), ("--all", "bets_all.csv"), ("--props", "props_close.csv"), ("--log", None),
                  ("--injuries", None), ("--exclude", None), ("--bets", "bets.csv"), ("--slip-out", "slip.csv"),
@@ -2904,5 +3177,5 @@ if __name__ == "__main__":
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
      "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "close": cmd_close, "status": cmd_status,
-     "takeif": cmd_takeif, "frames": cmd_frames}[a.cmd](a)
+     "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain}[a.cmd](a)
 
