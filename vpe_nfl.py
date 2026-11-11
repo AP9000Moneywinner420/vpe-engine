@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.16"
+VERSION = "NFL v15.17"
 
 # ==================== data ====================
 
@@ -943,7 +943,7 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
                 continue
             edge = prob - implied_prob(odds)
             ev = ev_per_unit(prob, odds)
-            tier = _tier(edge, prob, cfg)
+            tier = _tier(edge - (EST_MARGIN if fair_how == "1way" else 0.0), prob, cfg)  # v2.16: est. market
             if tier == "tier_3" and not profile["allow_tier3"]:
                 tier = None
             if tier and side == "Over" and p.get("blind_spot"):
@@ -965,7 +965,8 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
                 "blend_prob": round(prob, 3), "breakeven": round(implied_prob(odds), 3),
                 "edge": round(edge, 3), "ev_per_unit": round(ev, 3), "tier": tier, "units": units,
                 "injury": status or "",
-                **dict(zip(("min_odds", "line_limit"), _take_if(p, line, side, prob, shrink, cfg))), "x": xj,
+                **dict(zip(("min_odds", "line_limit"), _take_if(p, line, side, prob - (EST_MARGIN if fair_how == "1way" else 0.0), shrink, cfg))), "x": xj,
+                "mkt_est": fair_how == "1way",
             })
     return pd.DataFrame(rows), pd.DataFrame(skipped, columns=["player", "market", "reason"])
 
@@ -1217,7 +1218,7 @@ def cmd_check(a):
     print(f"CAP: {cfg['used_units']:g}u already staked in week {week} (pick log) -> {max(cap - cfg['used_units'], 0):g}u of {cap}u left this week")
     lines = pd.read_csv(a.props)
     if detect_lock(lines["book"] if "book" in lines else []):
-        print(f"PRICES LOCKED: every line is from your {LOCK['books']} recording/screenshots -> bet them as shown (no take-if)")
+        print(f"PRICES LOCKED: every line is from your {LOCK['books']} recording/screenshots -> priced as recorded; every pick still shows its take-if (worst price still worth it) in case the price moves before you bet")
     evald, skipped = evaluate_lines(lines, proj, inj, ov, cfg)
     if not evald.empty:
         evald["market_gap"] = (evald["model_prob"] - evald["market_prob"]).abs().round(3)
@@ -1234,7 +1235,7 @@ def cmd_check(a):
     print("\n=== BETS (after caps) ===")
     print(picks[["tier", "player", "team", "opp", "market", "side", "line", "odds", "book", "mean", "blend_prob", "edge",
                  "units", "min_odds", "line_limit"]].to_string(index=False) if not picks.empty else "none")
-    if not LOCK["on"]:
+    if True:  # v2.16: take-if on recordings too (prices move before bets go in)
         print("  take-if: bet at DraftKings only if DK's line is no worse than line_limit (Over: <=, Under: >=) "
               "AND DK's odds are min_odds or better. Otherwise it's a pass.")
     if not evald.empty:
@@ -1460,8 +1461,9 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             if kind == "lean":
                 v = "VPE lean (best available, no edge)" if not te else "VPE lean (+EV at the price taken)"
             mo = s.get("min_odds")
-            if not LOCK["on"] and mo is not None and pd.notna(mo) and american_to_decimal(odds) < american_to_decimal(mo) - 1e-9:
-                v = f"SKIP rule broken: {int(odds):+d} worse than take-if {int(mo):+d}"
+            if mo is not None and pd.notna(mo) and american_to_decimal(odds) < american_to_decimal(mo) - 1e-9:
+                v = (f"taken below take-if: {int(odds):+d} vs {int(mo):+d} (price moved after the recording)" if LOCK["on"]
+                     else f"SKIP rule broken: {int(odds):+d} worse than take-if {int(mo):+d}")
                 r["note"] = (r["note"] + " [below take-if]").strip()
             r.update({"tier": te or "off_model", "source": "engine" if te else "off_model", "vpe_verdict": v,
                       "edge_base": eb, "edge": ee, "ev_per_unit": round(ev_per_unit(s["prob"], eff), 3)})
@@ -1479,6 +1481,9 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         probs = [o[1] for o in out]
         teams = [frozenset((o[3]["team"], o[3]["opp"])) for o in out if o[3]]
         same_game = len(teams) != len(set(teams))
+        if same_game:  # v2.16: legs of a same-game parlay carry the parlay's label (rate-only SGP)
+            for o in out:
+                o[0]["suggested"] = "sgp"
         # a placed parlay is a VPE pick only if it is EXACTLY a parlay VPE built tonight (same legs, nothing added/removed)
         lk = frozenset((norm_name(o[0]["player"]), o[0]["market"], o[0]["side"]) for o in out)
         vpe_par = next((v for v in VPE_PARLAYS if frozenset((norm_name(x[0]), x[1], x[2]) for x in v["legs"]) == lk), None)
@@ -1730,10 +1735,19 @@ def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     d["price_fd"] = [decimal_to_american(x) for x in d["dec_fanduel"]]
     d["leg_prob"] = np.round(blend_leg(d["model_prob"], d["market_prob"], d["market"], d["side"]), 3)
     d["leg_edge"] = (d["leg_prob"] - 1 / d["best_dec"]).round(3)
-    d = d[(d["leg_edge"] >= (PARLAY["min_edge"] if min_edge is None else min_edge))
+    d["_estm"] = (d["mkt_est"].astype(str).str.lower().isin(["true", "1"]) * EST_MARGIN) if "mkt_est" in d else 0.0
+    d = d[(d["leg_edge"] - d["_estm"] >= (PARLAY["min_edge"] if min_edge is None else min_edge))
           & (d["leg_prob"] >= (PARLAY["min_prob"] if min_prob is None else min_prob))]
     # take-if: worst odds (at either book) at which this leg still clears min_edge
-    d["take_min"] = [int(decimal_to_american(1 / (p - PARLAY["min_edge"]))) for p in d["leg_prob"]]
+    d["take_min"] = [int(decimal_to_american(1 / (p - PARLAY["min_edge"] - m))) for p, m in zip(d["leg_prob"], d["_estm"])]
+    # v2.16: flag a leg whose player is HELD on another market tonight (model vs market gap: usually news)
+    gap_ = (pd.to_numeric(allp["model_prob"], errors="coerce") - pd.to_numeric(allp["market_prob"], errors="coerce")).abs()
+    hmap = {}
+    for _, h in allp[gap_ > CONFIG["model"].get("max_market_gap", 0.15)].iterrows():
+        hmap.setdefault(norm_name(h["player"]), set()).add((h["market"], h["side"], float(h["line"])))
+    d["held_note"] = ["; ".join(f"HELD {m} {sd2} {l:g}" for m, sd2, l in sorted(hmap.get(norm_name(pl), set()))
+                                if (m, sd2, l) != (mk, sd, float(ln)))
+                      for pl, mk, sd, ln in zip(d["player"], d["market"], d["side"], d["line"])]
     d = d.sort_values(["leg_prob", "leg_edge"], ascending=False).drop_duplicates("player").reset_index(drop=True)
     d["rank"] = d.index + 1
     d["medal"] = np.where(d["rank"] <= 3, "Gold", np.where(d["rank"] <= 6, "Silver", "pool"))
@@ -1766,7 +1780,7 @@ def cmd_parlay(a):
     set_calib(getattr(a, "calib", None), SPORT)
     allp = pd.read_csv(a.all)
     if lock_from(allp):
-        print(f"PRICES LOCKED ({LOCK['books']} recording): legs are priced as recorded; no take-if")
+        print(f"PRICES LOCKED ({LOCK['books']} recording): legs are priced as recorded; take_min / take-if shown in case the price moves before you bet")
     pool = parlay_pool(allp, [x for x in (a.exclude or "").split(";") if x.strip()])
     bank = a.bankroll or CONFIG["bankroll"]
     stake = a.stake if a.stake else max(1.0, round(bank * PARLAY["stake_pct"] * 2) / 2)
@@ -1774,7 +1788,7 @@ def cmd_parlay(a):
     pd.set_option("display.width", 260); pd.set_option("display.max_columns", 30)
     cols = [c for c in ("rank", "medal", "player", "team", "opp", "market", "side", "line", "odds", "src_book",
                         "price_dk", "price_fd", "bet_at", "leg_prob", "model_prob", "market_prob", "leg_edge",
-                        "take_min", "line_limit") if c in pool and not (LOCK["on"] and c in ("take_min", "line_limit"))]
+                        "take_min", "line_limit") if c in pool] + (["held_note"] if "held_note" in pool and pool["held_note"].astype(str).str.len().gt(0).any() else [])
     print(f"LEG POOL: {len(pool)} legs qualify | leg prob = {PARLAY['model_weight']:.0%} model + "
           f"{1 - PARLAY['model_weight']:.0%} market | edge >= {PARLAY['min_edge']:.1%} at DK/FD price | "
           f"gap <= {PARLAY['max_gap']:.0%} | odds {PARLAY['min_odds']} to +{PARLAY['max_odds']}")
@@ -1820,19 +1834,25 @@ def cmd_parlay(a):
               f"EV {p * dec_eff - 1:+.0%} | Unders {sum(c['side'] == 'Under' for c in combo)}")
         print(pd.DataFrame(combo)[cols].to_string(index=False))
         need = 1 + (target - 1) / (1 + boost / 100) if bnote else target
-        if LOCK["on"]:
-            print(f"  -> build it at {BOOK_NAME[bk]} as recorded")
-        else:
-            print(f"  -> build it at {BOOK_NAME[bk]}; if its parlay odds (before boost) are below {decimal_to_american(need):+d}"
-                  f" or a leg is worse than take_min, rerun with --exclude")
+        tk_ = parlay_take_if(p)
+        print(f"  -> build it at {BOOK_NAME[bk]}{' as recorded' if LOCK['on'] else ''} | TAKE-IF: parlay odds >= "
+              f"{decimal_to_american(tk_):+d} (break-even at VPE's hit chance; ~{target:g}x needs {decimal_to_american(need):+d})"
+              f" and every leg at or above its take_min. Price moved? -> `reprice`")
         keys += [(c["player"], c["market"], c["side"]) for c in combo]
         built.append({"name": name, "target": target, "book": bk, "odds": decimal_to_american(dec), "hit": round(p, 4),
+                      "take_if": decimal_to_american(parlay_take_if(p)),
                       "stake_usd": stake, "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]})
-    bp = print_boost(a, allp, stake, cols, keys) if boost else None
-    if bp:
-        built.append(bp)
+    specs = parse_boosts(getattr(a, "boosts", None)) or ([boost_spec_from_args(a)] if boost else [])
+    bps, used = [], []
+    for spec in sorted(specs, key=lambda x: -x["pct"]):  # biggest boost picks first; no leg is reused across boosts
+        r_ = print_boost_spec(spec, allp, stake, cols, keys, used, a)
+        if r_:
+            bps.append(r_)
+            built.append(r_)
+            used += [l[0] for l in r_["legs"]]
+    bp = next((b for b in bps if not b.get("lean")), bps[0] if bps else None)
     excl = [x for x in (a.exclude or "").split(";") if x.strip()]
-    lean_keys = [tuple(l[:3]) for l in bp["legs"]] if bp and bp.get("lean") else []
+    lean_keys = [tuple(l[:3]) for b in bps if b.get("lean") for l in b["legs"]]
     if not any(b["target"] for b in built):
         lp = lean_parlay(allp, excl)
         print(f"\n=== LEAN - BEST AVAILABLE PARLAY (~{LEAN['parlay_target']:g}x): VPE can't beat these lines tonight ===")
@@ -1860,7 +1880,7 @@ def cmd_parlay(a):
             for _, r in ls.iterrows():
                 print(f"  {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} "
                       f"({int(r['bet_odds']):+d} at {r['bet_at']}) | win {r['leg_prob']:.1%} | edge {r['leg_edge']:+.1%} | "
-                      f"{r['units']:g}u (${r['stake_usd']:.2f})" + ("" if LOCK["on"] else f" | take only at {int(r['bet_odds']):+d} or better"))
+                      f"{r['units']:g}u (${r['stake_usd']:.2f})" + f" | take only at {int(r['bet_odds']):+d} or better")
             lean_keys += list(zip(ls["player"], ls["market"], ls["side"]))
             lean_straight = set(zip(ls["player"], ls["market"], ls["side"]))
         else:
@@ -1871,7 +1891,14 @@ def cmd_parlay(a):
     # ONE-PARLAY RULE (10/21-10/26: parlays were the whole loss, -$15.14 of -$15.89): recommend ONE parlay a night:
     # the BOOST parlay if there is one (+EV at market odds alone), else the biggest VPE could build (~10x), else ~4x.
     real = [b for b in built if not b.get("lean")]
-    if built:
+    real_boosts = [b for b in bps if not b.get("lean")]
+    if len(real_boosts) > 1:
+        for b in real_boosts:
+            b["recommended"] = True
+        print(f"\nONE-PARLAY RULE (one per boost): place ONLY these {len(real_boosts)} BOOST parlays, no leg shared: "
+              + " | ".join(f"{b['name']} at {BOOK_NAME[b['book']]} {b['odds']:+d} (take-if {b['take_if']:+d})" for b in real_boosts)
+              + ". Any other parlay above = reference only.")
+    elif built:
         # boost parlay (real, then lean) > biggest real parlay > lean parlay
         rec = (bp if bp and not bp.get("lean") else None) or (max(real, key=lambda b: b["target"]) if real else None) \
             or bp or built[-1]
@@ -1879,7 +1906,7 @@ def cmd_parlay(a):
         tag = (" - LEAN: no edge, the least-bad play with what we're given; logged as a VPE lean"
                if rec.get("lean") else "")
         print(f"\nONE-PARLAY RULE: place ONLY the {rec['name']} parlay at {BOOK_NAME[rec['book']]} "
-              f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}){tag}. Any other parlay above = reference only.")
+              f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}{', take-if ' + format(rec['take_if'], '+d') if rec.get('take_if') is not None and not rec.get('lean') else ''}){tag}. Any other parlay above = reference only.")
     else:
         print("\nONE-PARLAY RULE: nothing within reach tonight (no legs close to break-even) -> place none.")
     import json
@@ -2153,7 +2180,7 @@ def cmd_menu(a):
         print("   none qualify")
     for i, (_, r) in enumerate(ov.iterrows(), 1):
         star = "★" if (r["player"], r["market"], r["side"]) in on_slip else " "
-        tk = f" | take if odds >= {int(r['min_odds']):+d}" if pd.notna(r.get("min_odds")) and not LOCK["on"] else ""
+        tk = f" | take if odds >= {int(r['min_odds']):+d}" if pd.notna(r.get("min_odds")) else ""
         print(f"  {i:>2}. {star} {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['book']})"
               f" | win {r['blend_prob']:.1%} | edge {r['edge']:+.1%}{tk}")
     print("\n1) BEST STRAIGHT BETS (the staked slip; max 2 per game)")
@@ -2192,7 +2219,7 @@ def cmd_menu(a):
         print(f"\n  {r0['team']} vs {r0['opp']}")
         for _, r in g.sort_values(["leg_prob", "leg_edge"], ascending=False).head(MENU["props_per_game"]).iterrows():
             print(f"    prop: {r['player']} {r['side']} {r['line']} {r['market']} ({int(r['odds']):+d}, {r['bet_at']}) | win {r['leg_prob']:.1%}"
-                  f" | edge {r['leg_edge']:+.1%}" + ("" if LOCK["on"] else f" | take if odds >= {int(r['take_min']):+d}"))
+                  f" | edge {r['leg_edge']:+.1%}" + f" | take if odds >= {int(r['take_min']):+d}")
 
 
 # ---------- NEWS SWEEP (v2.6 / v15.9): who to check in the news before anything is placed ----------
@@ -2280,7 +2307,10 @@ def cmd_close(a):
         p = min(max(po if str(r["side"]).title() == "Over" else 1 - po, 0.02), 0.98)
         log.loc[i, "closing_odds"] = decimal_to_american(1 / p)
         n += 1
-    log.to_csv(a.log, index=False)
+    if getattr(a, "no_log", False):
+        print("--no-log: pick log NOT written (recheck only)")
+    else:
+        log.to_csv(a.log, index=False)
     d = log[log["closing_odds"].notna() & log["odds"].notna() & (log["week"] == a.week)]
     print(f"CLOSE week {a.week}: closing price written to {n} bets/legs")
     if len(d):
@@ -2516,7 +2546,7 @@ def cmd_final(a):
     pd.set_option("display.width", 250)
     print("=== FINAL CHECK (closing prices recorded) ===")
     print(out.to_string(index=False) if len(out) else "slip empty")
-    if a.log and os.path.exists(a.log) and len(out):
+    if a.log and os.path.exists(a.log) and len(out) and not getattr(a, "no_log", False):
         log = read_log(a.log)
         if "closing_odds" not in log:
             log["closing_odds"] = np.nan
@@ -2609,7 +2639,7 @@ def cmd_log(a):
     outs = build_outs(inj, ov, week)
     plays = (load_plays(cfg["season"]), load_plays(cfg["season"] - 1))
     proj = Projector(stats, prev, games, cfg["season"], week, cfg, outs=outs, weather=_weather(a.weather), plays=plays)
-    unit = cfg["bankroll"] * cfg["unit_pct_of_bankroll"]
+    unit = LOG_UNIT_USD  # v2.16: the Pick Log unit is $1, so units == stake_usd (was 2% of --bankroll)
     allp = pd.read_csv(a.all) if a.all and os.path.exists(a.all) else None
     lock_from(allp)
 
@@ -2643,6 +2673,23 @@ def cmd_log(a):
         print("\nDRY RUN (rate only): nothing logged")
         return
     new = pd.DataFrame(rows).reindex(columns=LOG_COLS)
+    if a.log and os.path.exists(a.log):  # v2.16: the same bet logged twice (a rerun of `log`) is skipped, not doubled
+        old_ = read_log(a.log)
+        kc = [c for c in ("date", "week", "player", "market", "side", "line", "odds", "stake_usd", "bet_type", "parlay_id", "book")
+              if c in new and c in old_]
+        def _v(v):
+            if v is None or (isinstance(v, float) and math.isnan(v)) or str(v) in ("nan", "None", "<NA>"):
+                return ""
+            try:
+                return f"{float(v):g}"
+            except (TypeError, ValueError):
+                return str(v).strip()
+        sig = lambda df: pd.Series(["|".join(_v(v) for v in row) for row in df[kc].itertuples(index=False)], index=df.index)
+        dup = sig(new).isin(set(sig(old_))).to_numpy()
+        if dup.any():
+            print(f"LOG: {int(dup.sum())} row(s) were already in the pick log (same bet logged before) -> skipped")
+            rows = [r for r, d_ in zip(rows, dup) if not d_]
+            new = new[~dup]
     if a.log and os.path.exists(a.log):
         old = read_log(a.log)
         new = pd.concat([old, new], ignore_index=True).reindex(columns=LOG_COLS)
@@ -2692,9 +2739,6 @@ def cmd_takeif(a):
     leg's take_min. Anything not tiered tonight = SKIP (not a VPE pick at any price shown)."""
     set_calib(getattr(a, "calib", None), SPORT)
     allp = pd.read_csv(a.all)
-    if lock_from(allp):
-        print(f"PRICES LOCKED: tonight's lines are your {LOCK['books']} recording, so every VPE pick is a TAKE as recorded"
-              " (no price check needed)")
     lock_from(allp)
     pool = parlay_pool(allp)
     for spec in a.bet:
@@ -2868,7 +2912,8 @@ def _tier_text(r, x, cfg):
     T = cfg["tiers"]
     rule = " | ".join(f"T{t[-1]} edge>={T[t]['min_edge']:.1%}" + (f" & win>={T[t]['min_prob']:.0%}" if T[t]["min_prob"] > 0 else "")
                       for t in ("tier_1", "tier_2", "tier_3"))
-    nominal = _tier(edge, prob, cfg)
+    estm = EST_MARGIN if (x.get("p") or {}).get("how") == "1way" else 0.0
+    nominal = _tier(edge - estm, prob, cfg)
     tier = r.get("tier") if isinstance(r.get("tier"), str) else None
     if tier:
         return f"{tier.replace('_', ' ').upper()} ({rule})", tier
@@ -2884,8 +2929,9 @@ def _tier_text(r, x, cfg):
         if nominal == "tier_3" and not cfg["strategy_profiles"][cfg["strategy_profile"]]["allow_tier3"]:
             why.append("Tier 3 off in this profile")
         return f"clears {nominal.replace('_', ' ')} on edge but blocked: {'; '.join(why) or 'stake rounds below 0.25u'}", None
-    need = T["tier_3"]["min_edge"] - edge
-    return f"no tier: edge {edge:+.1%} is {need:.1%} short of Tier 3 ({rule})", None
+    need = T["tier_3"]["min_edge"] - (edge - estm)
+    return (f"no tier: edge {edge:+.1%} is {need:.1%} short of Tier 3 ({rule})"
+            + (" (market estimated from one price: needs +1.5% extra)" if estm else "")), None
 
 
 def _stake_text(r, cfg, tier):
@@ -3087,6 +3133,184 @@ def cmd_explain(a):
         print(explain_card(r, x, labels, cfg) + "\n")
 
 
+
+# ---------- v2.16 / v15.17: take-if on recordings, reprice, several boosts in one run, est. market margin ----------
+# Lines from a recording are priced as recorded, but bets often go in hours later and the price moves (11/11: three
+# boost legs moved 15-35 cents). So every pick, leg and parlay prints a take-if again, and `reprice` re-rates a few
+# props (or the parlay they make) at the live price without a full rerun.
+EST_MARGIN = 0.015  # extra edge a pick needs when its market chance comes from ONE price (no main O/U to read it off):
+                    # the hold on those is assumed (7%), and ~10% real hold would cost ~1.5 pts of market chance
+LOG_UNIT_USD = 1.0  # the Pick Log's unit: $1 (Summary "Unit ($)"), so logged units == stake_usd
+
+
+def parlay_take_if(p, boost=0.0, p_mkt=None):
+    """Worst parlay price (decimal, BEFORE any boost) still worth taking: break-even at VPE's hit chance; for a boost
+    parlay also break-even at market-only chances (a boost parlay must pay off even if the model adds nothing)."""
+    mult = 1 + (boost or 0.0) / 100
+    need = 1 + (1 / max(p, 1e-6) - 1) / mult
+    if p_mkt:
+        need = max(need, 1 + (1 / max(p_mkt, 1e-6) - 1) / mult)
+    return need
+
+
+def parse_boosts(spec):
+    """--boosts "fd30:3leg:+100:win25,fd25,dk30": book + % and optional rules per boost: Nleg = min legs, maxN = max
+    legs, +X/-X = min total odds, winN = max extra winnings ($), any = no rules beyond the defaults (rules confirmed)."""
+    out = []
+    for tok in [t.strip() for t in (spec or "").split(",") if t.strip()]:
+        parts = tok.lower().replace(" ", "").split(":")
+        m = re.match(r"^(fd|fanduel|dk|draftkings)(\d+(?:\.\d+)?)%?$", parts[0])
+        if not m:
+            print(f"BOOSTS: can't read '{tok}' (format: fd30, dk25:3leg:+100:win25)")
+            continue
+        b = {"book": "fanduel" if m.group(1).startswith("f") else "draftkings", "pct": float(m.group(2)),
+             "label": tok, "given": len(parts) > 1}
+        for q in parts[1:]:
+            if re.fullmatch(r"\d+leg?s?", q):
+                b["min_legs"] = int(re.match(r"\d+", q).group())
+            elif re.fullmatch(r"max\d+", q):
+                b["max_legs"] = int(q[3:])
+            elif re.fullmatch(r"[+-]\d+", q):
+                b["min_odds"] = float(q)
+            elif re.fullmatch(r"win\d+(\.\d+)?", q):
+                b["max_win"] = float(q[3:])
+            elif q not in ("any", "norules"):
+                print(f"BOOSTS: ignored '{q}' in {tok}")
+        out.append(b)
+    return out
+
+
+def boost_spec_from_args(a):
+    bbook = (a.boost_book or "draftkings").lower().replace(" ", "")
+    rules = {"min_legs": getattr(a, "boost_min_legs", None), "max_legs": getattr(a, "boost_max_legs", None),
+             "min_odds": getattr(a, "boost_min_odds", None), "max_win": getattr(a, "boost_max_win", None)}
+    return {"book": bbook, "pct": float(a.boost), "label": f"{bbook[:2]}{a.boost:g}",
+            "given": any(v for v in rules.values()), **rules}
+
+
+def print_boost_spec(spec, allp, stake, cols, keys, used, a):
+    """One boost -> its own parlay at its book, never reusing a leg (player) another boost already took."""
+    boost, bbook = spec["pct"], spec["book"]
+    excl = [x for x in (getattr(a, "exclude", None) or "").split(";") if x.strip()] + list(used)
+    pool = parlay_pool(allp, excl, min_edge=-0.03, min_prob=0.5)
+    min_dec = american_to_decimal(spec["min_odds"]) if spec.get("min_odds") else 1.0
+    lo, hi, mw = int(spec.get("min_legs") or 2), int(spec.get("max_legs") or 4), spec.get("max_win")
+    print(f"\n=== BOOST PARLAY {spec['label']}: {boost:g}% profit boost at {BOOK_NAME.get(bbook, bbook)} ===")
+    rules = (f"{lo}-{hi} legs" + (f", min total odds {int(spec['min_odds']):+d}" if spec.get("min_odds") else "")
+             + (f", extra winnings capped at ${mw:g}" if mw else ""))
+    print(f"  rules used: {rules}" + ("" if spec.get("given") else
+          "  (DEFAULTS - VPE doesn't know this boost's rules: read min legs / min odds / max win off the boost and pass "
+          "them, e.g. fd30:3leg:+100:win25, or :any if it has none)"))
+    if used:
+        print(f"  not reusing legs from bigger boosts: {', '.join(used)}")
+    r = boost_parlay(pool, bbook, boost, stake, lo, hi, min_dec, mw)
+    lean = False
+    if not r:
+        print("  SAVE IT: no combination left is +EV at market odds with this boost"
+              + (" without reusing another boost's legs" if used else ""))
+        r = boost_parlay(pool, bbook, boost, stake, lo, hi, min_dec, mw, need_market_ev=False)
+        if not r:
+            print("  and no legs qualify even as a lean")
+            return None
+        lean = True
+        print("  LEAN - BEST AVAILABLE BOOST: no edge; only if you use this boost tonight anyway, this is the least-bad way")
+    ev, p, p_mkt, dec, dec_eff, combo = r
+    print(f"  PLACE AT {BOOK_NAME.get(bbook, bbook).upper()} | {len(combo)} legs | est. odds {decimal_to_american(dec):+d} -> "
+          f"{decimal_to_american(dec_eff):+d} boosted | ${stake:.2f} pays ~${stake * dec_eff:.2f} | hit chance {p:.1%} "
+          f"(market {p_mkt:.1%}) | EV {ev:+.0%} (EV at market odds alone {p_mkt * dec_eff - 1:+.0%}) | "
+          f"Unders {sum(c['side'] == 'Under' for c in combo)}")
+    print(pd.DataFrame(combo)[[c for c in cols if c in combo[0]]].to_string(index=False))
+    # where the edge actually comes from: without the boost, and at the other book (11/9: P2 placed at DK, no boost: -3.5%)
+    ev0, evm0 = p * dec - 1, p_mkt * dec - 1
+    msg = f"  WITHOUT the boost at {BOOK_NAME[bbook]}: EV {ev0:+.1%} (market-only {evm0:+.1%})"
+    for ob in [b for b in PARLAY["books"] if b != bbook]:
+        dec_o = float(np.prod([c["dec_" + ob] for c in combo]))
+        msg += (f" | at {BOOK_NAME[ob]}, no boost: {decimal_to_american(dec_o):+d}, EV {p * dec_o - 1:+.1%} "
+                f"(market-only {p_mkt * dec_o - 1:+.1%})")
+    print(msg + (f" -> the edge is the boost: place it only WITH the boost at {BOOK_NAME[bbook]}" if min(ev0, evm0) <= 0 else ""))
+    tk = parlay_take_if(p, boost, None if lean else p_mkt)
+    print(f"  TAKE-IF: {BOOK_NAME[bbook]} parlay odds before the boost >= {decimal_to_american(tk):+d}"
+          + (" (below that it's -EV even with the boost)" if not lean else " (VPE break-even; it's a lean)")
+          + " and every leg at or above its take_min. Price moved? -> `reprice`")
+    est = sum(str(c.get("mkt_est")).lower() in ("true", "1") for c in combo)
+    if est:
+        print(f"  note: {est} leg(s) have no main O/U line, so their market chance is estimated from one price")
+    held = [f"{c['player']}: {c['held_note']}" for c in combo if str(c.get("held_note", "") or "") not in ("", "nan")]
+    if held:
+        print("  FLAG - player HELD on another market tonight (model vs market gap, usually news): " + " | ".join(held))
+    if mw:
+        print(f"  (boost winnings capped at ${mw:g}: counted)")
+    if not lean:
+        keys += [(c["player"], c["market"], c["side"]) for c in combo]
+    return {"name": f"BOOST {spec['label']}" + (" (LEAN)" if lean else ""), "target": 0, "book": bbook,
+            "boost_pct": boost, "odds": decimal_to_american(dec), "take_if": decimal_to_american(tk), "hit": round(p, 4),
+            "lean": lean, "ev": round(ev, 3), "stake_usd": stake,
+            "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]}
+
+
+def cmd_reprice(a):
+    """Live price check without a full rerun: the app's price now for a few props (and the parlay they make), re-rated
+    with tonight's projections. The market's chance moves with the price (same hold); the model's chance doesn't."""
+    set_calib(getattr(a, "calib", None), SPORT)
+    allp = pd.read_csv(a.all)
+    lock_from(allp)
+    cfg = CONFIG
+    legs = []
+    for spec in a.bet:
+        t = [x.strip() for x in spec.split(";")]
+        if len(t) < 5:
+            print(f"{spec}: need Player;market;Side;line;odds")
+            legs.append(None)
+            continue
+        pl, mk, side, line, odds = t[0], canon_market(t[1]) or t[1], t[2].title(), float(t[3]), _odds(t[4])
+        tag = f"{pl} {side} {line:g} {mk} @ {odds:+d}"
+        h = allp[(allp["player"].map(norm_name) == norm_name(pl)) & (allp["market"] == mk) & (allp["side"] == side)]
+        hl = h[(pd.to_numeric(h["line"], errors="coerce") - line).abs() < 1e-9]
+        if hl.empty:
+            lines_ = sorted(pd.to_numeric(h["line"], errors="coerce").dropna().unique())
+            print(f"{tag}: not scored at this line tonight" + (f" (scored: {', '.join(f'{x:g}' for x in lines_)})" if lines_ else "")
+                  + " -> the LINE moved: rerun check with the new line")
+            legs.append(None)
+            continue
+        r = hl.iloc[0]
+        old = int(r["odds"])
+        mp_new = float(np.clip(float(r["market_prob"]) * implied_prob(odds) / implied_prob(old), 0.01, 0.99))
+        p_new = float(blend_leg(float(r["model_prob"]), mp_new, mk, side))
+        estm = EST_MARGIN if str(r.get("mkt_est")).lower() in ("true", "1") else 0.0
+        be = implied_prob(odds)
+        edge = p_new - be
+        tier = _tier(edge - estm, p_new, cfg)
+        if tier:
+            v = f"TAKE as a straight ({tier.replace('_', ' ')})"
+        elif edge - estm >= PARLAY["min_edge"] and p_new >= PARLAY["min_prob"]:
+            v = "TAKE as a parlay leg only"
+        else:
+            v = "SKIP at this price"
+        print(f"{tag} (recorded {old:+d}): market {float(r['market_prob']):.1%} -> {mp_new:.1%} | VPE {p_new:.1%} vs "
+              f"{be:.1%} needed -> edge {edge:+.1%}{' (needs +1.5% more: market estimated)' if estm else ''} -> {v}")
+        legs.append({"p": p_new, "pm": mp_new, "dec": american_to_decimal(odds), "game": str(r.get("game_id")), "tag": tag})
+    if not a.parlay or not legs:
+        return
+    if any(x is None for x in legs):
+        print("PARLAY: a leg isn't scored at its line -> can't rate it (rerun check)")
+        return
+    p, pm = float(np.prod([x["p"] for x in legs])), float(np.prod([x["pm"] for x in legs]))
+    dec = american_to_decimal(_odds(a.parlay_odds)) if a.parlay_odds else float(np.prod([x["dec"] for x in legs]))
+    if len({x["game"] for x in legs}) < len(legs):
+        print("note: same-game legs -> chances treated as independent; rate it with the sgp command instead")
+    boost = a.boost or 0.0
+    extra = (dec - 1) * boost / 100
+    if a.max_win and a.stake:
+        extra = min(extra, a.max_win / a.stake)
+    dec_eff = dec + extra
+    ev, evm = p * dec_eff - 1, pm * dec_eff - 1
+    tk = parlay_take_if(p, boost, pm if boost else None)
+    ok = ev > 0 and (not boost or evm >= 0)
+    print(f"PARLAY {decimal_to_american(dec):+d}" + (f" -> {decimal_to_american(dec_eff):+d} with the {boost:g}% boost" if boost else "")
+          + f" | hit {p:.1%} (market {pm:.1%}) | EV {ev:+.1%} | market-only EV {evm:+.1%} | take-if {decimal_to_american(tk):+d}"
+          + f" -> {'TAKE' if ok else 'SKIP'}")
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Verified Prop Engine - NFL (in-chat edition)")
@@ -3121,6 +3345,7 @@ if __name__ == "__main__":
     sub.choices["parlay"].add_argument("--exclude", help='players to leave out "A;B" (e.g. DK price failed take-if)')
     sub.choices["parlay"].add_argument("--slip-out", default="slip.csv")
     sub.choices["parlay"].add_argument("--boost", type=float, help="profit boost %% (gets its own BOOST parlay)")
+    sub.choices["parlay"].add_argument("--boosts", help='several boosts in one run, e.g. "fd30:3leg:+100:win25,fd25,dk30"')
     sub.choices["parlay"].add_argument("--boost-book", default="draftkings", help="draftkings|fanduel (where the boost is)")
     sub.choices["log"].add_argument("--sheet-out", default="sheet_new.json", help="new rows for the Pick Log sheet")
     for name in ("check", "parlay", "log"):
@@ -3146,7 +3371,7 @@ if __name__ == "__main__":
     sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
     sw_.add_argument("--parlays", default="vpe_parlays.json"); sw_.add_argument("--top", type=int, default=10)
     sw_.add_argument("--heavy", action="store_true", help="final check: every player with a qualifying line")
-    cl_ = sub.add_parser("close"); cl_.add_argument("--log", default="pick_log.csv"); cl_.add_argument("--props", nargs="+", required=True)
+    cl_ = sub.add_parser("close"); cl_.add_argument("--no-log", action="store_true"); cl_.add_argument("--log", default="pick_log.csv"); cl_.add_argument("--props", nargs="+", required=True)
     cl_.add_argument("--week", type=int, required=True)
     ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
@@ -3161,11 +3386,19 @@ if __name__ == "__main__":
     sh.add_argument("--mode", choices=["pull", "push"], required=True)
     sh.add_argument("--json", default="sheet_tab.json"); sh.add_argument("--log", required=True)
     sh.add_argument("--out", default="sheet_all.json")
+    rp_ = sub.add_parser("reprice")
+    rp_.add_argument("--all", default="bets_all.csv"); rp_.add_argument("--calib")
+    rp_.add_argument("--bet", action="append", required=True, help='"Player;market;Side;line;odds" (repeat)')
+    rp_.add_argument("--parlay", action="store_true", help="also rate the parlay these legs make")
+    rp_.add_argument("--parlay-odds", help="the app's total parlay price (default: legs multiplied)")
+    rp_.add_argument("--boost", type=float); rp_.add_argument("--max-win", type=float); rp_.add_argument("--stake", type=float)
     ex_ = sub.add_parser("explain")
     for k, v in (("--all", "bets_all.csv"), ("--bets", "bets.csv"), ("--parlays", "vpe_parlays.json"), ("--leans", "leans.csv"),
                  ("--slip", "slip.csv"), ("--calib", None), ("--player", None), ("--market", None), ("--side", None)):
         ex_.add_argument(k, default=v)
     f = sub.add_parser("final")
+    f.add_argument("--no-log", action="store_true", help="recheck only: do not write the pick log")
+    f.add_argument("--boosts")
     for k, v in (("--slip", "slip.csv"), ("--all", "bets_all.csv"), ("--props", "props_close.csv"), ("--log", None),
                  ("--injuries", None), ("--exclude", None), ("--bets", "bets.csv"), ("--slip-out", "slip.csv"),
                  ("--close-out", "closing.csv"), ("--boost-book", "draftkings"), ("--calib", None)):
@@ -3177,5 +3410,5 @@ if __name__ == "__main__":
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
      "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "close": cmd_close, "status": cmd_status,
-     "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain}[a.cmd](a)
+     "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain, "reprice": cmd_reprice}[a.cmd](a)
 
