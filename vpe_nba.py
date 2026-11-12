@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.16.0"
+VERSION = "NBA v2.17.0"
 
 # ==================== data ====================
 
@@ -1042,7 +1042,7 @@ def _take_if(mu, var, mk, line, side, prob, shrink, cfg):
     po0 = cal_prob(prob_over(mu, var, mk, line))
     for _ in range(30):
         po = cal_prob(prob_over(mu, var, mk, L))
-        po = (1 - prob if side == "Under" else prob) + PARLAY["model_weight"] * (po - po0)  # blended, moved with the line
+        po = (1 - prob if side == "Under" else prob) + _mw(mk) * (po - po0)  # blended, moved with the line
         pr = po if side == "Over" else 1 - po
         if pr - be110 >= c["min_edge"] and pr >= c["min_prob"]:
             limit = L
@@ -2320,6 +2320,7 @@ def cmd_parlay(a):
 # ~1,500 lines are in), and each market's Over rate is corrected if it keeps landing off what VPE predicted.
 CALIB_W = [round(i * 0.1, 1) for i in range(11)]
 CALIB_COLS = ["sport", "market", "n", "sum_over", "sum_pm", "sum_pk"] + [f"ll_{int(round(x * 100)):03d}" for x in CALIB_W]
+CAL_EXTRA = {}
 CALIB = {"prior_w": 0.4, "n0_w": 1500, "n0_bias": 1500, "bias_cap": 0.03, "w_min": 0.15, "w_max": 0.6}
 SHADOW_COLS = ["key", "player", "market", "line", "over_odds", "under_odds", "p_model", "p_market", "actual", "over"]
 
@@ -2358,27 +2359,46 @@ def load_calib(path, sport):
     w_fit = CALIB_W[int(np.argmin(ll))]
     w = (n_tot * w_fit + CALIB["n0_w"] * CALIB["prior_w"]) / (n_tot + CALIB["n0_w"])
     w = float(min(max(w, CALIB["w_min"]), CALIB["w_max"]))
+    mk_w = {}
     for r in rows:
         n = _f(r, "n")
-        pred = (w * _f(r, "sum_pm") + (1 - w) * _f(r, "sum_pk")) / n
+        # v2.17: each market's own best mix, shrunk toward the shared weight (1,500 lines = half trust)
+        llm = [_f(r, f"ll_{int(round(x * 100)):03d}") for x in CALIB_W]
+        wm = (n * CALIB_W[int(np.argmin(llm))] + CALIB["n0_w"] * w) / (n + CALIB["n0_w"])
+        wm = float(min(max(wm, CALIB["w_min"]), CALIB["w_max"]))
+        mk_w[str(r["market"])] = round(wm, 3)
+        pred = (wm * _f(r, "sum_pm") + (1 - wm) * _f(r, "sum_pk")) / n
         b = (_f(r, "sum_over") / n - pred) * n / (n + CALIB["n0_bias"])
         bias[str(r["market"])] = float(np.clip(b, -CALIB["bias_cap"], CALIB["bias_cap"]))
+    CAL_EXTRA.update({"mk_w": mk_w, "w_fit": w_fit, "n": int(n_tot)})
     return round(w, 3), bias, int(n_tot)
 
 
 def set_calib(path, sport):
+    CAL_EXTRA.clear()
     w, bias, n = load_calib(path, sport)
     PARLAY["model_weight"], PARLAY["side_bias"] = w, bias
+    PARLAY["mk_weight"] = dict(CAL_EXTRA.get("mk_w") or {})
+    # v15.18: NFL goes boosts + leans only while the model adds nothing over the market (best mix 0% model on 3,000+
+    # graded lines); it lifts itself as soon as the Calib tab shows the model earning weight again
+    PARLAY["boost_only"] = (sport == "NFL" and CAL_EXTRA.get("n", 0) >= 3000 and CAL_EXTRA.get("w_fit", 1) <= 0.0)
     b = ", ".join(f"{k} Over {v:+.1%}" for k, v in sorted(bias.items()) if abs(v) >= 0.005) or "none yet"
     src = f"{n} graded lines" if n else "no graded lines yet (prior)"
-    print(f"CALIB: {src} -> win chance = {w:.0%} model + {1 - w:.0%} market | Over-rate corrections: {b}")
+    mw_ = PARLAY.get("mk_weight") or {}
+    mws = ", ".join(f"{k} {v:.0%}" for k, v in sorted(mw_.items()) if abs(v - w) >= 0.03)
+    print(f"CALIB: {src} -> win chance = {w:.0%} model + {1 - w:.0%} market"
+          + (f" (own mix: {mws})" if mws else "") + f" | Over-rate corrections: {b}")
+    if PARLAY.get("boost_only"):
+        print("NFL MODE: BOOSTS + LEANS ONLY - on 3,000+ graded lines the most accurate mix is 0% model, so VPE's NFL"
+              " numbers add nothing over the market. No straight picks / model parlays; boost parlays and labeled leans only."
+              " Lifts itself when the model earns weight again (or pass --all-picks).")
     set_learned(os.path.join(os.path.dirname(path) or ".", "learned_tab.json") if path else None, sport)
     return w, bias
 
 
 def blend_leg(model_p, market_p, market=None, side=None):
     """VPE win chance = learned mix of model and no-vig market, + the market's learned Over-rate correction."""
-    w = PARLAY["model_weight"]
+    w = _mw(market)
     p = w * model_p + (1 - w) * market_p
     b = PARLAY.get("side_bias") or {}
     if market is not None and b:
@@ -3629,6 +3649,19 @@ def cmd_close(a):
     close = _read_props(a.props) if a.props else pd.DataFrame()
     if "market" in close:
         close = close[close["market"].notna()]
+    snaps = snap_rows(close, date) if len(close) else []
+    if getattr(a, "snap_out", None):
+        import json as _j
+        _j.dump(snaps, open(a.snap_out, "w"))
+        print(f"SNAPSHOT: {len(snaps)} closing lines for {date} -> {a.snap_out} (append to the 'Close NBA' tab, every night)")
+    if getattr(a, "snap", None):  # closing lines saved earlier (bets logged after the closing run)
+        sp = snap_props(a.snap, slate=date)
+        close = pd.concat([close, sp], ignore_index=True) if len(sp) else close
+        print(f"SNAPSHOT: {len(sp)} saved closing lines for {date} read from {a.snap}")
+    for c in ("closing_odds",):
+        log[c] = pd.to_numeric(log.get(c), errors="coerce")
+    bt_ = log["bet_type"].fillna("straight").astype(str)
+    open_ = log[(log["date"].astype(str).str.lstrip("'").str[:10] == str(date)) & log["closing_odds"].isna() & bt_.isin(["straight", "leg"])]
     log, n = fill_closing(log, close, date, cfg)
     if getattr(a, "no_log", False):
         print("--no-log: pick log NOT written (recheck only)")
@@ -3637,6 +3670,13 @@ def cmd_close(a):
     print(f"CLOSE {date}: closing price written to {n} bets/legs in {a.log}"
           + ("" if n else " (none matched: the closing file needs each bet player's MAIN O/U line with both prices)"))
     clv_report(log, date)
+    miss = sorted(set(open_["market"].astype(str)) - set(close["market"].astype(str))) if len(close) else []
+    note = ("no bets logged for this slate yet (the snapshot keeps the closing lines for later)" if open_.empty
+            else "ok" if n == len(open_) else f"{len(open_) - n} left blank" + (f" (no closing page for: {', '.join(miss)})" if miss else
+                                                                             " (player/line not on the closing pages)"))
+    if not len(close):
+        note = "NO closing lines (odds pages blocked or stale?)"
+    write_close_status(getattr(a, "status_out", None), "NBA", date, len(open_), n, len(snaps), note)
 
 
 def cmd_vig(a):
@@ -3919,7 +3959,7 @@ def _r(v, d=3):
 
 def why_prob(pm_over, fair_over, mk, fair_how, raw_over):
     """The win-chance chain for the Over (the Under is its mirror), exactly as blend_leg computed it."""
-    w = float(PARLAY["model_weight"])
+    w = _mw(mk)
     mix = w * pm_over + (1 - w) * fair_over
     b = float((PARLAY.get("side_bias") or {}).get(mk, 0.0) or 0.0)
     g = int((LEARNED.get("gate") or {}).get(f"{mk}|Over", 0))
@@ -4232,7 +4272,7 @@ def boost_spec_from_args(a):
     bbook = (a.boost_book or "draftkings").lower().replace(" ", "")
     rules = {"min_legs": getattr(a, "boost_min_legs", None), "max_legs": getattr(a, "boost_max_legs", None),
              "min_odds": getattr(a, "boost_min_odds", None), "max_win": getattr(a, "boost_max_win", None)}
-    return {"book": bbook, "pct": float(a.boost), "label": f"{bbook[:2]}{a.boost:g}",
+    return {"book": bbook, "pct": float(a.boost), "label": f"{'fd' if bbook.startswith('f') else 'dk'}{a.boost:g}",
             "given": any(v for v in rules.values()), **rules}
 
 
@@ -4359,6 +4399,62 @@ def cmd_reprice(a):
           + f" -> {'TAKE' if ok else 'SKIP'}")
 
 
+
+# ---------- v2.17 / v15.18: per-market model weight, closing-line snapshots + status rows ----------
+SNAP_COLS = ["date", "week", "player", "matchup", "market", "line", "over_odds", "under_odds", "book", "captured_at"]
+CLOSE_STATUS_COLS = ["run_at", "sport", "slate", "open_bets", "priced", "snapshot_rows", "note"]
+
+
+def _mw(market=None):
+    """Model weight for this market (v2.17: each market learns its own mix, shrunk toward the shared one)."""
+    mw = PARLAY.get("mk_weight") or {}
+    g = PARLAY["model_weight"]
+    if isinstance(market, pd.Series):
+        return market.map(mw).fillna(g).astype(float).to_numpy()
+    if isinstance(market, np.ndarray):
+        return np.array([mw.get(m, g) for m in market], dtype=float)
+    return float(mw.get(market, g)) if market is not None else float(g)
+
+
+def snap_rows(props, slate, week=""):
+    """props_close rows -> 'Close <sport>' tab rows (every scored line's closing price, saved whether or not bets were logged)."""
+    now = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %H:%M")
+    out = []
+    for _, r in props.iterrows():
+        oo, uo = r.get("over_odds"), r.get("under_odds")
+        if pd.isna(oo) or pd.isna(uo) or str(oo) == "" or str(uo) == "":
+            continue
+        out.append([str(slate), str(week), r["player"], r.get("matchup", ""), r["market"], float(r["line"]), int(float(oo)), int(float(uo)),
+                    r.get("book", ""), now])
+    return out
+
+
+def snap_props(path, slate=None, week=None):
+    """'Close <sport>' tab JSON -> a props frame for one slate (NBA date) or one week (NFL)."""
+    vals = _values(path)
+    if len(vals) < 2:
+        return pd.DataFrame(columns=["player", "matchup", "market", "line", "over_odds", "under_odds", "book"])
+    hdr = [str(h) for h in vals[0]]
+    d = pd.DataFrame([list(r) + [""] * (len(hdr) - len(r)) for r in vals[1:]], columns=hdr)
+    if slate is not None:
+        d = d[d["date"].astype(str).str.lstrip("'").str[:10] == str(slate)]
+    if week is not None:
+        d = d[pd.to_numeric(d["week"], errors="coerce") == int(week)]
+    for c in ("line", "over_odds", "under_odds"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    return d[d["over_odds"].notna() & d["under_odds"].notna()].reset_index(drop=True)
+
+
+def write_close_status(path, sport, slate, open_bets, priced, snap_n, note):
+    if not path:
+        return
+    import json as _j
+    now = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %H:%M")
+    _j.dump([[now, sport, str(slate), int(open_bets), int(priced), int(snap_n), note]], open(path, "w"))
+    print(f"CLOSE STATUS: {sport} {slate} | open bets {open_bets} | priced {priced} | snapshot rows {snap_n} | {note}"
+          f" -> {path} (append to the 'Close log' tab)")
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Verified Prop Engine - NBA (in-chat edition)")
@@ -4431,6 +4527,9 @@ if __name__ == "__main__":
     sw_.add_argument("--heavy", action="store_true", help="final check: every player with a qualifying line")
     cl_ = sub.add_parser("close"); cl_.add_argument("--no-log", action="store_true"); cl_.add_argument("--log", default="nba_pick_log.csv"); cl_.add_argument("--props", nargs="+")
     cl_.add_argument("--date")
+    cl_.add_argument("--snap", help="'Close NBA' tab JSON: closing lines saved on the night (for bets logged later)")
+    cl_.add_argument("--snap-out", help="write tonight's closing lines as rows for the 'Close NBA' tab")
+    cl_.add_argument("--status-out", help="write one status row for the 'Close log' tab")
     ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
