@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.18"
+VERSION = "NFL v15.19"
 
 # ==================== data ====================
 
@@ -3411,6 +3411,124 @@ def write_close_status(path, sport, slate, open_bets, priced, snap_n, note):
           f" -> {path} (append to the 'Close log' tab)")
 
 
+# ---------- v2.18 / v15.19: cross-check a recording against the free odds pages ----------
+# On recording nights the recording stays the price VPE bets on. The free odds pages are pulled too, only to
+# (1) catch numbers misread off a video frame, (2) list props the recording missed, (3) measure how far the free
+# pages' prices sit from the user's book (the 'Line check' tab: the honest answer to "do I need to record?").
+LINECHECK_COLS = ["date", "slate", "player", "market", "line", "side", "rec_book", "rec_odds", "web_odds", "web_book",
+                  "gap_pts", "flag", "captured_at"]
+
+def _x_odds(v):
+    s = str(v).strip().replace("+", "")
+    if s.lower() in ("", "nan", "none"):
+        return None
+    if s.lower() in ("ev", "even"):
+        return 100.0
+    try:
+        x = float(s)
+    except ValueError:
+        return None
+    return x if abs(x) >= 100 else None
+
+def _x_imp(o):
+    return 1.0 / american_to_decimal(o)
+
+def _x_frame(path, web):
+    d = _read_loose_csv(path)
+    for c in ("player", "market", "line", "over_odds", "under_odds", "book"):
+        if c not in d:
+            d[c] = ""
+    d = d.assign(_k=d["player"].map(norm_name), _m=d["market"].map(canon_market),
+                 _l=pd.to_numeric(d["line"], errors="coerce"),
+                 _o=d["over_odds"].map(_x_odds), _u=d["under_odds"].map(_x_odds))
+    return d[d["_m"].notna() & d["_l"].notna()]
+
+def cmd_crosscheck(a):
+    rec, web = _x_frame(a.rec, False), _x_frame(a.web, True)
+    import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        now = _dt.datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now = _dt.datetime.utcnow()
+    stamp = now.strftime("%Y-%m-%d %H:%M ET")
+    slate = a.slate or now.strftime("%Y-%m-%d")
+    flags, rows = [], []
+    # 1) the recording on its own: a two-sided price whose hold is impossible is a misread number
+    for _, r in rec.iterrows():
+        if r["_o"] is not None and r["_u"] is not None:
+            hold = _x_imp(r["_o"]) + _x_imp(r["_u"]) - 1
+            if hold < -0.005 or hold > 0.16:
+                flags.append(("RED", r["player"], r["_m"], r["_l"], f"Over {int(r['_o']):+d} / Under {int(r['_u']):+d} = {hold:+.1%} hold"
+                              " -> one side is likely misread (real holds run ~4-10%)"))
+    if web.empty:
+        print(f"CROSSCHECK: no free-page lines to compare (page failed or on another night) | recording checked on its own: "
+              f"{sum(f[0] == 'RED' for f in flags)} RED")
+    # 2) recording vs the free pages, prop by prop
+    wmain = web[web["_o"].notna() & web["_u"].notna()]
+    matched = 0
+    for (k, m), g in rec.groupby(["_k", "_m"]):
+        w = web[(web["_k"] == k) & (web["_m"] == m)]
+        if w.empty:
+            continue
+        rmain = g[g["_o"].notna() & g["_u"].notna()]
+        wm = wmain[(wmain["_k"] == k) & (wmain["_m"] == m)]
+        name = g["player"].iloc[0]
+        if len(rmain) and len(wm):
+            rl, wl = float(rmain["_l"].iloc[0]), float(wm["_l"].iloc[0])
+            if abs(rl - wl) >= a.line_gap:
+                flags.append(("RED", name, m, rl, f"main line {rl:g} in the recording vs {wl:g} on the free page"
+                              " -> misread line, or it moved since the recording"))
+        for _, r in g.iterrows():
+            same = w[w["_l"] == r["_l"]]
+            for side, rc, wc in (("Over", "_o", "_o"), ("Under", "_u", "_u")):
+                ro = r[rc]
+                cand = same[same[wc].notna()]
+                if ro is None or cand.empty:
+                    continue
+                wr = cand.iloc[0]
+                wo, wb = wr[wc], side_book(wr["book"], side)
+                rb = str(r["book"]).strip().lower()
+                gap = _x_imp(ro) - _x_imp(wo)  # + = the recording's price is worse than the free page's
+                matched += 1
+                flag = ""
+                if wb == rb and abs(gap) > a.same_book_gap:
+                    flag = "RED"
+                    flags.append(("RED", name, m, r["_l"], f"{side} {int(ro):+d} recorded vs {int(wo):+d} at the same book ({wb}) on the free page"
+                                  " -> misread, or the price moved"))
+                elif wb != rb and gap < -a.better_gap:
+                    flag = "RED"
+                    flags.append(("RED", name, m, r["_l"], f"{side} {int(ro):+d} recorded beats every book on the free page (best {int(wo):+d} {wb})"
+                                  " -> check that number"))
+                elif wb != rb and gap > a.better_gap:
+                    flag = "INFO"
+                    flags.append(("INFO", name, m, r["_l"], f"{side} better elsewhere: {int(wo):+d} at {wb} vs {int(ro):+d} recorded (you bet DK/FD; info only)"))
+                rows.append([slate, a.week or "", name, m, float(r["_l"]), side, rb, int(ro), int(wo), wb, round(gap * 100, 1), flag, stamp])
+    # 3) props on the free page that the recording doesn't have (not scored tonight: the recording is the price)
+    have = set(zip(rec["_k"], rec["_m"]))
+    miss = web[[(k, m) not in have for k, m in zip(web["_k"], web["_m"])]].drop_duplicates(["_k", "_m"])
+    nred, ninfo = sum(f[0] == "RED" for f in flags), sum(f[0] == "INFO" for f in flags)
+    if not web.empty:
+        same_book = [r[10] for r in rows if r[6] == r[9]]
+        print(f"CROSSCHECK: {matched} prices matched to the free page | {nred} RED | {ninfo} better-price notes | "
+              f"{len(miss)} props on the free page not in the recording"
+              + (f" | same-book gap: median {pd.Series(same_book).abs().median():.1f} pts" if same_book else ""))
+    for lvl in ("RED", "INFO"):
+        for f in [f for f in flags if f[0] == lvl][: (40 if lvl == "RED" else 8)]:
+            print(f"  {'RED ' if lvl == 'RED' else 'note'} {f[1]} {f[2]} {f[3]:g}: {f[4]}")
+    if nred:
+        print("  -> for each RED: look at that frame again. Misread -> fix props.csv. Price/line moved -> leave it (the recording is what you bet at; the take-if covers moves).")
+    if len(miss):
+        by = miss.groupby("_m")["player"].apply(lambda s: ", ".join(list(s)[:6]) + (f" +{len(s) - 6} more" if len(s) > 6 else ""))
+        for m, s in by.items():
+            print(f"  missing from the recording ({m}): {s}")
+        print("  -> not scored tonight (the recording sets the price). Want them? Record that list or screenshot it, then rerun check.")
+    if a.out:
+        with open(a.out, "w") as fh:
+            _json.dump(rows, fh)
+        print(f"LINE CHECK: {len(rows)} rows -> {a.out} (append to the 'Line check' tab)")
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Verified Prop Engine - NFL (in-chat edition)")
@@ -3473,6 +3591,10 @@ if __name__ == "__main__":
     sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
     sw_.add_argument("--parlays", default="vpe_parlays.json"); sw_.add_argument("--top", type=int, default=10)
     sw_.add_argument("--heavy", action="store_true", help="final check: every player with a qualifying line")
+    xc_ = sub.add_parser("crosscheck"); xc_.add_argument("--rec", required=True, help="props.csv from the recording")
+    xc_.add_argument("--web", required=True, help="props_web.csv from `lines` (free pages)"); xc_.add_argument("--out", default="linecheck_new.json")
+    xc_.add_argument("--slate"); xc_.add_argument("--week")
+    xc_.add_argument("--line-gap", type=float, default=1.0); xc_.add_argument("--same-book-gap", type=float, default=0.04); xc_.add_argument("--better-gap", type=float, default=0.03)
     cl_ = sub.add_parser("close"); cl_.add_argument("--no-log", action="store_true"); cl_.add_argument("--log", default="pick_log.csv"); cl_.add_argument("--props", nargs="+")
     cl_.add_argument("--week", type=int, required=True)
     cl_.add_argument("--snap", help="'Close NFL' tab JSON: closing lines saved earlier (for bets logged later)")
@@ -3515,5 +3637,5 @@ if __name__ == "__main__":
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
      "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "close": cmd_close, "status": cmd_status,
-     "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain, "reprice": cmd_reprice}[a.cmd](a)
+     "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck}[a.cmd](a)
 
