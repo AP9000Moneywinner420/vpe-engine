@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.18.0"
+VERSION = "NBA v2.19.0"
 
 # ==================== data ====================
 
@@ -3674,8 +3674,7 @@ def cmd_close(a):
     note = ("no bets logged for this slate yet (the snapshot keeps the closing lines for later)" if open_.empty
             else "ok" if n == len(open_) else f"{len(open_) - n} left blank" + (f" (no closing page for: {', '.join(miss)})" if miss else
                                                                              " (player/line not on the closing pages)"))
-    if not len(close):
-        note = "NO closing lines (odds pages blocked or stale?)"
+    note = close_note(note, len(close), a)
     write_close_status(getattr(a, "status_out", None), "NBA", date, len(open_), n, len(snaps), note)
 
 
@@ -4573,6 +4572,100 @@ def cmd_crosscheck(a):
         print(f"LINE CHECK: {len(rows)} rows -> {a.out} (append to the 'Line check' tab)")
 
 
+FETCH_SPORT = "NBA"
+# ---------- v2.19 / v15.20: engine-side page download (no web-fetch tool, no permission prompt) ----------
+# 11/12-11/14 every unattended closing run failed: the session's web-fetch asked for permission and nobody was there.
+# `fetchpages` downloads the odds pages itself through the session's network. It only works when the environment's
+# network access allows www.scoresandodds.com; when it doesn't, it says so in plain words (and `close` puts that in
+# the 'Close log' note) instead of a vague "blocked or stale?".
+ODDS_PAGES = {
+    "NBA": {"pts": "https://www.scoresandodds.com/nba/props/points",
+            "reb": "https://www.scoresandodds.com/nba/props/rebounds",
+            "ast": "https://www.scoresandodds.com/nba/props/assists",
+            "fg3m": "https://www.scoresandodds.com/nba/props/3-pointers"},
+    "NFL": {"pass_yds": "https://www.scoresandodds.com/nfl/props/passing-yards",
+            "rush_yds": "https://www.scoresandodds.com/nfl/props/rushing-yards",
+            "rec_yds": "https://www.scoresandodds.com/nfl/props/receiving-yards",
+            "receptions": "https://www.scoresandodds.com/nfl/props/receptions"},
+}
+
+def _page_text(html):
+    import html as _h
+    s = re.sub(r"(?is)<(script|style|noscript|svg|head)\b.*?</\1>", " ", html)
+    s = re.sub(r"(?i)<br\s*/?>|</(div|p|li|tr|td|th|h\d|span|a|section|article)>", "\n", s)
+    s = _h.unescape(re.sub(r"<[^>]+>", " ", s))
+    lines = [re.sub(r"[ \t ]+", " ", x).strip() for x in s.splitlines()]
+    return "\n".join(x for x in lines if x)
+
+def _fetch_one(url, tries=2):
+    import urllib.request, urllib.error
+    err = ""
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (VPE closing-price capture)",
+                                                       "Accept": "text/html"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode("utf-8", "replace"), ""
+        except urllib.error.HTTPError as e:
+            err = f"HTTP {e.code} from the site"
+        except urllib.error.URLError as e:
+            m = str(e.reason)
+            err = ("BLOCKED by this session's network (proxy 403): allow www.scoresandodds.com in the cloud environment's "
+                   "Network access (Custom > Allowed domains)") if "403" in m or "Tunnel" in m else f"network error: {m}"
+            if "BLOCKED" in err:
+                break  # a policy block won't change on retry
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        time.sleep(3)
+    return None, err
+
+def cmd_fetchpages(a):
+    """Download the props pages with the engine (no web-fetch tool). Writes <out>/<market>.html and <market>.txt
+    (clean page text to transcribe into <market>.csv) and a status file that `close --fetch-status` turns into the
+    'Close log' note."""
+    os.makedirs(a.out, exist_ok=True)
+    rows, ok = [], 0
+    for mk, url in ODDS_PAGES[FETCH_SPORT].items():
+        if a.markets and mk not in a.markets:
+            continue
+        html, err = _fetch_one(url)
+        if html is not None:
+            txt = _page_text(html)
+            open(os.path.join(a.out, f"{mk}.html"), "w").write(html)
+            open(os.path.join(a.out, f"{mk}.txt"), "w").write(txt)
+            ok += 1
+            rows.append({"market": mk, "url": url, "status": "ok", "bytes": len(html), "text_lines": txt.count("\n") + 1})
+            print(f"  {mk:<10} ok  {len(html):>8,} bytes -> {a.out}/{mk}.txt")
+        else:
+            rows.append({"market": mk, "url": url, "status": "failed", "error": err})
+            print(f"  {mk:<10} FAILED  {url}  {err}")
+    import json as _j
+    _j.dump({"sport": FETCH_SPORT, "pages": rows}, open(a.status, "w"))
+    print(f"FETCH {FETCH_SPORT}: {ok}/{len(rows)} pages downloaded" + ("" if ok == len(rows) else
+          f" | {fetch_note(a.status)}"))
+
+def fetch_note(path):
+    """One-line summary of failed pages for the 'Close log' note."""
+    import json as _j
+    try:
+        d = _j.load(open(path))
+    except Exception:
+        return ""
+    bad = [p for p in d.get("pages", []) if p.get("status") != "ok"]
+    if not bad:
+        return ""
+    errs = sorted({p.get("error", "") for p in bad})
+    return "pages failed: " + ", ".join(p["market"] for p in bad) + " (" + "; ".join(errs) + ")"
+
+def close_note(note, n_lines, a):
+    """v2.19: name the exact pages and errors instead of 'blocked or stale?'."""
+    extra = "; ".join(x for x in (fetch_note(a.fetch_status) if getattr(a, "fetch_status", None) else "",
+                                  getattr(a, "fetch_note", None) or "") if x)
+    if not n_lines:
+        return "NO closing lines: " + (extra or "no props file passed (pages not fetched?)")
+    return note + (f" | {extra}" if extra else "")
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Verified Prop Engine - NBA (in-chat edition)")
@@ -4652,6 +4745,10 @@ if __name__ == "__main__":
     cl_.add_argument("--snap", help="'Close NBA' tab JSON: closing lines saved on the night (for bets logged later)")
     cl_.add_argument("--snap-out", help="write tonight's closing lines as rows for the 'Close NBA' tab")
     cl_.add_argument("--status-out", help="write one status row for the 'Close log' tab")
+    cl_.add_argument("--fetch-status", help="fetch_status.json from fetchpages: failed pages + errors go into the Close log note")
+    cl_.add_argument("--fetch-note", help="free text for the Close log note (e.g. which web-fetch was refused and the error)")
+    fp_ = sub.add_parser("fetchpages"); fp_.add_argument("--out", default="lines_close"); fp_.add_argument("--status", default="fetch_status.json")
+    fp_.add_argument("--markets", nargs="+")
     ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
@@ -4687,6 +4784,12 @@ if __name__ == "__main__":
     f.add_argument("--boost-min-legs", type=int); f.add_argument("--boost-max-legs", type=int)
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
+    try:  # v2.19: parquet needs pyarrow; install it instead of stalling the run (11/14)
+        import pyarrow  # noqa: F401
+    except ImportError:
+        import subprocess
+        print("SETUP: pyarrow missing -> pip install pyarrow")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "pyarrow"], check=False)
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
      "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "close": cmd_close, "status": cmd_status, "styles": cmd_styles,
-     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck}[a.cmd](a)
+     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
