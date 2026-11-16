@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.21.0"
+VERSION = "NBA v2.22.0"
 
 # ==================== data ====================
 
@@ -1186,7 +1186,8 @@ def evaluate(props, proj, injuries, cfg):
             if pd.isna(odds):
                 continue
             edge = prob - implied_prob(odds)
-            tier = _tier(edge - (EST_MARGIN if fair_how == "1way" else 0.0), prob, cfg)  # v2.16: est. market
+            xm = (EST_MARGIN if fair_how == "1way" else 0.0) + MARKET_EXTRA.get(mk, 0.0)  # v2.16 est. market + v2.22 market
+            tier = _tier(edge - xm, prob, cfg)
             if tier == "tier_3" and not profile["allow_tier3"]:
                 tier = None
             if tier and odds > smax:  # long shots: tail of the distribution is where the model is least reliable
@@ -1201,7 +1202,7 @@ def evaluate(props, proj, injuries, cfg):
                 units = round(units * 4) / 4
                 if units < 0.25:
                     tier, units = None, 0.0
-            mo, ll = _take_if(mu, var, mk, line, side, prob - (EST_MARGIN if fair_how == "1way" else 0.0), shrink, cfg)
+            mo, ll = _take_if(mu, var, mk, line, side, prob - xm, shrink, cfg)
             rr_ = role_risk(p)
             rows.append({"player": p["name"], "team": p["team"], "opp": p["opp"], "home": p["home"],
                          "game_id": p["game_id"], "market": mk, "side": side, "line": line, "odds": int(odds),
@@ -1352,7 +1353,7 @@ CONFIG = {
                        # threes allowed, ...) tested on top of defense-vs-position: none beat it in both seasons.
                        "apply": ["ast"]},
             "new_team_sd_mult": 1.05, "early_sd_mult": 1.0,
-            "prob_calibration_shrink": 0.8, "max_market_gap": 0.15, "min_minutes_to_bet": 20,
+            "prob_calibration_shrink": 0.8, "max_market_gap": 0.10, "min_minutes_to_bet": 20,
             # v2.3 calibration map (see cal_prob): cross-season test 2024-25 <-> 2025-26 log-loss better both ways
             # (t=+3.6 / +7.8); 0-10% bucket 12% -> 4% predicted (actual 4-5%), 80-90% 78-80% -> 84% (actual 82-85%)
             "prob_map": {"x": [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.3, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.4, 0.41, 0.42, 0.43, 0.44, 0.45, 0.46, 0.47, 0.48, 0.49, 0.5, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.6, 0.61, 0.62, 0.63, 0.64, 0.65, 0.66, 0.67, 0.68, 0.69, 0.7, 0.71, 0.72, 0.73, 0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.8, 0.81, 0.82, 0.83, 0.84, 0.85, 0.86, 0.87, 0.88, 0.89, 0.9, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.0],
@@ -2024,7 +2025,7 @@ def print_logged(rows):
 # better one is shown. A profit boost (--boost) is applied to the big parlay at --boost-book.
 PARLAY = {"model_weight": 0.4, "side_bias": {},  # replaced every run by the learned weight (CALIB / Calib tab)
           "min_edge": 0.015,         # leg prob - break-even at the user's best book, after haircut
-          "min_prob": 0.53, "max_gap": 0.15,          # model vs market gap: bigger = model probably missing news
+          "min_prob": 0.53, "max_gap": 0.10,          # model vs market gap: bigger = model probably missing news
           "min_odds": -200, "max_odds": 150, "min_minutes": 20, "min_minutes_ratio": 0.85,
           "books": ["draftkings", "fanduel"],
           "haircut": 0.05,           # price from another book -> assume ours pays 0.05 less in decimal odds (~6-8 cents)
@@ -2142,7 +2143,8 @@ def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     d["price_fd"] = [decimal_to_american(x) for x in d["dec_fanduel"]]
     d["leg_prob"] = np.round(blend_leg(d["model_prob"], d["market_prob"], d["market"], d["side"]), 3)
     d["leg_edge"] = (d["leg_prob"] - 1 / d["best_dec"]).round(3)
-    d["_estm"] = (d["mkt_est"].astype(str).str.lower().isin(["true", "1"]) * EST_MARGIN) if "mkt_est" in d else 0.0
+    d["_estm"] = ((d["mkt_est"].astype(str).str.lower().isin(["true", "1"]) * EST_MARGIN) if "mkt_est" in d else 0.0) \
+        + d["market"].map(MARKET_EXTRA).fillna(0.0)
     d = d[(d["leg_edge"] - d["_estm"] >= (PARLAY["min_edge"] if min_edge is None else min_edge))
           & (d["leg_prob"] >= (PARLAY["min_prob"] if min_prob is None else min_prob))]
     # take-if: worst odds (at either book) at which this leg still clears min_edge
@@ -2658,7 +2660,7 @@ def cmd_sweep(a):
         for par in json.load(open(a.parlays)):
             for l in par.get("legs", []):
                 add(l[0], "parlay leg" + (" (THE parlay)" if par.get("recommended") else ""))
-    top = allp[(allp["edge"] >= 0.015) & allp["odds"].between(-200, 200) & (allp["market_gap"].fillna(0) <= 0.15)]
+    top = allp[(allp["edge"] >= 0.015) & allp["odds"].between(-200, 200) & (allp["market_gap"].fillna(0) <= CONFIG["model"]["max_market_gap"])]
     for p in top.sort_values("edge", ascending=False)["player"].drop_duplicates().head(a.top):
         add(p, "top prop")
     if a.heavy:  # final check: every player with a qualifying line
@@ -2795,7 +2797,8 @@ def load_calib_table(table, sport):
 def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, max_win=None, need_market_ev=True):
     col = "dec_" + book
     # low-vig legs first: value at market odds (no-vig chance x this book's price), not the shortest prices
-    ranked = pool.assign(_mv=pool["market_prob"] * pool[col]).sort_values(["_mv", "leg_prob"], ascending=False)
+    ranked = pool.assign(_mv=pool["market_prob"] * pool[col] * (1 + pool["market"].map(BOOST_PREF).fillna(0.0) / 6)
+                         ).sort_values(["_mv", "leg_prob"], ascending=False)
     ranked = ranked.drop_duplicates("player")
     # both sides in the candidate list (low-vig legs skew Under, and the Unders cap would block every combo)
     ranked = pd.concat([ranked[ranked["side"] == sd].head(PARLAY["pool"] // 2 + 1) for sd in ("Over", "Under")])
@@ -2819,6 +2822,8 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
                 continue
             # least risk for the payout: maximize long-run bankroll growth at a 5% stake (penalizes longshots)
             g = p * math.log(1 + 0.05 * (dec_eff - 1)) + (1 - p) * math.log(0.95)
+            if g > 0:  # v2.22: on close calls prefer threes / PRA legs (+3% of the growth score per leg)
+                g *= 1 + sum(BOOST_PREF.get(c["market"], 0.0) for c in combo)
             if best is None or g > best[6] + 1e-12:
                 best = (p * dec_eff - 1, p, p_mkt, dec, dec_eff, combo, g)
     return best[:6] if best and (best[6] > 0 or not need_market_ev) else None
@@ -3521,7 +3526,7 @@ def cmd_menu(a):
     ov = allp.copy()
     for c in ("edge", "blend_prob", "odds", "market_gap"):
         ov[c] = pd.to_numeric(ov.get(c), errors="coerce")
-    ok = (ov["edge"] >= MENU["min_edge"]) & ov["odds"].between(-200, 200) & (ov["market_gap"].fillna(0) <= 0.15)
+    ok = (ov["edge"] >= MENU["min_edge"]) & ov["odds"].between(-200, 200) & (ov["market_gap"].fillna(0) <= CONFIG["model"]["max_market_gap"])
     if "base_min" in ov:
         ok &= pd.to_numeric(ov["base_min"], errors="coerce").fillna(99) >= 20
     if "injury" in ov:
@@ -4016,7 +4021,7 @@ def _tier_text(r, x, cfg):
     T = cfg["tiers"]
     rule = " | ".join(f"T{t[-1]} edge>={T[t]['min_edge']:.1%}" + (f" & win>={T[t]['min_prob']:.0%}" if T[t]["min_prob"] > 0 else "")
                       for t in ("tier_1", "tier_2", "tier_3"))
-    estm = EST_MARGIN if (x.get("p") or {}).get("how") == "1way" else 0.0
+    estm = (EST_MARGIN if (x.get("p") or {}).get("how") == "1way" else 0.0) + MARKET_EXTRA.get(r.get("market"), 0.0)
     nominal = _tier(edge - estm, prob, cfg)
     tier = r.get("tier") if isinstance(r.get("tier"), str) else None
     if tier:
@@ -4035,7 +4040,8 @@ def _tier_text(r, x, cfg):
         return f"clears {nominal.replace('_', ' ')} on edge but blocked: {'; '.join(why) or 'stake rounds below 0.25u'}", None
     need = T["tier_3"]["min_edge"] - (edge - estm)
     return (f"no tier: edge {edge:+.1%} is {need:.1%} short of Tier 3 ({rule})"
-            + (" (market estimated from one price: needs +1.5% extra)" if estm else "")), None
+            + (f" (needs {estm:+.1%} extra: " + " + ".join(x for x in ("market estimated from one price" if (x.get("p") or {}).get("how") == "1way" else "",
+                                                                        "points market" if r.get("market") in MARKET_EXTRA else "") if x) + ")" if estm else "")), None
 
 
 def _stake_text(r, cfg, tier):
@@ -4260,6 +4266,9 @@ def nba_x(p, mk, mu, var, oo, uo, pchain):
 # Lines from a recording are priced as recorded, but bets often go in hours later and the price moves (11/11: three
 # boost legs moved 15-35 cents). So every pick, leg and parlay prints a take-if again, and `reprice` re-rates a few
 # props (or the parlay they make) at the live price without a full rerun.
+MARKET_EXTRA = {"pts": 0.02}  # v2.22: extra edge by market. 11/16 Shadow test: VPE's side on points lost 15.1% (1,068
+                              # lines), the worst market by far; threes -1.7%, PRA -2.1%, assists -6.9%, rebounds -8.6%
+BOOST_PREF = {"fg3m": 0.03, "pra": 0.03}  # v2.22: boost parlays lean toward VPE's best markets on close calls
 EST_MARGIN = 0.015  # extra edge a pick needs when its market chance comes from ONE price (no main O/U to read it off):
                     # the hold on those is assumed (7%), and ~10% real hold would cost ~1.5 pts of market chance
 LOG_UNIT_USD = 1.0  # the Pick Log's unit: $1 (Summary "Unit ($)"), so logged units == stake_usd
@@ -4398,7 +4407,7 @@ def cmd_reprice(a):
         old = int(r["odds"])
         mp_new = float(np.clip(float(r["market_prob"]) * implied_prob(odds) / implied_prob(old), 0.01, 0.99))
         p_new = float(blend_leg(float(r["model_prob"]), mp_new, mk, side))
-        estm = EST_MARGIN if str(r.get("mkt_est")).lower() in ("true", "1") else 0.0
+        estm = (EST_MARGIN if str(r.get("mkt_est")).lower() in ("true", "1") else 0.0) + MARKET_EXTRA.get(mk, 0.0)
         be = implied_prob(odds)
         edge = p_new - be
         tier = _tier(edge - estm, p_new, cfg)
@@ -4409,7 +4418,7 @@ def cmd_reprice(a):
         else:
             v = "SKIP at this price"
         print(f"{tag} (recorded {old:+d}): market {float(r['market_prob']):.1%} -> {mp_new:.1%} | VPE {p_new:.1%} vs "
-              f"{be:.1%} needed -> edge {edge:+.1%}{' (needs +1.5% more: market estimated)' if estm else ''} -> {v}")
+              f"{be:.1%} needed -> edge {edge:+.1%}{f' (needs {estm:+.1%} more: estimated market / points)' if estm else ''} -> {v}")
         legs.append({"p": p_new, "pm": mp_new, "dec": american_to_decimal(odds), "game": str(r.get("game_id")), "tag": tag})
     if not a.parlay or not legs:
         return
