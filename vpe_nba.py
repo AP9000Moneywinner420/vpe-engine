@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.20.0"
+VERSION = "NBA v2.21.0"
 
 # ==================== data ====================
 
@@ -719,8 +719,10 @@ def team_adjust(state, sl, outs, rosters, cfg, use_split=True, sure=None):
             sl.at[pid, "m2"] = m2[pid]
             for s in USE_STATS:
                 sl.at[pid, "u_" + s] = mult[s]
+            why = ("team-total trim: this roster's rates add up to more than the team normally produces" if mult["pts"] < 0.995
+                   else "missing production shared out" if mult["pts"] > 1.005 else "")
             note = (f"OUT: {', '.join(names)} | " if names else "") + \
-                   f"{m2[pid] - P.at[pid, 'min']:+.1f} min, usage x{mult['fga']:.2f}, pts x{mult['pts']:.2f}"
+                   f"{m2[pid] - P.at[pid, 'min']:+.1f} min, usage x{mult['fga']:.2f}, pts x{mult['pts']:.2f}" + (f" ({why})" if why else "")
             if use_split and big is not None:
                 ws = without_split(state, pid, team, big.name)
                 if ws:
@@ -1805,6 +1807,8 @@ def rate_pick(prob, odds, eff_odds, cfg, suggested):
         v = "-EV at price taken"
     return te, v, round(eb, 3), round(ee, 3)
 
+SGP_RATINGS = []  # v2.21: ratings the sgp command saved tonight (sgp_ratings.json), matched to logged SGPs
+
 def build_log_rows(placed, score, cfg, unit, slip, stamp):
     """placed.csv: player,market,side,line,odds,stake[,boost_pct,parlay_id,parlay_odds,note].
     Straight bets: one row each. Parlays: one row per leg (same parlay_id; odds = that leg's odds if shown, stake =
@@ -1897,6 +1901,16 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
                 r["suggested"], r["rec_stake_usd"] = "sgp", 0.0
                 r.update({"tier": "sgp_correlated", "vpe_verdict": "same-game parlay: legs correlated, EV not rated "
                           "(use the sgp command before placing)"})
+                # v2.21: if the sgp checker rated these exact legs tonight, log its rating (re-priced at the odds taken)
+                pk = frozenset((norm_name(o[0]["player"]), o[0]["market"], o[0]["side"], float(o[0]["line"])) for o in out)
+                rt = next((x for x in reversed(SGP_RATINGS)
+                           if frozenset((l[0], l[1], l[2], float(l[3])) for l in x["legs"]) == pk), None)
+                if rt:
+                    ev_t = rt["joint"] * american_to_decimal(eff) - 1
+                    vd = "TAKE" if ev_t >= rt.get("min_ev", 0.10) else "SKIP"
+                    r.update({"vpe_verdict": f"SGP checker: {vd} at the price taken (joint {rt['joint']:.1%}, fair "
+                                             f"{rt['fair']:+d}, EV {ev_t:+.0%} at {int(eff):+d}; rated {rt['verdict']} at {rt['price']:+d})",
+                              "ev_per_unit": round(ev_t, 3), "model_prob": round(rt["joint"], 4)})
             elif any(x is None for x in probs):
                 r.update({"tier": "unscored", "vpe_verdict": "unscored (a leg has no projection)"})
             else:
@@ -3042,6 +3056,8 @@ def cmd_log(a):
     import json as _j
     pp_ = getattr(a, "parlays", None) or "vpe_parlays.json"
     VPE_PARLAYS[:] = _j.load(open(pp_)) if os.path.exists(pp_) else []
+    _sr = getattr(a, "sgp_ratings", None) or "sgp_ratings.json"
+    SGP_RATINGS[:] = _j.load(open(_sr)) if os.path.exists(_sr) else []
     stamp = {"season": season_for(today_et()),
              "date": allp["date"].iloc[0] if len(allp) else str(today_et().date())}
     rows = build_log_rows(pd.read_csv(a.placed, dtype=str), score, cfg, unit, slip, stamp)
@@ -3453,6 +3469,16 @@ def cmd_sgp(a):
     print(f"  book price {price:+d} (implies {1 / dec:.2%}) | fair price {decimal_to_american(1 / joint):+d} | EV {ev:+.0%}")
     print(f"  VERDICT: {'TAKE' if ev >= a.min_ev else 'SKIP'} (needs EV >= {a.min_ev:+.0%}; rate-only - correlations from last "
           "season, not yet proven against real SGP results)")
+    # v2.21: save the rating so `log` records it on the SGP row (11/16: it had to be typed into the note by hand)
+    import json as _j
+    rp = getattr(a, "ratings_out", None) or "sgp_ratings.json"
+    saved = _j.load(open(rp)) if os.path.exists(rp) else []
+    saved.append({"legs": [[norm_name(l["name"]), l["market"], l["side"], l["line"]] for l in legs if l["kind"] == "player"],
+                  "other_legs": [l["label"] for l in legs if l["kind"] != "player"], "game": f"{away}@{home}",
+                  "joint": round(joint, 4), "fair": int(decimal_to_american(1 / joint)), "price": price, "ev": round(ev, 3),
+                  "min_ev": a.min_ev, "verdict": "TAKE" if ev >= a.min_ev else "SKIP", "lift": round(float(lift), 3)})
+    _j.dump(saved, open(rp, "w"))
+    print(f"  saved to {rp}: `log` will record this rating on the SGP if it is placed")
     if lift > 1.05:
         print("  why: legs move together (shared minutes / pace / same-player stats) - the book may or may not price that in")
     elif lift < 0.95:

@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.22"
+VERSION = "NFL v15.23"
 
 # ==================== data ====================
 
@@ -1418,6 +1418,8 @@ def rate_pick(prob, odds, eff_odds, cfg, suggested):
         v = "-EV at price taken"
     return te, v, round(eb, 3), round(ee, 3)
 
+SGP_RATINGS = []  # v2.21: ratings the sgp command saved tonight (sgp_ratings.json), matched to logged SGPs
+
 def build_log_rows(placed, score, cfg, unit, slip, stamp):
     """placed.csv: player,market,side,line,odds,stake[,boost_pct,parlay_id,parlay_odds,note].
     Straight bets: one row each. Parlays: one row per leg (same parlay_id; odds = that leg's odds if shown, stake =
@@ -1510,6 +1512,16 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
                 r["suggested"], r["rec_stake_usd"] = "sgp", 0.0
                 r.update({"tier": "sgp_correlated", "vpe_verdict": "same-game parlay: legs correlated, EV not rated "
                           "(use the sgp command before placing)"})
+                # v2.21: if the sgp checker rated these exact legs tonight, log its rating (re-priced at the odds taken)
+                pk = frozenset((norm_name(o[0]["player"]), o[0]["market"], o[0]["side"], float(o[0]["line"])) for o in out)
+                rt = next((x for x in reversed(SGP_RATINGS)
+                           if frozenset((l[0], l[1], l[2], float(l[3])) for l in x["legs"]) == pk), None)
+                if rt:
+                    ev_t = rt["joint"] * american_to_decimal(eff) - 1
+                    vd = "TAKE" if ev_t >= rt.get("min_ev", 0.10) else "SKIP"
+                    r.update({"vpe_verdict": f"SGP checker: {vd} at the price taken (joint {rt['joint']:.1%}, fair "
+                                             f"{rt['fair']:+d}, EV {ev_t:+.0%} at {int(eff):+d}; rated {rt['verdict']} at {rt['price']:+d})",
+                              "ev_per_unit": round(ev_t, 3), "model_prob": round(rt["joint"], 4)})
             elif any(x is None for x in probs):
                 r.update({"tier": "unscored", "vpe_verdict": "unscored (a leg has no projection)"})
             else:
@@ -2731,6 +2743,8 @@ def cmd_log(a):
     import json as _j
     pp_ = getattr(a, "parlays", None) or "vpe_parlays.json"
     VPE_PARLAYS[:] = _j.load(open(pp_)) if os.path.exists(pp_) else []
+    _sr = getattr(a, "sgp_ratings", None) or "sgp_ratings.json"
+    SGP_RATINGS[:] = _j.load(open(_sr)) if os.path.exists(_sr) else []
     rows = build_log_rows(pd.read_csv(a.placed, dtype=str), score, cfg, unit, slip,
                           {"season": cfg["season"], "week": week})
     if getattr(a, "dry_run", False):
