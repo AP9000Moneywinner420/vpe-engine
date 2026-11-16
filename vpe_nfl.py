@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.20"
+VERSION = "NFL v15.21"
 
 # ==================== data ====================
 
@@ -1660,18 +1660,22 @@ def market_prob_for(allp, player, mk, side, line, odds):
 # When nothing clears the edge bar, VPE still says which of tonight's lines are the least-bad to play, labeled LEAN.
 # Why: a night with no bets teaches the learning loop nothing new about placed bets and CLV, and boosts get used
 # either way. Leans are logged as suggested = "lean" (their own group in the Summary), never mixed with VPE picks.
-LEAN = {"min_edge": -0.04,   # leans may be up to 4 pts below break-even (anything worse is listed as a pass)
+LEAN = {"min_dec": 1.0 / 0.6,  # v2.20: no lean shorter than -150 (11/16: 5-9, -118.7u, mostly -180 to -200 favourites)
+        "min_edge": -0.04,   # leans may be up to 4 pts below break-even (anything worse is listed as a pass)
         "min_prob": 0.50, "straights": 3, "units": 0.5, "parlay_target": 4.0, "parlay_max_legs": 3}
 
 def lean_pool(allp, exclude=()):
-    return parlay_pool(allp, exclude, min_edge=LEAN["min_edge"], min_prob=LEAN["min_prob"])
+    d = parlay_pool(allp, exclude, min_edge=LEAN["min_edge"], min_prob=LEAN["min_prob"])
+    return d[d["best_dec"] >= LEAN["min_dec"] - 1e-9] if len(d) and "best_dec" in d else d
 
 def lean_straights(allp, exclude, unit_usd):
     """Top straight bets by edge (one per game) when the staked slip is empty."""
     d = lean_pool(allp, exclude)
     if d.empty:
         return d
-    d = d.sort_values(["leg_prob", "leg_edge"], ascending=False).drop_duplicates("game_id").head(LEAN["straights"]).copy()
+    # v2.20: least-bad by EDGE first (closest to break-even), not by win chance: sorting by win chance picked the
+    # heaviest favourites, where the juice costs the most.
+    d = d.sort_values(["leg_edge", "leg_prob"], ascending=False).drop_duplicates("game_id").head(LEAN["straights"]).copy()
     d["bet_odds"] = [decimal_to_american(x) for x in d["best_dec"]]
     d["units"] = LEAN["units"]
     d["stake_usd"] = round(LEAN["units"] * unit_usd, 2)
@@ -2038,7 +2042,7 @@ def blend_leg(model_p, market_p, market=None, side=None):
 #     150+ lines) VPE trusts the model half as much there; 10+ pts under (z <= -3) it defers fully to the market (no bet).
 #     A gate lifts itself when the recent window recovers. The core projection math is never touched.
 LEARN = {"start": {"NBA": "2026-10-26", "NFL": "2026-W1"}, "window": 8000, "n0_tail": 600, "tail_cap": 0.04,
-         "tail_bins": [0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0], "bet_edge": 0.025, "gate_n": 150, "est_hold": 1.045}
+         "tail_bins": [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0], "bet_edge": 0.025, "gate_n": 150, "est_hold": 1.045}
 LEARNED = {"tail": None, "gate": {}}
 LEARNED_COLS = ["sport", "kind", "key", "value", "n", "note", "updated"]
 
@@ -2062,7 +2066,7 @@ def _learned_rows(path):
 
 def set_learned(path, sport):
     LEARNED["tail"], LEARNED["gate"] = None, {}
-    xs, ds, gates = [], [], {}
+    xs, ds, gates, ax = [], [], {}, []
     for r in _learned_rows(path):
         if str(r.get("sport", "")).upper() != sport:
             continue
@@ -2072,10 +2076,15 @@ def set_learned(path, sport):
             gates[str(r["key"])] = int(r["value"])
     if xs:
         o = np.argsort(xs)
-        LEARNED["tail"] = ([0.5, LEARN["tail_bins"][0]] + [xs[i] for i in o], [0.0, 0.0] + [float(np.clip(ds[i], -LEARN["tail_cap"], LEARN["tail_cap"])) for i in o])
+        # v2.20: the learn step now also fits the 50-55 and 55-60 bands (11/16 review: NBA said 52.5%, hit 49.9% on
+        # 2,411 lines, and nothing corrected it). A Learned tab written before that has no row under 60%: keep the old
+        # flat-zero anchor there so nothing changes until the next morning learn writes the new bands.
+        mid = any(x < LEARN["tail_bins"][2] for x in xs)
+        ax, ay = ([0.5], [0.0]) if mid else ([0.5, LEARN["tail_bins"][2]], [0.0, 0.0])
+        LEARNED["tail"] = (ax + [xs[i] for i in o], ay + [float(np.clip(ds[i], -LEARN["tail_cap"], LEARN["tail_cap"])) for i in o])
     LEARNED["gate"] = gates
     if path:
-        t = "none" if not xs else ", ".join(f"{x:.0%}->{d:+.1%}" for x, d in zip(LEARNED["tail"][0][2:], LEARNED["tail"][1][2:]) if abs(d) >= 0.005) or "none needed"
+        t = "none" if not xs else ", ".join(f"{x:.0%}->{d:+.1%}" for x, d in zip(LEARNED["tail"][0][len(ax):], LEARNED["tail"][1][len(ax):]) if abs(d) >= 0.005) or "none needed"
         g = ", ".join(f"{k} {'HALF' if v == 1 else 'PAUSED'}" for k, v in sorted(gates.items())) or "none"
         print(f"LEARNED: tail fixes {t} | market gates {g}")
 
@@ -3577,6 +3586,53 @@ def _fetch_one(url, tries=2):
         time.sleep(3)
     return None, err
 
+def parse_props_html(html):
+    """v2.20: read a ScoresAndOdds props page straight from its HTML (no transcription by hand).
+    Each player is one <li class="border"> row: name + matchup, then the best Over and best Under (line, odds, book)."""
+    import html as _h
+    rows = []
+    for blk in re.split(r'<li class="border"', html)[1:]:
+        blk = blk.split("</li>", 1)[0] if 'class="table-list-button' not in blk else blk.split('class="table-list-button', 1)[0]
+        nm = re.search(r'class="props-name">\s*<a[^>]*>(.*?)</a>', blk, re.S)
+        mu = re.search(r'class="props-name">.*?<span class="bold small gray">(.*?)</span>', blk, re.S)
+        if not nm:
+            continue
+        rec = {"player": _h.unescape(re.sub(r"<[^>]+>", "", nm.group(1))).strip(),
+               "matchup": _h.unescape(mu.group(1)).strip() if mu else ""}
+        for cell in re.findall(r'<div class="game-odds[^"]*">(.*?)</div>\s*<div class="book-logo">(.*?)</div>\s*</div>', blk, re.S):
+            ln = re.search(r'class="data-moneyline">\s*([ou])\s*([\d.]+)\s*<', cell[0])
+            od = re.search(r'class="data-odds[^"]*">\s*([+-]?\d+|even|EVEN|Even)\s*<', cell[0])
+            bk = re.search(r'alt="([^"]+)"', cell[1])
+            if not ln or not od:
+                continue
+            side = "over" if ln.group(1) == "o" else "under"
+            if f"{side}_line" in rec:
+                continue
+            o = od.group(1)
+            rec[f"{side}_line"] = ln.group(2)
+            rec[f"{side}_odds"] = "100" if o.lower() == "even" else o
+            rec[f"{side}_book"] = re.sub(r"\s+", "", bk.group(1).lower()) if bk else ""
+        if "over_line" in rec or "under_line" in rec:
+            rows.append(rec)
+    return rows
+
+
+MIRROR = "https://raw.githubusercontent.com/AP9000Moneywinner420/vpe-engine/odds-pages/"  # v2.20: GitHub copy, refreshed
+MIRROR_MAX_AGE_H = 3.0                                                                      # 6x/day by .github/workflows/odds-pages.yml
+
+def _mirror_one(sport, mk):
+    """The same page from the GitHub mirror (GitHub is always reachable from VPE sessions)."""
+    import gzip, urllib.request, datetime as _dt
+    try:
+        ts = urllib.request.urlopen(MIRROR + "fetched_at.txt", timeout=30).read().decode().strip()
+        age = (_dt.datetime.now(_dt.timezone.utc) - _dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)).total_seconds() / 3600
+        if age > MIRROR_MAX_AGE_H:
+            return None, f"GitHub mirror is {age:.1f} h old (limit {MIRROR_MAX_AGE_H:g} h): the odds-pages workflow may not have run", None
+        raw = urllib.request.urlopen(MIRROR + f"{sport.lower()}/{mk}.html.gz", timeout=60).read()
+        return gzip.decompress(raw).decode("utf-8", "replace"), "", age
+    except Exception as e:
+        return None, f"GitHub mirror failed: {type(e).__name__}: {e}", None
+
 def cmd_fetchpages(a):
     """Download the props pages with the engine (no web-fetch tool). Writes <out>/<market>.html and <market>.txt
     (clean page text to transcribe into <market>.csv) and a status file that `close --fetch-status` turns into the
@@ -3587,13 +3643,25 @@ def cmd_fetchpages(a):
         if a.markets and mk not in a.markets:
             continue
         html, err = _fetch_one(url)
+        src = "direct"
+        if html is None:  # v2.20: direct download blocked -> the GitHub mirror of the same page
+            direct_err = err
+            html, err, age = _mirror_one(FETCH_SPORT, mk)
+            src = f"GitHub mirror, {age * 60:.0f} min old" if html is not None else src
+            if html is None:
+                err = f"{direct_err}; {err}"
         if html is not None:
             txt = _page_text(html)
             open(os.path.join(a.out, f"{mk}.html"), "w").write(html)
             open(os.path.join(a.out, f"{mk}.txt"), "w").write(txt)
+            parsed = parse_props_html(html)
+            cols = ["player", "matchup", "over_line", "over_odds", "over_book", "under_line", "under_odds", "under_book"]
+            pd.DataFrame(parsed, columns=cols).to_csv(os.path.join(a.out, f"{mk}.csv"), index=False)
             ok += 1
-            rows.append({"market": mk, "url": url, "status": "ok", "bytes": len(html), "text_lines": txt.count("\n") + 1})
-            print(f"  {mk:<10} ok  {len(html):>8,} bytes -> {a.out}/{mk}.txt")
+            rows.append({"market": mk, "url": url, "status": "ok", "source": src, "bytes": len(html), "players": len(parsed)})
+            print(f"  {mk:<10} ok  {len(parsed):>4} players ({src}) -> {a.out}/{mk}.csv")
+            if not parsed:
+                print(f"  {mk:<10} WARNING: page downloaded but 0 players parsed (layout changed?): read {a.out}/{mk}.txt and write the CSV by hand")
         else:
             rows.append({"market": mk, "url": url, "status": "failed", "error": err})
             print(f"  {mk:<10} FAILED  {url}  {err}")
