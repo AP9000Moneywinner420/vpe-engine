@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.23"
+VERSION = "NFL v15.24"
 
 # ==================== data ====================
 
@@ -970,16 +970,25 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
             })
     return pd.DataFrame(rows), pd.DataFrame(skipped, columns=["player", "market", "reason"])
 
-def used_units(log_path, mask_fn):
+def used_units(log_path, mask_fn, unit_usd=None):
     """Units already staked (straights + parlays, not legs) in the pick log for this week/night, so a second run
-    (e.g. Thursday game, then Sunday slate) shares the cap instead of resetting it."""
+    (e.g. Thursday game, then Sunday slate) shares the cap instead of resetting it.
+    v2.23 / v15.24: the log stores DOLLARS (Pick Log unit = $1), so the dollars staked are converted back into VPE
+    units (bankroll x unit %) before they are compared with the cap. Uses stake_usd when present, else units x $1."""
     if not log_path or not os.path.exists(log_path):
         return 0.0
     d = pd.read_csv(log_path, dtype=str)
     if d.empty:
         return 0.0
     m = mask_fn(d) & (d.get("bet_type", pd.Series("straight", index=d.index)).fillna("straight") != "leg")
-    return round(float(pd.to_numeric(d.loc[m, "units"], errors="coerce").fillna(0).sum()), 2)
+    col = "stake_usd" if "stake_usd" in d.columns else "units"
+    usd = pd.to_numeric(d.loc[m, col], errors="coerce")
+    if col == "stake_usd":
+        usd = usd.fillna(pd.to_numeric(d.loc[m, "units"], errors="coerce") * LOG_UNIT_USD) if "units" in d.columns else usd
+    else:
+        usd = usd * LOG_UNIT_USD
+    usd = float(usd.fillna(0).sum())
+    return round(usd / unit_usd, 2) if unit_usd else round(usd, 2)
 
 # ---------- locked prices (v2.11 / v15.12): the user's own recording = the price he gets ----------
 # When every line comes from the user's DraftKings / FanDuel recording or screenshots (book = draftkings or fanduel,
@@ -1213,7 +1222,8 @@ def cmd_check(a):
     plays = (load_plays(cfg["season"]), load_plays(cfg["season"] - 1))
     proj = Projector(stats, prev, games, cfg["season"], week, cfg, outs=outs, weather=_weather(a.weather), plays=plays)
     cfg["used_units"] = used_units(a.log, lambda d: (pd.to_numeric(d.get("season"), errors="coerce") == cfg["season"])
-                                   & (pd.to_numeric(d.get("week"), errors="coerce") == week))
+                                   & (pd.to_numeric(d.get("week"), errors="coerce") == week),
+                                   unit_usd=cfg["bankroll"] * cfg["unit_pct_of_bankroll"])
     cap = cfg["strategy_profiles"][cfg["strategy_profile"]]["max_units_per_week"]
     print(f"CAP: {cfg['used_units']:g}u already staked in week {week} (pick log) -> {max(cap - cfg['used_units'], 0):g}u of {cap}u left this week")
     lines = pd.read_csv(a.props)
@@ -1261,7 +1271,7 @@ def cmd_check(a):
         os.makedirs("runs", exist_ok=True)
         evald.to_csv(f"runs/bets_all_W{week}_{pd.Timestamp.now(tz='America/New_York'):%a%H%M%S}.csv", index=False)
         print(f"\nsaved bets -> {a.out}")
-    write_shadow(evald, f"{cfg['season']}-W{week}", a.shadow_out)
+    write_shadow(evald, f"{cfg['season']}-W{week}", a.shadow_out, getattr(a, "shadow_saved", None))
 
 def _read_loose_csv(path):
     """Reads CSV text copied from a web page: drops ``` fences, MARKET= lines and blank lines."""
@@ -1493,6 +1503,17 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         # a placed parlay is a VPE pick only if it is EXACTLY a parlay VPE built tonight (same legs, nothing added/removed)
         lk = frozenset((norm_name(o[0]["player"]), o[0]["market"], o[0]["side"]) for o in out)
         vpe_par = next((v for v in VPE_PARLAYS if frozenset((norm_name(x[0]), x[1], x[2]) for x in v["legs"]) == lk), None)
+        # v2.23 / v15.24: a BOOST-built parlay placed without its boost (or at the other book) is NOT the VPE pick: its
+        # edge was the boost (11/16: unboosted FD copy of a boost build was logged "suggested = yes")
+        boost_unused = None
+        if vpe_par and _num(vpe_par.get("boost_pct")):
+            _vb, _pb = float(_num(vpe_par.get("boost_pct"))), _num(b0["boost_pct"]) if "boost_pct" in b0 else None
+            _bk_ok = BOOK_NAME.get(vpe_par.get("book"), str(vpe_par.get("book"))).lower() == _book(b0).lower()
+            if not _pb or float(_pb) + 1e-9 < _vb or not _bk_ok:
+                boost_unused = (f"VPE legs, boost not used (built for {_vb:g}% boost at "
+                                f"{BOOK_NAME.get(vpe_par.get('book'), vpe_par.get('book'))}; placed "
+                                + (f"{float(_pb):g}% boost" if _pb else "no boost") + f" at {_book(b0)})")
+                vpe_par = None
         r = {**stamp, "logged_at": now, "bet_type": "parlay", "parlay_id": f"{tag}-{p}", "market": "parlay",
              "player": " + ".join(f"{o[0]['player']} {o[0]['side']} {o[0]['line']:g} {o[0]['market']}" for o in out),
              "side": np.nan, "odds": podds, "book": _book(b0), "units": round(stake / unit, 2),
@@ -1531,10 +1552,16 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
                     v = "VPE lean parlay (best available, no edge)" if ee <= 0 else "VPE lean parlay (+EV at the price taken)"
                 if v == "small +EV, below tiers":
                     v = "+EV parlay" if eb > 0 else "+EV only with boost"
+                if boost_unused:
+                    v = boost_unused + f" -> {v}"
                 r.update({"model_prob": round(prob, 3), "blend_prob": round(prob, 3), "tier": te or "off_model",
                           "source": "engine" if te else "off_model", "vpe_verdict": v, "edge_base": eb, "edge": ee,
                           "ev_per_unit": round(ev_per_unit(prob, eff), 3)})
         rows.append(r)
+    # v2.23 / v15.24: stamp the engine version on every row (note) so grading can split picks by engine version
+    for r_ in rows:
+        n_ = "" if r_.get("note") is None or (isinstance(r_.get("note"), float) and pd.isna(r_.get("note"))) else str(r_["note"])
+        r_["note"] = (n_ + f" [{VERSION}]").strip()
     return rows
 
 VPE_PARLAYS = []  # parlays VPE built this run (vpe_parlays.json, written by `parlay`), loaded by `log`
@@ -1759,7 +1786,10 @@ def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     d = d[(d["leg_edge"] - d["_estm"] >= (PARLAY["min_edge"] if min_edge is None else min_edge))
           & (d["leg_prob"] >= (PARLAY["min_prob"] if min_prob is None else min_prob))]
     # take-if: worst odds (at either book) at which this leg still clears min_edge
-    d["take_min"] = [int(decimal_to_american(1 / (p - PARLAY["min_edge"] - m))) for p, m in zip(d["leg_prob"], d["_estm"])]
+    # v2.23 / v15.24: at THIS pool's cutoff (boost pool -3%, leans pool its own), so a leg the pool keeps at its price
+    # never shows a take_min above that price (was always the regular parlay cutoff -> "take if +105" on a +100 leg it kept)
+    _me = PARLAY["min_edge"] if min_edge is None else min_edge
+    d["take_min"] = [int(decimal_to_american(1 / min(max(p - _me - m, 0.02), 0.98))) for p, m in zip(d["leg_prob"], d["_estm"])]
     # v2.16: flag a leg whose player is HELD on another market tonight (model vs market gap: usually news)
     gap_ = (pd.to_numeric(allp["model_prob"], errors="coerce") - pd.to_numeric(allp["market_prob"], errors="coerce")).abs()
     hmap = {}
@@ -2401,11 +2431,32 @@ def shadow_rows(allp, key):
     return pd.DataFrame(list(out.values()), columns=SHADOW_COLS)
 
 
-def write_shadow(evald, key, path):
+def write_shadow(evald, key, path, saved=None):
     import json
     if evald is None or evald.empty or not path:
         return
     s = shadow_rows(evald, key)
+    # v2.23 / v15.24: same-slate rerun -> skip lines already in the Shadow tab (key + player + market + line), so a rerun
+    # never saves the same night twice. `saved` = get_values JSON of the tab's last rows (columns A:D).
+    if saved and os.path.exists(saved):
+        have = set()
+        for r in _values(saved):
+            if len(r) >= 4:
+                try:
+                    have.add((str(r[0]).lstrip("'"), norm_name(r[1]), str(r[2]), round(float(r[3]), 1)))
+                except (TypeError, ValueError):
+                    pass
+        dup = [(str(key), norm_name(p), str(m), round(float(l), 1)) in have for p, m, l in zip(s["player"], s["market"], s["line"])]
+        n0 = len(s)
+        s = s[[not x for x in dup]].reset_index(drop=True)
+        print(f"SHADOW DEDUPE: {n0 - len(s)} of {n0} lines already saved for {key} (rerun) -> {len(s)} new")
+        for f_ in [path] + [f"{path[:-5] if path.endswith('.json') else path}_{i}.json" for i in range(1, 60)]:
+            if os.path.exists(f_):
+                os.remove(f_)
+        if s.empty:
+            json.dump([], open(path, "w"))
+            print("SHADOW: 0 new lines (this slate is already in the Shadow tab) -> nothing to append; report 'Shadow: already saved'")
+            return
     rows = [[_cell(v) for v in r] for r in s.itertuples(index=False, name=None)]
     json.dump(rows, open(path, "w"))
     stem = path[:-5] if path.endswith(".json") else path
@@ -2540,7 +2591,7 @@ def print_boost(a, allp, stake, cols, keys):
     if not lean:
         keys += [(c["player"], c["market"], c["side"]) for c in combo]
     return {"name": f"BOOST {boost:g}%" + (" (LEAN)" if lean else ""), "target": 0, "book": bbook,
-            "odds": decimal_to_american(dec), "hit": round(p, 4), "lean": lean, "ev": round(ev, 3),
+            "boost_pct": boost, "odds": decimal_to_american(dec), "hit": round(p, 4), "lean": lean, "ev": round(ev, 3),
             "stake_usd": stake, "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]}
 
 
@@ -2879,7 +2930,9 @@ def cmd_status(a):
         or "no props file / no matchup column") + f" ({n} rows)", "hold" if best == 0 else "partial")
     inj = load_injuries(cfg["season"])
     official = week in set(inj.get("week", []))
-    news = a.injuries_file and os.path.exists(a.injuries_file) and open(a.injuries_file).read().strip() != ""
+    _ij = getattr(a, "injuries", None)  # v15.24: same flag as check (a list or a file)
+    news = bool(_ij and not os.path.exists(_ij) and _ij.strip()) or bool(
+        (_ij or a.injuries_file) and os.path.exists(_ij or a.injuries_file) and open(_ij or a.injuries_file).read().strip() != "")
     add("INJURIES", bool(news), f"official report {'YES' if official else 'NOT YET'}; news list "
         + ("built" if news else "MISSING (usage model and Out filter blind)"), "hold")
     if a.calib and os.path.exists(a.calib):
@@ -3168,6 +3221,8 @@ def cmd_explain(a):
                 d = d[d["market"] == mk]
             if a.side:
                 d = d[d["side"].str.lower() == a.side.lower()]
+            if getattr(a, "line", None):  # v2.23 / v15.24: one rung of a ladder only
+                d = d[(pd.to_numeric(d["line"], errors="coerce") - float(a.line)).abs() < 1e-6]
             if d.empty:
                 print(f"EXPLAIN: no scored line for {nm}" + (f" {mk}" if mk else ""))
             for _, r in d.iterrows():
@@ -3496,6 +3551,16 @@ def cmd_crosscheck(a):
             if hold < -0.005 or hold > 0.16:
                 flags.append(("RED", r["player"], r["_m"], r["_l"], f"Over {int(r['_o']):+d} / Under {int(r['_u']):+d} = {hold:+.1%} hold"
                               " -> one side is likely misread (real holds run ~4-10%)"))
+    # v2.23 / v15.24: FanDuel's SGP tab shows a flat -113 / -113 on every O/U; it is not the straight price. Several
+    # flat -113/-113 FD rows in one recording = it was probably recorded from the SGP tab.
+    fl = rec[(rec["book"].astype(str).str.lower().str.replace(" ", "", regex=False).isin(["fanduel", "fd"]))
+             & (rec["_o"] == -113) & (rec["_u"] == -113)]
+    if len(fl):
+        lvl_ = "RED" if len(fl) >= 3 else "INFO"
+        for _, r in fl.iterrows():
+            flags.append((lvl_, r["player"], r["_m"], r["_l"], "FanDuel Over -113 / Under -113: the flat SGP-tab display, "
+                          "probably not the straight price -> re-check on the player's prop page"
+                          + (f" ({len(fl)} flat -113/-113 FD rows in this recording)" if len(fl) >= 3 else "")))
     if web.empty:
         print(f"CROSSCHECK: no free-page lines to compare (page failed or on another night) | recording checked on its own: "
               f"{sum(f[0] == 'RED' for f in flags)} RED")
@@ -3748,7 +3813,7 @@ if __name__ == "__main__":
     sub.choices["log"].add_argument("--all", default="bets_all.csv", help="this week's bets_all.csv (market prices for parlay legs)")
     sub.choices["parlay"].add_argument("--all", default="bets_all.csv")
     sub.choices["parlay"].add_argument("--bets", default="bets.csv")
-    sub.choices["parlay"].add_argument("--stake", type=float, help="$ per parlay (default 5% of bankroll)")
+    sub.choices["parlay"].add_argument("--stake", type=float, help="$ per parlay (default 5%% of bankroll)")
     sub.choices["parlay"].add_argument("--exclude", help='players to leave out "A;B" (e.g. DK price failed take-if)')
     sub.choices["parlay"].add_argument("--slip-out", default="slip.csv")
     sub.choices["parlay"].add_argument("--all-picks", action="store_true", help="NFL: ignore boosts+leans-only mode")
@@ -3759,6 +3824,7 @@ if __name__ == "__main__":
     for name in ("check", "parlay", "log"):
         sub.choices[name].add_argument("--calib", help="Calib tab JSON (get_values): learned model weight")
     sub.choices["check"].add_argument("--shadow-out", default="shadow_new.json")
+    sub.choices["check"].add_argument("--shadow-saved", help="get_values JSON of the Shadow tab's last rows (A:D): skip lines already saved (same-slate rerun)")
     sub.choices["log"].add_argument("--dry-run", action="store_true", help="rate the bets only, log nothing")
     for k, t in (("--boost-min-legs", int), ("--boost-max-legs", int), ("--boost-min-odds", float), ("--boost-max-win", float)):
         sub.choices["parlay"].add_argument(k, type=t)
@@ -3772,6 +3838,7 @@ if __name__ == "__main__":
     ss = sub.add_parser("status")
     ss.add_argument("--week", type=int); ss.add_argument("--season", type=int); ss.add_argument("--bankroll", type=float)
     ss.add_argument("--profile"); ss.add_argument("--props", default="props.csv"); ss.add_argument("--injuries-file", default="inj.txt")
+    ss.add_argument("--injuries", help='inline list like check ("A:Out;B:Questionable") or a file; overrides --injuries-file')
     ss.add_argument("--calib", default="calib_tab.json"); ss.add_argument("--shadow", default="shadow_new.json")
     ss.add_argument("--v2-before", type=int); ss.add_argument("--v2-after", type=int)
     mn = sub.add_parser("menu"); mn.add_argument("--all", default="bets_all.csv"); mn.add_argument("--bets", default="bets.csv")
@@ -3813,7 +3880,8 @@ if __name__ == "__main__":
     rp_.add_argument("--boost", type=float); rp_.add_argument("--max-win", type=float); rp_.add_argument("--stake", type=float)
     ex_ = sub.add_parser("explain")
     for k, v in (("--all", "bets_all.csv"), ("--bets", "bets.csv"), ("--parlays", "vpe_parlays.json"), ("--leans", "leans.csv"),
-                 ("--slip", "slip.csv"), ("--calib", None), ("--player", None), ("--market", None), ("--side", None)):
+                 ("--slip", "slip.csv"), ("--calib", None), ("--player", None), ("--market", None), ("--side", None),
+                 ("--line", None)):
         ex_.add_argument(k, default=v)
     f = sub.add_parser("final")
     f.add_argument("--no-log", action="store_true", help="recheck only: do not write the pick log")
