@@ -1,0 +1,41 @@
+name: odds-pages
+# Mirrors the free odds pages VPE reads, so unattended VPE runs can get them from GitHub (always reachable)
+# even when their own network can't reach the odds site. Writes only to the `odds-pages` branch.
+on:
+  schedule:
+    - cron: "40 15 * * *"   # 10:40 AM ET (EST) - before the Sunday-early closing run
+    - cron: "5 18 * * *"    # 1:05 PM ET
+    - cron: "15 21 * * *"   # 4:15 PM ET
+    - cron: "55 22 * * *"   # 5:55 PM ET - before the 6:37 PM closing run
+    - cron: "25 23 * * *"   # 6:25 PM ET
+    - cron: "30 1 * * *"    # 8:30 PM ET (late games)
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download pages
+        run: |
+          set -u
+          mkdir -p out/nba out/nfl
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+          get() { curl -sSL --max-time 40 --retry 2 -A "$UA" -o "$2" -w "%{http_code}" "$1" || echo "ERR"; }
+          : > out/status.txt
+          for p in "nba/pts points" "nba/reb rebounds" "nba/ast assists" "nba/fg3m 3-pointers"; do
+            set -- $p; code=$(get "https://www.scoresandodds.com/nba/props/$2" "out/$1.html"); echo "$1 $code" >> out/status.txt
+          done
+          for p in "nfl/pass_yds passing-yards" "nfl/rush_yds rushing-yards" "nfl/rec_yds receiving-yards" "nfl/receptions receptions"; do
+            set -- $p; code=$(get "https://www.scoresandodds.com/nfl/props/$2" "out/$1.html"); echo "$1 $code" >> out/status.txt
+          done
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > out/fetched_at.txt
+          gzip -9 -f out/nba/*.html out/nfl/*.html
+          cat out/status.txt out/fetched_at.txt
+      - name: Publish to odds-pages branch (latest copy only)
+        run: |
+          cd out
+          git init -q -b odds-pages
+          git config user.name "vpe-odds-bot"; git config user.email "vpe-odds-bot@users.noreply.github.com"
+          git add -A && git commit -q -m "odds pages $(cat fetched_at.txt)"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" odds-pages
