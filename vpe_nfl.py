@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.21"
+VERSION = "NFL v15.22"
 
 # ==================== data ====================
 
@@ -2690,28 +2690,39 @@ def cmd_log(a):
     cfg = _cfg(a)
     games, stats, prev, inj, week = _setup(a, cfg)
     ov = _overrides(a.injuries)
-    outs = build_outs(inj, ov, week)
-    plays = (load_plays(cfg["season"]), load_plays(cfg["season"] - 1))
-    proj = Projector(stats, prev, games, cfg["season"], week, cfg, outs=outs, weather=_weather(a.weather), plays=plays)
+    # v15.22: the play-by-play load + full projection rebuild was the slow part of logging (11/16). A bet whose exact
+    # line is already in tonight's bets_all.csv reuses that projection (same model chance: the model never depends on
+    # the price); the projector is only built, once, if a bet isn't in bets_all.csv.
+    _pj = {}
+    def get_proj():
+        if "p" not in _pj:
+            print("LOG: a bet isn't in bets_all.csv -> building projections (slower)")
+            outs = build_outs(inj, ov, week)
+            plays = (load_plays(cfg["season"]), load_plays(cfg["season"] - 1))
+            _pj["p"] = Projector(stats, prev, games, cfg["season"], week, cfg, outs=outs, weather=_weather(a.weather), plays=plays)
+        return _pj["p"]
     unit = LOG_UNIT_USD  # v2.16: the Pick Log unit is $1, so units == stake_usd (was 2% of --bankroll)
     allp = pd.read_csv(a.all) if a.all and os.path.exists(a.all) else None
     lock_from(allp)
 
     def score(player, mk, side, line, odds):
-        one = pd.DataFrame([{"player": player, "market": mk, "line": line,
-                             "over_odds": odds if side == "Over" else np.nan,
-                             "under_odds": odds if side == "Under" else np.nan, "book": "draftkings"}])
-        ev, sk = evaluate_lines(one, proj, inj, ov, cfg)
-        if ev.empty:
-            return None, (sk["reason"].iloc[0] if not sk.empty else "?")
-        e = ev.iloc[0]
-        mp = market_prob_for(allp, player, mk, side, line, odds)
-        pb = blend_leg(float(e["model_prob"]), mp, mk, side)
         e0 = None
         if allp is not None and len(allp):
             ex = allp[(allp["player"].map(norm_name) == norm_name(player)) & (allp["market"] == mk) & (allp["side"] == side)
                       & (pd.to_numeric(allp["line"], errors="coerce") == float(line))]
             e0 = ex.iloc[0] if len(ex) else None
+        if e0 is not None and pd.notna(e0.get("model_prob")):
+            e = e0
+        else:
+            one = pd.DataFrame([{"player": player, "market": mk, "line": line,
+                                 "over_odds": odds if side == "Over" else np.nan,
+                                 "under_odds": odds if side == "Under" else np.nan, "book": "draftkings"}])
+            ev, sk = evaluate_lines(one, get_proj(), inj, ov, cfg)
+            if ev.empty:
+                return None, (sk["reason"].iloc[0] if not sk.empty else "?")
+            e = ev.iloc[0]
+        mp = market_prob_for(allp, player, mk, side, line, odds)
+        pb = blend_leg(float(e["model_prob"]), mp, mk, side)
         return {"prob": pb, "leg_prob": pb, "team": e["team"], "opp": e["opp"],
                 "rec_units": float(e0["units"]) if e0 is not None and pd.notna(e0.get("units")) else 0.0,
                 "min_odds": e0.get("min_odds") if e0 is not None and pd.notna(e0.get("tier")) and str(e0.get("tier")) not in ("", "nan") else None}, ""
