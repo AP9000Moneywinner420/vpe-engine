@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.26"
+VERSION = "NFL v15.27"
 
 # ==================== data ====================
 
@@ -1684,7 +1684,7 @@ PARLAY = {"model_weight": 0.4, "side_bias": {},  # replaced every run by the lea
           "books": ["draftkings", "fanduel"],
           "haircut": 0.05,           # price from another book -> assume ours pays 0.05 less in decimal odds (~6-8 cents)
           "junk_lines": {"rush_yds": 10.5, "rec_yds": 10.5, "receptions": 1.5, "rush_att": 3.5},  # line below -> skip
-          "max_under_share": 0.45,   # v15.26 HARD RULE: Unders <= 45% of a parlay's legs (2 legs: 0, 3-4 legs: 1, 5: 2) unless the math is
+          "max_under_share": 0.45,   # v15.26 HARD RULE: Unders <= 45% of a parlay's legs, never under 1 (2-4 legs: 1, 5-6: 2) unless the math is
                                      # overwhelming (under_override_*). Evidence 11/16: logged Unders hit 31% vs 56% needed (16 props), boost-pool
                                      # Unders in the Shadow tab hit 47.0% vs 54.1% said (115 lines), and 7 of 9 legs on the 0-for-4 night were Unders
           "under_override_hit": 1.20,  # ...unless the Under-heavy parlay is >= 20% more likely to hit
@@ -1740,6 +1740,13 @@ def lean_straights(allp, exclude, unit_usd):
     d["cost_usd"] = (d["leg_edge"] * d["stake_usd"]).round(2)
     return d
 
+def _under_max(n, share=None):
+    """v15.27: most Unders allowed in an n-leg parlay: 45% of the legs, but never less than 1 (Adrian 11/16: 1 of 2 is fine).
+    2 legs: 1 · 3: 1 · 4: 1 · 5: 2 · 6: 2."""
+    share = PARLAY["max_under_share"] if share is None else share
+    return n if share >= 1 else max(1, math.floor(share * n + 1e-9))
+
+
 def lean_parlay(allp, exclude):
     """Least-bad ~4x parlay (highest EV, one leg per game) when no +EV parlay exists."""
     pool = lean_pool(allp, exclude)
@@ -1758,7 +1765,7 @@ def lean_parlay(allp, exclude):
                     continue
                 p = float(np.prod([c["leg_prob"] for c in combo]))
                 ev = p * dec - 1
-                if sum(c["side"] == "Under" for c in combo) > math.floor(PARLAY["max_under_share"] * n + 1e-9):
+                if sum(c["side"] == "Under" for c in combo) > _under_max(n):
                     if heavy is None or ev > heavy[0] + 1e-9:   # over the Under cap: kept only as the last resort
                         heavy = (ev, p, dec, combo, bk)
                     continue
@@ -1772,6 +1779,8 @@ def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     """Legs a parlay may use (one per player), ranked by leg prob. #1-3 Gold, #4-6 Silver."""
     d = allp.copy()
     d["odds"] = pd.to_numeric(d["odds"], errors="coerce")
+    _ts = d[d["odds"].notna()].assign(_l=lambda x: pd.to_numeric(x["line"], errors="coerce")).groupby(["player", "market", "_l"])["side"].nunique()
+    _two = set(_ts[_ts >= 2].index)   # lines with BOTH an Over and an Under price = a real two-sided main line
     d["model_prob"] = pd.to_numeric(d["model_prob"], errors="coerce")
     d["market_prob"] = pd.to_numeric(d.get("market_prob"), errors="coerce")
     d = d[d["odds"].between(PARLAY["min_odds"], PARLAY["max_odds"]) & d["model_prob"].notna() & d["market_prob"].notna()]
@@ -1806,6 +1815,11 @@ def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     d["price_dk"] = [decimal_to_american(x) for x in d["dec_draftkings"]]
     d["price_fd"] = [decimal_to_american(x) for x in d["dec_fanduel"]]
     d["leg_prob"] = np.round(blend_leg(d["model_prob"], d["market_prob"], d["market"], d["side"]), 3)
+    # v15.27: pick shrink (see PICK): a picked leg's chance moves a share k toward what the price itself implies
+    d["two_sided"] = [k_ in _two for k_ in zip(d["player"], d["market"], pd.to_numeric(d["line"], errors="coerce"))]
+    d["leg_prob_raw"] = d["leg_prob"]
+    _fair = np.array([_price_fair(o, t, mp) for o, t, mp in zip(d["odds"], d["two_sided"], d["market_prob"])])
+    d["leg_prob"] = np.round(d["leg_prob"] - _pick_k() * np.clip(d["leg_prob"] - _fair, 0, None), 3)
     d["leg_edge"] = (d["leg_prob"] - 1 / d["best_dec"]).round(3)
     d["_estm"] = (d["mkt_est"].astype(str).str.lower().isin(["true", "1"]) * EST_MARGIN) if "mkt_est" in d else 0.0
     d = d[(d["leg_edge"] - d["_estm"] >= (PARLAY["min_edge"] if min_edge is None else min_edge))
@@ -1838,7 +1852,7 @@ def best_parlay(pool, target, book, boost=0.0, under_share=None):
         for combo in itertools.combinations(cand, n):
             if len({str(c["game_id"]) for c in combo}) < n:
                 continue
-            if under_share is not None and sum(c["side"] == "Under" for c in combo) > math.floor(under_share * n + 1e-9):
+            if under_share is not None and sum(c["side"] == "Under" for c in combo) > _under_max(n, under_share):
                 continue
             dec = float(np.prod([c[col] for c in combo]))
             dec_eff = 1 + (dec - 1) * (1 + boost / 100)
@@ -1889,7 +1903,7 @@ def cmd_parlay(a):
         pick = lambda xs: max(xs, key=lambda r: (round(r[0], 4), r[0] * r[2])) if xs else None
         bal, heavy = pick(found), pick(free)
         override = False
-        if heavy and sum(c["side"] == "Under" for c in heavy[3]) > math.floor(PARLAY["max_under_share"] * len(heavy[3]) + 1e-9):
+        if heavy and sum(c["side"] == "Under" for c in heavy[3]) > _under_max(len(heavy[3])):
             h_ev = heavy[0] * heavy[2] - 1
             if bal:
                 b_ev = bal[0] * bal[2] - 1
@@ -2115,7 +2129,25 @@ def blend_leg(model_p, market_p, market=None, side=None):
 #     A gate lifts itself when the recent window recovers. The core projection math is never touched.
 LEARN = {"start": {"NBA": "2026-10-26", "NFL": "2026-W1"}, "window": 8000, "n0_tail": 600, "tail_cap": 0.04,
          "tail_bins": [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0], "bet_edge": 0.025, "gate_n": 150, "est_hold": 1.045}
-LEARNED = {"tail": None, "gate": {}}
+LEARNED = {"tail": None, "gate": {}, "pick": None}
+# v15.27 PICK SHRINK (approved 11/16). The legs VPE picks for parlays and boosts are the lines where its chance sits furthest
+# above the price, and that selection is mostly noise: 253 graded NBA pool legs said 54.2%, hit 50.2% (NFL 94: 55.9% -> 51.1%),
+# almost exactly the chance the PRICE implies once the book's hold is taken out. So a picked leg's chance is pulled a share k
+# of the way from VPE's number toward the price-fair chance. k is re-learned every morning from the graded Shadow tab
+# (`learn`, row kind "pick"), shrunk by sample size (n0 300 legs); until a learned value exists it is 0.5.
+PICK = {"k0": 0.5, "n0": 300, "pool_prob": 0.50, "pool_edge": -0.03, "min_n": 60}
+
+
+def _pick_k():
+    return PICK["k0"] if LEARNED.get("pick") is None else float(LEARNED["pick"])
+
+
+def _price_fair(odds, two_sided, market_p):
+    """What the price itself says the chance is: the no-vig market chance on a two-sided line, else implied / (1 + hold)."""
+    if two_sided or odds is None or pd.isna(odds):
+        return float(market_p)
+    h = one_sided_hold(odds)
+    return min(float(market_p), implied_prob(odds) / (1 + h))
 LEARNED_COLS = ["sport", "kind", "key", "value", "n", "note", "updated"]
 
 
@@ -2137,7 +2169,7 @@ def _learned_rows(path):
 
 
 def set_learned(path, sport):
-    LEARNED["tail"], LEARNED["gate"] = None, {}
+    LEARNED["tail"], LEARNED["gate"], LEARNED["pick"] = None, {}, None
     xs, ds, gates, ax = [], [], {}, []
     for r in _learned_rows(path):
         if str(r.get("sport", "")).upper() != sport:
@@ -2146,6 +2178,11 @@ def set_learned(path, sport):
             xs.append(float(r["key"])); ds.append(float(r["value"]))
         elif r["kind"] == "gate" and str(r["value"]) in ("1", "2"):
             gates[str(r["key"])] = int(r["value"])
+        elif r["kind"] == "pick":
+            try:
+                LEARNED["pick"] = float(np.clip(float(r["value"]), 0.0, 1.0))
+            except (TypeError, ValueError):
+                pass
     if xs:
         o = np.argsort(xs)
         # v2.20: the learn step now also fits the 50-55 and 55-60 bands (11/16 review: NBA said 52.5%, hit 49.9% on
@@ -2158,7 +2195,8 @@ def set_learned(path, sport):
     if path:
         t = "none" if not xs else ", ".join(f"{x:.0%}->{d:+.1%}" for x, d in zip(LEARNED["tail"][0][len(ax):], LEARNED["tail"][1][len(ax):]) if abs(d) >= 0.005) or "none needed"
         g = ", ".join(f"{k} {'HALF' if v == 1 else 'PAUSED'}" for k, v in sorted(gates.items())) or "none"
-        print(f"LEARNED: tail fixes {t} | market gates {g}")
+        print(f"LEARNED: tail fixes {t} | market gates {g} | pick shrink {_pick_k():.0%}"
+              + (" (starting value)" if LEARNED.get("pick") is None else " (learned)"))
 
 
 def _learn_adjust(p, market_p, market=None, side=None):
@@ -2252,6 +2290,34 @@ def cmd_learn(a):
             out.append([SPORT, "gate", key, lvl, n, f"said {pred:.1%} hit {got:.1%} z {z:+.1f}", today])
             if lvl or was or n >= LEARN["gate_n"]:
                 print(f"    {key:<22} said {pred:.1%} hit {got:.1%}  n={n:<4} z={z:+.1f} -> {tag}")
+    # v15.27: pick shrink. Legs the pool would take (chance >= 50%, edge >= -3% at a real price): how much of VPE's lean
+    # above the price-fair chance actually shows up in results?
+    ps_, fr_, ys_ = [], [], []
+    for side in ("Over", "Under"):
+        odds = d["oo"] if side == "Over" else d["uo"]
+        oth = d["uo"] if side == "Over" else d["oo"]
+        ok = odds.str.match(r"^[+-]?\d+(\.0)?$").to_numpy()
+        two = ok & oth.str.match(r"^[+-]?\d+(\.0)?$").to_numpy()
+        p_side = np.where(side == "Over", q, 1 - q)
+        pk_side = d["pk"].to_numpy() if side == "Over" else 1 - d["pk"].to_numpy()
+        y = d["over"].to_numpy() if side == "Over" else 1 - d["over"].to_numpy()
+        for i in np.where(ok)[0]:
+            o = float(odds.iloc[i])
+            if not (PARLAY["min_odds"] <= o <= PARLAY["max_odds"]):
+                continue
+            if p_side[i] >= PICK["pool_prob"] and p_side[i] - implied_prob(o) >= PICK["pool_edge"]:
+                ps_.append(p_side[i]); fr_.append(_price_fair(o, two[i], pk_side[i])); ys_.append(y[i])
+    n = len(ps_)
+    if n >= PICK["min_n"]:
+        said, fair, got = float(np.mean(ps_)), float(np.mean(fr_)), float(np.mean(ys_))
+        raw = float(np.clip((said - got) / (said - fair), 0.0, 1.0)) if said - fair > 0.003 else 0.0
+        k = round(raw * n / (n + PICK["n0"]), 3)
+        was = prev.get(("pick", "shrink"), {}).get("value")
+        out.append([SPORT, "pick", "shrink", k, n, f"picked legs said {said:.1%} hit {got:.1%}; price-fair {fair:.1%}; raw {raw:.0%}", today])
+        print(f"  pick shrink: {n} pool legs said {said:.1%}, hit {got:.1%}, the price implied {fair:.1%} -> shrink {k:.0%}"
+              + (f" (was {float(was):.0%})" if was not in (None, "") else " (first fit)"))
+    else:
+        print(f"  pick shrink: only {n} graded pool legs (needs {PICK['min_n']}) -> stays at the starting {PICK['k0']:.0%}")
     json.dump(out, open(a.out, "w"))
     print(f"Learned table -> {a.out}: clear 'Learned {SPORT}'!A:G, then write it at 'Learned {SPORT}'!A1. Save it as learned_tab.json"
           f" next to calib_tab.json before check/parlay/final/takeif.")
@@ -2904,6 +2970,15 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
     col = "dec_" + book
     # low-vig legs first: value at market odds (no-vig chance x this book's price), not the shortest prices
     ranked = pool.assign(_mv=pool["market_prob"] * pool[col]).sort_values(["_mv", "leg_prob"], ascending=False)
+    # v15.27: boosts are built from TWO-SIDED main lines (both prices recorded = real, lower hold: all two-sided sides in the
+    # Shadow tab returned -6.6% vs -9.7% on one-sided ladder rungs). Ladder rungs only when too few main lines exist.
+    if "two_sided" in ranked:
+        _t = ranked[ranked["two_sided"]]
+        if _t["game_id"].astype(str).nunique() >= max(min_legs, 2):
+            ranked = _t
+        else:
+            print(f"  note ({book} {boost:g}% boost): only {len(_t)} two-sided main lines qualify -> ladder rungs allowed too"
+                  " (record the main Over/Under lists to get lower-hold legs)")
     ranked = ranked.drop_duplicates("player")
     # both sides in the candidate list (low-vig legs skew Under, and the Unders cap would block every combo)
     ranked = pd.concat([ranked[ranked["side"] == sd].head(PARLAY["pool"] // 2 + 1) for sd in ("Over", "Under")])
@@ -2912,7 +2987,7 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
         for combo in itertools.combinations(cand, n):
             if len({str(c["game_id"]) for c in combo}) < n:
                 continue
-            uh = sum(c["side"] == "Under" for c in combo) > math.floor(PARLAY["max_under_share"] * n + 1e-9)
+            uh = sum(c["side"] == "Under" for c in combo) > _under_max(n)
             dec = float(np.prod([c[col] for c in combo]))
             if dec < min_dec:
                 continue
