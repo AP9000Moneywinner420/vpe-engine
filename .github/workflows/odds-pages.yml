@@ -3,12 +3,11 @@ name: odds-pages
 # even when their own network can't reach the odds site. Writes only to the `odds-pages` branch.
 on:
   schedule:
-    - cron: "40 15 * * *"   # 10:40 AM ET (EST) - before the Sunday-early closing run
-    - cron: "5 18 * * *"    # 1:05 PM ET
-    - cron: "15 21 * * *"   # 4:15 PM ET
-    - cron: "55 22 * * *"   # 5:55 PM ET - before the 6:37 PM closing run
-    - cron: "25 23 * * *"   # 6:25 PM ET
-    - cron: "30 1 * * *"    # 8:30 PM ET (late games)
+    # Every 20 minutes from 9 AM to 1 AM ET (14:00-05:59 UTC). GitHub skips or delays scheduled runs under load
+    # (11/16: the 1:05, 4:15, 5:55 and 6:25 PM runs never fired on time, so the 6:37 PM closing run found the mirror
+    # 8 h old). Many slots = one always lands; the closing task also triggers a run on demand (workflow_dispatch).
+    - cron: "7,27,47 14-23 * * *"
+    - cron: "7,27,47 0-5 * * *"
   workflow_dispatch: {}
   push:
     branches: [main]
