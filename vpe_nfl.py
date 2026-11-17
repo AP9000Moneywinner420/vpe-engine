@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.25"
+VERSION = "NFL v15.26"
 
 # ==================== data ====================
 
@@ -800,6 +800,14 @@ class Projector:
 
 ASSUMED_HOLD_ONE_SIDED = 0.07  # one-sided DK markets (anytime TD, milestones like 60+ yds): only for the info column
 
+
+def one_sided_hold(odds):
+    """v15.26: MEASURED on 3,793 graded one-sided NFL lines (Shadow tab, weeks 9-10): real hold x0.04-0.07 up to +100,
+    x0.10 at +100..+250, and x0.34 at +250 and longer (1,246 lines: the price implied 15.2%, 11.3% hit; VPE read 14.2%).
+    The flat 7% made every longshot look ~3 pts better than it was (Goedert +250 and Lane +265 were Tier 3 picks)."""
+    o = float(odds)
+    return 0.30 if o >= 250 else (0.10 if o >= 100 else 0.06)
+
 LONG_TERM = {"Ir", "Injured Reserve", "Out For Season", "Pup", "Nfi", "Suspended", "Reserve"}
 
 def _override_for(overrides, key, team):
@@ -932,7 +940,7 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
         else:
             fair_how = "1way"
             side_odds = oo if pd.notna(oo) else uo
-            fair = implied_prob(side_odds) / (1 + ASSUMED_HOLD_ONE_SIDED)
+            fair = implied_prob(side_odds) / (1 + one_sided_hold(side_odds))
             fair_over = fair if pd.notna(oo) else 1 - fair
         p_over = blend_leg(p_model_over, fair_over, mk, "Over")
         xj = _json.dumps({**p["_x"], "oo": None if pd.isna(oo) else int(oo), "uo": None if pd.isna(uo) else int(uo),
@@ -1403,12 +1411,18 @@ def boosted_american(odds, boost_pct):
         return int(odds)
     return int(decimal_to_american(1 + (american_to_decimal(odds) - 1) * (1 + boost_pct / 100)))
 
+SLIP_MEDAL = {}
+
+
 def slip_keys(path):
     """(player, market, side) of every bet on the slip the last `check` produced; None if no slip was saved."""
     if not path or not os.path.exists(path):
         return None
     s = pd.read_csv(path)
     kinds = s["kind"] if "kind" in s else ["pick"] * len(s)
+    if "medal" in s:   # v15.26: Gold (#1-3) / Silver (#4-6) of that run's leg ranking -> stamped on the logged row
+        SLIP_MEDAL.update({(norm_name(p), canon_market(m) or m, str(sd).title()): str(md) for p, m, sd, md in
+                           zip(s["player"], s["market"], s["side"], s["medal"]) if str(md) in ("Gold", "Silver")})
     return {(norm_name(p), canon_market(m) or m, str(sd).title()): str(k) for p, m, sd, k in zip(s.get("player", []),
             s.get("market", []), s.get("side", []), kinds)}
 
@@ -1450,6 +1464,9 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
         sug = None if slip is None else kind is not None
         s, why = score(b["player"], mk, side, line, odds if odds is not None else -110) if mk else (None, "unknown market")
         note = "" if pd.isna(b["note"]) else str(b["note"])
+        md_ = SLIP_MEDAL.get((norm_name(b["player"]), mk, side))
+        if md_ and f"[{md_}]" not in note:
+            note = (note + f" [{md_}]").strip()
         r = {**stamp, "logged_at": now, "player": b["player"], "market": mk or b["market"], "side": side, "line": line,
              "odds": odds, "book": _book(b), "note": note,
              "suggested": "unknown" if sug is None else ("lean" if kind == "lean" else ("yes" if sug else "no"))}
@@ -1667,7 +1684,9 @@ PARLAY = {"model_weight": 0.4, "side_bias": {},  # replaced every run by the lea
           "books": ["draftkings", "fanduel"],
           "haircut": 0.05,           # price from another book -> assume ours pays 0.05 less in decimal odds (~6-8 cents)
           "junk_lines": {"rush_yds": 10.5, "rec_yds": 10.5, "receptions": 1.5, "rush_att": 3.5},  # line below -> skip
-          "max_under_share": 1.0,    # v2.5.2: no Under cap (it guarded against the v2.1 home-team bug; the learned market gates now police each market x side)
+          "max_under_share": 0.45,   # v15.26 HARD RULE: Unders <= 45% of a parlay's legs (2 legs: 0, 3-4 legs: 1, 5: 2) unless the math is
+                                     # overwhelming (under_override_*). Evidence 11/16: logged Unders hit 31% vs 56% needed (16 props), boost-pool
+                                     # Unders in the Shadow tab hit 47.0% vs 54.1% said (115 lines), and 7 of 9 legs on the 0-for-4 night were Unders
           "under_override_hit": 1.20,  # ...unless the Under-heavy parlay is >= 20% more likely to hit
           "under_override_ev": 0.10,   # ...AND has >= 10 pts more EV than the best balanced one
           "pool": 14, "max_legs": 7,
@@ -1727,7 +1746,7 @@ def lean_parlay(allp, exclude):
     if pool.empty:
         return None
     cand = pool.sort_values("leg_edge", ascending=False).head(PARLAY["pool"]).to_dict("records")
-    best = None
+    best, heavy = None, None
     for bk in PARLAY["books"]:
         col = "dec_" + bk
         for n in range(2, LEAN["parlay_max_legs"] + 1):
@@ -1739,9 +1758,15 @@ def lean_parlay(allp, exclude):
                     continue
                 p = float(np.prod([c["leg_prob"] for c in combo]))
                 ev = p * dec - 1
+                if sum(c["side"] == "Under" for c in combo) > math.floor(PARLAY["max_under_share"] * n + 1e-9):
+                    if heavy is None or ev > heavy[0] + 1e-9:   # over the Under cap: kept only as the last resort
+                        heavy = (ev, p, dec, combo, bk)
+                    continue
                 if best is None or ev > best[0] + 1e-9 or (abs(ev - best[0]) <= 1e-9 and p > best[1]):
                     best = (ev, p, dec, combo, bk)
-    return best
+    if best is None and heavy is not None:
+        print(f"  UNDER CAP {PARLAY['max_under_share']:.0%}: no lean parlay fits the cap tonight -> the Under-heavy one is the only play (say so)")
+    return best or heavy
 
 def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     """Legs a parlay may use (one per player), ranked by leg prob. #1-3 Gold, #4-6 Silver."""
@@ -1973,7 +1998,10 @@ def cmd_parlay(a):
     # a lean straight stays a lean even if the same prop is also a leg somewhere (it is a -EV straight bet)
     sk = pd.DataFrame(sorted(set(keys) - lean_straight), columns=["player", "market", "side"]).assign(kind="pick")
     lk = pd.DataFrame(sorted((set(lean_keys) - set(keys)) | lean_straight), columns=["player", "market", "side"]).assign(kind="lean")
-    pd.concat([sk, lk], ignore_index=True).to_csv(a.slip_out, index=False)
+    sl_ = pd.concat([sk, lk], ignore_index=True)
+    md_ = {(r_["player"], r_["market"], r_["side"]): r_["medal"] for _, r_ in pool.head(6).iterrows()} if len(pool) and "medal" in pool else {}
+    sl_["medal"] = [md_.get(k_, "") for k_ in zip(sl_["player"], sl_["market"], sl_["side"])]
+    sl_.to_csv(a.slip_out, index=False)
     print(f"\nslip of every VPE leg/pick -> {a.slip_out} (use with log --slip and final --slip)")
     print("NOTE: legs treated as independent. Hit chances lean on the market on purpose; the model only tilts them.")
 
@@ -2156,7 +2184,7 @@ def cmd_learn(a):
     set_calib(a.calib, SPORT)
     LEARNED["tail"], LEARNED["gate"] = None, {}   # learn from the base blend, never from its own fixes
     vals = [r for j in a.json for r in _values(j)]   # several 2000-row reads, oldest first
-    rows = [list(r) + [""] * (len(SHADOW_COLS) - len(r)) for r in vals if r and str(r[0]) != "key"]
+    rows = [list(r)[:len(SHADOW_COLS)] + [""] * (len(SHADOW_COLS) - len(r)) for r in vals if r and str(r[0]) != "key"]
     start = _key_ord(LEARN["start"][SPORT])
     seen, data = set(), []
     for r in rows:
@@ -2306,6 +2334,162 @@ def cmd_menu(a):
 # What the searches find goes into inj.txt (Out / Doubtful / Questionable / Limited) and `check` is rerun, so a minutes
 # restriction mentioned in a presser but missing from the injury page still reaches the projection.
 SWEEP = {"top": 10, "per_game_queries": 1}
+
+
+SB = {"min_bets": 30, "min_bucket": 400, "cal_max": 3.0, "clv_min": 0.50}  # sample-size guardrails for the scoreboard
+
+
+def cmd_scoreboard(a):
+    """v2.25 / v15.26: THE scoreboard, printed after every graded run. Winning is not a hit rate. Four tests:
+    1 beat the break-even % of the odds actually taken (after boosts) · 2 positive closing-line value on most bets ·
+    3 calibration error under 3 points per bucket (every line VPE scored, from the Shadow tab) · 4 positive ROI by tier.
+    Guardrail: a group under 30 graded bets (or a bucket under 400 lines) is shown but never called PASS or FAIL."""
+    d = read_log(a.log)
+    for c in ("odds", "odds_eff", "stake_usd", "units", "profit_units", "model_prob", "closing_odds", "boost_pct"):
+        d[c] = pd.to_numeric(d[c], errors="coerce") if c in d else np.nan
+    if getattr(a, "since", None) and "date" in d:
+        d = d[d["date"].astype(str).str.lstrip("'").str[:10] >= str(a.since)]
+    if getattr(a, "since_week", None) and "week" in d:
+        d = d[pd.to_numeric(d["week"], errors="coerce") >= int(a.since_week)]
+    res = d["result"].astype(str).str.upper()
+    d = d.assign(bt=d.get("bet_type", pd.Series("straight", index=d.index)).fillna("straight").replace("", "straight"))
+    g = d[res.isin(["WIN", "LOSS"])].copy()
+    g["w"] = (res[g.index] == "WIN").astype(float)
+    eff = g["odds_eff"].fillna(g["odds"])
+    g["be"] = eff.map(lambda o: implied_prob(o) if pd.notna(o) and o != 0 else np.nan)
+    g["stake"] = g["stake_usd"].fillna(g["units"])
+    sug = g.get("suggested", pd.Series("", index=g.index)).fillna("").astype(str)
+    g["sg"] = np.where(sug.str.startswith("yes"), "yes", np.where(sug == "lean", "lean", np.where(sug == "sgp", "sgp", "no")))
+    vv = (g.get("vpe_verdict", pd.Series("", index=g.index)).fillna("").astype(str) + " " + g.get("note", pd.Series("", index=g.index)).fillna("").astype(str))
+    g["medal"] = np.where(vv.str.contains("Gold"), "Gold", np.where(vv.str.contains("Silver"), "Silver", ""))
+    g.loc[vv.str.contains("boost not used"), "sg"] = "no"
+    st, pa, lg = g[g["bt"] == "straight"], g[g["bt"] == "parlay"], g[g["bt"] == "leg"]
+    staked = g[g["bt"] != "leg"]
+    props = g[g["bt"].isin(["straight", "leg"])]
+    MB = SB["min_bets"]
+    lights = []
+
+    def call(ok, n, need=MB):
+        return "too early" if n < need else ("PASS" if ok else "FAIL")
+
+    def be_line(lab, x):
+        x = x[x["be"].notna()]
+        if not len(x):
+            return None
+        hit, need = x["w"].mean(), x["be"].mean()
+        v = call(hit > need, len(x))
+        print(f"    {lab:26s} {len(x):4d}  hit {hit:6.1%}  needed {need:6.1%}  {100 * (hit - need):+6.1f} pts  {v}")
+        return v
+
+    def roi_line(lab, x):
+        if not len(x) or not x["stake"].sum():
+            return None
+        roi = x["profit_units"].sum() / x["stake"].sum()
+        v = call(roi > 0, len(x))
+        print(f"    {lab:26s} {len(x):4d}  staked ${x['stake'].sum():9.2f}  profit ${x['profit_units'].sum():+9.2f}  ROI {roi:+7.1%}  {v}")
+        return v
+
+    span = ""
+    if "date" in g and len(g):
+        dd = g["date"].astype(str).str.lstrip("'").str[:10]
+        span = f"{dd.min()} to {dd.max()}"
+    elif "week" in g and len(g):
+        span = f"weeks {int(pd.to_numeric(g['week']).min())}-{int(pd.to_numeric(g['week']).max())}"
+    print(f"VPE SCOREBOARD [{VERSION}] {span} | {len(staked)} graded bets, {len(props)} graded props (straights + legs)")
+    print(f"  (a group under {MB} graded bets is 'too early': shown, never called PASS or FAIL)")
+    # ---- 1 beat break-even
+    print("  1 BEAT BREAK-EVEN: hit rate vs the break-even % of the odds taken (after boosts)")
+    v1 = [be_line("VPE straight picks", st[st["sg"] == "yes"]), be_line("VPE parlay legs", lg[lg["sg"] == "yes"]),
+          be_line("VPE parlays", pa[pa["sg"] == "yes"])]
+    be_line("VPE leans (no edge)", staked[staked["sg"] == "lean"]); be_line("own picks", staked[staked["sg"] == "no"])
+    be_line("same-game parlays", staked[staked["sg"] == "sgp"])
+    allv = pd.concat([st[st["sg"] == "yes"], lg[lg["sg"] == "yes"]])
+    allv = allv[allv["be"].notna()]
+    t1 = call(len(allv) and allv["w"].mean() > allv["be"].mean(), len(allv))
+    if len(allv):
+        print(f"    -> VPE props overall: {len(allv)} graded, hit {allv['w'].mean():.1%} vs {allv['be'].mean():.1%} needed: {t1}")
+    lights.append(("beat break-even", t1))
+    # ---- 2 CLV
+    print("  2 CLV: price taken vs the fair closing price (beating the close = the earliest sign of real edge)")
+    pr_all = d[d["bt"].isin(["straight", "leg"]) & d["odds"].notna()]
+    c = pr_all[pr_all["closing_odds"].notna()]
+    if len(c):
+        clv = c["closing_odds"].map(lambda x: 1 / american_to_decimal(x)) - c["odds"].map(implied_prob)
+        t2 = call((clv > 0).mean() > SB["clv_min"], len(c))
+        print(f"    {len(c)} of {len(pr_all)} priced props have a closing price | beat the close {(clv > 0).mean():.0%} | avg {100 * clv.mean():+.1f} pts: {t2}")
+    else:
+        t2 = "NO DATA"
+        print(f"    0 of {len(pr_all)} priced props have a closing price -> NO DATA (closing capture is not working: see the 'Close log' tab)")
+    lights.append(("positive CLV", t2))
+    # ---- 3 calibration
+    print(f"  3 CALIBRATION: what VPE said vs what happened (target: under {SB['cal_max']:g} pts in every bucket)")
+    rows, src = [], None
+    for f in (getattr(a, "shadow", None) or []):
+        if os.path.exists(f):
+            rows += [list(r) for r in _values(f) if r and str(r[0]) != "key"]
+    if rows:
+        s = pd.DataFrame([r[:11] + [""] * (11 - len(r[:11])) for r in rows], columns=SHADOW_COLS + ["p_vpe"])
+        for c_ in ("p_model", "p_market", "over", "p_vpe"):
+            s[c_] = pd.to_numeric(s[c_], errors="coerce")
+        s = s[s["over"].isin([0, 1]) & s["p_model"].notna() & s["p_market"].notna()].drop_duplicates(["key", "player", "market", "line"])
+        if len(s):
+            set_calib(getattr(a, "calib", None), SPORT)
+            now_p = blend_leg(s["p_model"].to_numpy(), s["p_market"].to_numpy(), s["market"], np.array(["Over"] * len(s)))
+            s["said"] = s["p_vpe"].fillna(pd.Series(now_p, index=s.index))
+            n_then = int(s["p_vpe"].notna().sum())
+            cal = s.assign(win=s["over"])
+            src = (f"{len(s)} graded lines from the Shadow tab ({s['key'].nunique()} slates; "
+                   + (f"{n_then} at the chance VPE gave that night, " if n_then else "")
+                   + f"{len(s) - n_then} re-scored with today's learned mix)")
+            edges, need = [0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.0], SB["min_bucket"]
+    if src is None:
+        cal = props[props["model_prob"].notna()].assign(said=lambda x: x["model_prob"], win=lambda x: x["w"])
+        src = f"{len(cal)} graded props from the pick log only (pass --shadow for every scored line)"
+        edges, need = [0, .4, .5, .55, .6, .65, .7, 1.0], 100
+    print(f"    source: {src}")
+    worst, judged = 0.0, 0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        x = cal[(cal["said"] > lo) & (cal["said"] <= hi)]
+        if not len(x):
+            continue
+        err = 100 * (x["said"].mean() - x["win"].mean())
+        ok = len(x) >= need
+        judged += ok
+        worst = max(worst, abs(err)) if ok else worst
+        print(f"    said {lo:4.0%}-{hi:4.0%}: {len(x):5d} lines  said {x['said'].mean():6.1%}  hit {x['win'].mean():6.1%}  error {err:+5.1f} pts  "
+              + ("too few to judge" if not ok else ("ok" if abs(err) < SB["cal_max"] else "OVER the limit")))
+    t3 = "too early" if not judged else ("PASS" if worst < SB["cal_max"] else "FAIL")
+    print(f"    -> worst judged bucket {worst:.1f} pts: {t3}")
+    lights.append(("calibration", t3))
+    # ---- 4 ROI by tier
+    print("  4 ROI BY TIER (staked bets, $)")
+    tv = []
+    tier = staked.get("tier", pd.Series("", index=staked.index)).fillna("").astype(str)
+    for t_, lab in (("tier_1", "Tier 1"), ("tier_2", "Tier 2"), ("tier_3", "Tier 3")):
+        tv.append(roi_line(lab, staked[tier == t_]))
+    roi_line("off-model / below tiers", staked[tier.isin(["off_model", "below_tier", ""])])
+    roi_line("same-game (rate-only)", staked[tier == "sgp_correlated"])
+    tiered = staked[tier.isin(["tier_1", "tier_2", "tier_3"])]
+    t4 = call(len(tiered) and tiered["stake"].sum() and tiered["profit_units"].sum() > 0, len(tiered))
+    lights.append(("ROI by tier", t4))
+    print(f"    -> tiered bets together: {len(tiered)} graded: {t4}")
+    # ---- splits
+    print("  SPLITS (information; small groups are noise)")
+    roi_line("ALL staked bets", staked); roi_line("straights", st); roi_line("parlays", pa)
+    for k_, lab in (("yes", "suggested = yes (VPE)"), ("lean", "suggested = lean"), ("no", "not suggested (own)"), ("sgp", "same-game")):
+        roi_line(lab, staked[staked["sg"] == k_])
+    bst = staked["boost_pct"].fillna(0) > 0
+    roi_line("boosted", staked[bst]); roi_line("not boosted", staked[~bst])
+    roi_line("VPE-built boost parlays", staked[bst & (staked["sg"] == "yes") & (staked["bt"] == "parlay")])
+    for sd in ("Over", "Under"):
+        be_line(f"{sd}s (straights + legs)", props[props["side"].astype(str).str.title() == sd])
+    for md in ("Gold", "Silver"):
+        be_line(f"{md} legs", props[props["medal"] == md])
+    for mk, x in props.groupby("market"):
+        if len(x) >= 5:
+            be_line(f"{mk}", x)
+    npass = sum(v == "PASS" for _, v in lights)
+    print("  SCOREBOARD: " + " | ".join(f"{k}: {v}" for k, v in lights) + f"  -> {npass} of 4 green")
 
 
 def cmd_linediff(a):
@@ -2598,13 +2782,18 @@ def shadow_rows(allp, key):
             continue
         k = (r["player"], r["market"], float(r["line"]))
         x = out.setdefault(k, {"key": key, "player": r["player"], "market": r["market"], "line": float(r["line"]),
-                               "over_odds": "", "under_odds": "", "p_model": None, "p_market": None, "actual": "", "over": ""})
+                               "over_odds": "", "under_odds": "", "p_model": None, "p_market": None, "actual": "", "over": "",
+                               "p_vpe": None})
         o = r["side"] == "Over"
         x["over_odds" if o else "under_odds"] = int(r["odds"])
         if x["p_model"] is None or o:
             x["p_model"] = round(float(r["model_prob"] if o else 1 - r["model_prob"]), 4)
             x["p_market"] = round(float(r["market_prob"] if o else 1 - r["market_prob"]), 4)
-    return pd.DataFrame(list(out.values()), columns=SHADOW_COLS)
+            # v15.26: column K = the Over win chance VPE gave THAT night (learned mix + fixes), so the scoreboard's calibration
+            # test compares what was said then with what happened (not a re-score with today's weights)
+            bp_ = r.get("blend_prob")
+            x["p_vpe"] = "" if bp_ is None or pd.isna(bp_) else round(float(bp_ if o else 1 - bp_), 4)
+    return pd.DataFrame(list(out.values()), columns=SHADOW_COLS + ["p_vpe"])
 
 
 def write_shadow(evald, key, path, saved=None):
@@ -2652,7 +2841,7 @@ def cmd_shadow(a):
     if value_of is None:
         print(f"No box scores for {key} yet; retry later.")
         return
-    rows = [list(r) + [""] * (len(SHADOW_COLS) - len(r)) for r in vals]
+    rows = [list(r)[:len(SHADOW_COLS)] + [""] * (len(SHADOW_COLS) - len(r)) for r in vals]
     if rows and str(rows[0][0]) == "key":
         rows, first = rows[1:], a.first_row + 1
     else:
@@ -2723,8 +2912,7 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
         for combo in itertools.combinations(cand, n):
             if len({str(c["game_id"]) for c in combo}) < n:
                 continue
-            if sum(c["side"] == "Under" for c in combo) > math.floor(PARLAY["max_under_share"] * n + 1e-9):
-                continue
+            uh = sum(c["side"] == "Under" for c in combo) > math.floor(PARLAY["max_under_share"] * n + 1e-9)
             dec = float(np.prod([c[col] for c in combo]))
             if dec < min_dec:
                 continue
@@ -2741,14 +2929,36 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
             ml = min(float(c.get("leg_edge", 0) or 0) for c in combo)
             if BOOST_LEG["min_edge"] is not None and ml < BOOST_LEG["min_edge"]:
                 continue
-            allc.append((p * dec_eff - 1, p, p_mkt, dec, dec_eff, combo, g, ml))
+            allc.append((p * dec_eff - 1, p, p_mkt, dec, dec_eff, combo, g, ml, uh))
     if not allc:
         return None
     # v15.25: close calls go to the STRONGER legs: among combos within 10% of the best growth score, the score gets
     # +BOOST_LEG["w"] x the weakest leg's edge (w 5: a +1% weakest leg = +5%); outside close calls nothing changes.
-    gmax = max(x[6] for x in allc)
-    close = [x for x in allc if x[6] >= gmax - 0.10 * abs(gmax)]
-    best = max(close, key=lambda x: x[6] * (1 + BOOST_LEG["w"] * x[7]) if x[6] > 0 else x[6] + BOOST_LEG["w"] * x[7] * 1e-4)
+    def _pick(xs):
+        if not xs:
+            return None
+        gmax = max(x[6] for x in xs)
+        close = [x for x in xs if x[6] >= gmax - 0.10 * abs(gmax)]
+        return max(close, key=lambda x: x[6] * (1 + BOOST_LEG["w"] * x[7]) if x[6] > 0 else x[6] + BOOST_LEG["w"] * x[7] * 1e-4)
+    # v15.26: Under cap (45% of legs) with the same "overwhelming math" override as the regular parlays
+    ok_, hv_ = _pick([x for x in allc if not x[8]]), _pick([x for x in allc if x[8]])
+    ok_ = ok_ if ok_ and (ok_[6] > 0 or not need_market_ev) else None
+    hv_ = hv_ if hv_ and (hv_[6] > 0 or not need_market_ev) else None
+    best = ok_
+    if hv_:
+        mev = lambda x: x[2] * x[4] - 1   # EV at market odds alone
+        if ok_ is None:
+            over_ = (mev(hv_) >= 0.25) if need_market_ev else True
+            why = (f"no combo within the cap qualifies; the Under-heavy one is {mev(hv_):+.0%} at market odds"
+                   + (" (needs +25%)" if need_market_ev else " and is the only play"))
+        else:
+            over_ = hv_[1] >= ok_[1] * PARLAY["under_override_hit"] and mev(hv_) >= mev(ok_) + PARLAY["under_override_ev"]
+            why = f"Under-heavy option: hit {hv_[1]:.1%} vs {ok_[1]:.1%}, market-odds EV {mev(hv_):+.0%} vs {mev(ok_):+.0%}"
+        if over_ or ok_ is None or hv_[6] > ok_[6]:
+            print(f"  UNDER CAP {PARLAY['max_under_share']:.0%} ({book} {boost:g}% boost): {why} -> "
+                  + ("OVERRIDE: the math clearly favors the Unders, using it" if over_ else "kept within the cap"))
+        if over_:
+            best = hv_
     return best[:6] if best and (best[6] > 0 or not need_market_ev) else None
 
 
@@ -3896,12 +4106,22 @@ def parse_props_html(html):
 
 
 MIRROR = "https://raw.githubusercontent.com/AP9000Moneywinner420/vpe-engine/odds-pages/"  # v2.20: GitHub copy, refreshed
-MIRROR_MAX_AGE_H = 3.0                                                                      # 6x/day by .github/workflows/odds-pages.yml
+MIRROR_MAX_AGE_H = 3.0                                                                      # every 20 min by .github/workflows/odds-pages.yml
 
 def _mirror_one(sport, mk):
     """The same page from the GitHub mirror (GitHub is always reachable from VPE sessions)."""
     import gzip, urllib.request, datetime as _dt
     try:
+        global MIRROR
+        if "/odds-pages/" in MIRROR:   # v15.26: read by commit id, so a just-refreshed mirror is never served from a 5-minute cache
+            try:
+                import subprocess
+                sha = subprocess.run(["git", "ls-remote", "https://github.com/AP9000Moneywinner420/vpe-engine", "odds-pages"],
+                                     capture_output=True, text=True, timeout=30).stdout.split()[0]
+                if len(sha) == 40:
+                    MIRROR = MIRROR.replace("/odds-pages/", f"/{sha}/")
+            except Exception:
+                pass
         ts = urllib.request.urlopen(MIRROR + "fetched_at.txt", timeout=30).read().decode().strip()
         age = (_dt.datetime.now(_dt.timezone.utc) - _dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)).total_seconds() / 3600
         if age > MIRROR_MAX_AGE_H:
@@ -4033,6 +4253,7 @@ if __name__ == "__main__":
     ss.add_argument("--v2-before", type=int); ss.add_argument("--v2-after", type=int)
     mn = sub.add_parser("menu"); mn.add_argument("--all", default="bets_all.csv"); mn.add_argument("--bets", default="bets.csv")
     mn.add_argument("--parlays", default="vpe_parlays.json"); mn.add_argument("--calib", default="calib_tab.json")
+    sbp_ = sub.add_parser("scoreboard"); sbp_.add_argument("--log", default="pick_log.csv"); sbp_.add_argument("--shadow", nargs="*"); sbp_.add_argument("--calib", default="calib_tab.json"); sbp_.add_argument("--since"); sbp_.add_argument("--since-week")
     ld_ = sub.add_parser("linediff"); ld_.add_argument("--a", required=True, help="earlier props CSV"); ld_.add_argument("--b", required=True, help="later props CSV"); ld_.add_argument("--log"); ld_.add_argument("--date")
     ex2_ = sub.add_parser("exposure"); ex2_.add_argument("--log", default="pick_log.csv"); ex2_.add_argument("--date"); ex2_.add_argument("--week")
     sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
@@ -4088,6 +4309,6 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "close": cmd_close, "status": cmd_status,
+     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "scoreboard": cmd_scoreboard, "close": cmd_close, "status": cmd_status,
      "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
 
