@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.28.0"
+VERSION = "NBA v2.29.0"
 
 # ==================== data ====================
 
@@ -2135,6 +2135,36 @@ def lean_straights(allp, exclude, unit_usd):
     d["cost_usd"] = (d["leg_edge"] * d["stake_usd"]).round(2)
     return d
 
+def best_available(allp, exclude, n=3):
+    """v2.29 (hard rule 3: never a bare "no bets"): when not one line is within the lean limit, the closest lines to
+    break-even anyway, one per game, rate-only. KILL-list slices are left out unless nothing else exists."""
+    d = parlay_pool(allp, exclude, min_edge=-1.0, min_prob=0.0)
+    if d.empty:
+        return d.assign(on_kill=[])
+    ok = np.array([not _killed(m_, s_) for m_, s_ in zip(d["market"], d["side"])], dtype=bool) \
+        & (d["best_dec"] >= LEAN["min_dec"] - 1e-9).to_numpy()
+    d = d.assign(on_kill=~ok)
+    d = d[ok] if ok.any() else d
+    d = d.sort_values(["leg_edge", "leg_prob"], ascending=False).drop_duplicates("game_id").head(n).copy()
+    d["bet_odds"] = [decimal_to_american(x) for x in d["best_dec"]]
+    return d
+
+
+def _print_best_available(allp, excl):
+    ba = best_available(allp, excl)
+    if ba.empty:
+        print("  BEST AVAILABLE: no scoreable line tonight (every line is held, injured or outside -200..+150): say so, "
+              "and offer a rerun on a fresh recording")
+        return []
+    print(f"  BEST AVAILABLE (rate-only, no stake suggested): no line is within {-LEAN['min_edge']:.0%} of break-even, so "
+          f"these are tonight's closest, one per game:")
+    for _, r in ba.iterrows():
+        print(f"    {r['player']} ({r['team']} vs {r['opp']}) {r['side']} {r['line']} {r['market']} "
+              f"({int(r['bet_odds']):+d} at {r['bet_at']}) | win {r['leg_prob']:.1%} | edge {r['leg_edge']:+.1%}"
+              + (" | on the KILL list (nothing else to show)" if r["on_kill"] else ""))
+    return list(zip(ba["player"], ba["market"], ba["side"]))
+
+
 def _under_max(n, share=None):
     """v2.26: most Unders allowed in an n-leg parlay: 45% of the legs, but never less than 1 (Adrian 11/16: 1 of 2 is fine).
     2 legs: 1 · 3: 1 · 4: 1 · 5: 2 · 6: 2."""
@@ -2376,7 +2406,9 @@ def cmd_parlay(a):
             lean_keys += list(zip(ls["player"], ls["market"], ls["side"]))
             lean_straight = set(zip(ls["player"], ls["market"], ls["side"]))
         else:
-            print(f"  none: no line within {-LEAN['min_edge']:.0%} of break-even")
+            _bk = _print_best_available(allp, excl)
+            lean_keys += _bk
+            lean_straight = set(_bk)
         ls.to_csv(getattr(a, "leans_out", None) or "leans.csv", index=False)
     elif os.path.exists(getattr(a, "leans_out", None) or "leans.csv"):
         os.remove(getattr(a, "leans_out", None) or "leans.csv")
@@ -2407,7 +2439,8 @@ def cmd_parlay(a):
         print(f"\nONE-PARLAY RULE: place ONLY the {rec['name']} parlay at {BOOK_NAME[rec['book']]} "
               f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}{', take-if ' + format(rec['take_if'], '+d') if rec.get('take_if') is not None and not rec.get('lean') else ''}){tag}. Any other parlay above = reference only.")
     else:
-        print("\nONE-PARLAY RULE: nothing within reach tonight (no legs close to break-even) -> place none.")
+        print("\nONE-PARLAY RULE: no parlay tonight (no legs close enough to break-even). Tonight's plays are the "
+              "straight bets or the BEST AVAILABLE lines printed above.")
     import json
     json.dump(built, open(getattr(a, "parlays_out", None) or "vpe_parlays.json", "w"), indent=1)
     if len(pool):
