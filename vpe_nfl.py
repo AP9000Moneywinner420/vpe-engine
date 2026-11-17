@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.24"
+VERSION = "NFL v15.25"
 
 # ==================== data ====================
 
@@ -1827,6 +1827,8 @@ def best_parlay(pool, target, book, boost=0.0, under_share=None):
     return best
 
 def cmd_parlay(a):
+    if getattr(a, "boost_min_leg_edge", None) is not None:  # v2.24 / v15.25
+        BOOST_LEG["min_edge"] = float(a.boost_min_leg_edge)
     set_calib(getattr(a, "calib", None), SPORT)
     allp = pd.read_csv(a.all)
     if lock_from(allp):
@@ -2306,6 +2308,172 @@ def cmd_menu(a):
 SWEEP = {"top": 10, "per_game_queries": 1}
 
 
+def cmd_linediff(a):
+    """v2.24 / v15.25: two recordings of the same night (or a recording vs the closing page): MAIN two-sided lines only
+    (ladders are too noisy to compare: 11/16, 736 of 1,180 matched prices 'changed'). Shows real moves, flags jumps that
+    look like a misread, and, with --log, how each bet already placed moved since (price taken vs the later fair price)."""
+    def main(path):
+        p = pd.read_csv(path)
+        p["_m"] = p["market"].map(lambda m: canon_market(m) if "canon_market" in globals() else str(m))
+        p["_o"], p["_u"] = pd.to_numeric(p["over_odds"], errors="coerce"), pd.to_numeric(p["under_odds"], errors="coerce")
+        p["_l"] = pd.to_numeric(p["line"], errors="coerce")
+        p = p[p["_o"].notna() & p["_u"].notna() & p["_l"].notna()].copy()
+        p["_k"] = p["player"].map(norm_name)
+        p["_b"] = p.get("book", pd.Series("", index=p.index)).fillna("").astype(str).str.lower().str.replace(" ", "", regex=False)
+        p["_f"] = [no_vig(o, u)[0] for o, u in zip(p["_o"], p["_u"])]
+        p["_h"] = [implied_prob(o) + implied_prob(u) - 1 for o, u in zip(p["_o"], p["_u"])]
+        return p.drop_duplicates(["_k", "_m", "_b"], keep="last")
+    A, B = main(a.a), main(a.b)
+    m = A.merge(B, on=["_k", "_m", "_b"], suffixes=("_a", "_b"))
+    if m.empty:
+        print("LINEDIFF: no main two-sided lines in both files (same player, market, book)")
+        return
+    m["dline"] = m["_l_b"] - m["_l_a"]
+    m["dfair"] = m["_f_b"] - m["_f_a"]  # change in the market's Over chance (at each file's own line)
+    same = m["dline"].abs() < 1e-9
+    def cents(x, y):
+        return abs(american_to_decimal(y) - american_to_decimal(x)) * 100
+    m["dc_o"] = [cents(x, y) for x, y in zip(m["_o_a"], m["_o_b"])]
+    flags = []
+    for _, r in m.iterrows():
+        why = []
+        if not (-0.025 <= r["_h_b"] <= 0.15) and (-0.025 <= r["_h_a"] <= 0.15):  # one book's O/U can't hold <0 or 15%+
+            why.append(f"impossible hold {r['_h_b']:+.1%} in B")
+        if abs(r["dline"]) >= (3 if r["_m"] in ("pts", "pra", "pass_yds", "rush_yds", "rec_yds", "rush_rec_yds") else 1.5):
+            why.append(f"line jumped {r['_l_a']:g} -> {r['_l_b']:g}")
+        if abs(r["dline"]) < 1e-9 and abs(r["dfair"]) > 0.12:
+            why.append(f"same line, market chance moved {r['dfair']:+.0%}")
+        if why:
+            flags.append((r["player_a"], r["_m"], "; ".join(why)))
+    mv = m[~same | (m["dc_o"] >= 1)]
+    print(f"LINEDIFF: {len(m)} main lines in both | {int(same.sum())} same line ({int((same & (m['dc_o'] < 1)).sum())} unchanged,"
+          f" {int((same & (m['dc_o'] >= 1)).sum())} price moved) | {int((~same).sum())} line moved | {len(flags)} flagged as likely misread")
+    for p_, mk, why in flags[:30]:
+        print(f"  FLAG {p_} {mk}: {why} -> check that frame")
+    top = m.assign(_ab=m["dfair"].abs()).sort_values("_ab", ascending=False).head(10)
+    print("  biggest real moves (Over chance A -> B):")
+    for _, r in top.iterrows():
+        if (r["player_a"], r["_m"]) in {(f[0], f[1]) for f in flags}:
+            continue
+        print(f"    {r['player_a']:24s} {r['_m']:8s} {r['_l_a']:g} {int(r['_o_a']):+d}/{int(r['_u_a']):+d} -> {r['_l_b']:g} "
+              f"{int(r['_o_b']):+d}/{int(r['_u_b']):+d}  Over {r['_f_a']:.1%} -> {r['_f_b']:.1%}")
+    if a.log and os.path.exists(a.log):
+        d = read_log(a.log)
+        if a.date and "date" in d:
+            d = d[d["date"].astype(str).str.lstrip("'") == str(pd.Timestamp(a.date).date())]
+        d = d[d.get("bet_type", pd.Series("straight", index=d.index)).fillna("straight").isin(["straight", "leg"])]
+        rows = []
+        Bk = B.set_index(["_k", "_m"])
+        for _, r in d.iterrows():
+            k = (norm_name(r["player"]), canon_market(r["market"]) if "canon_market" in globals() else str(r["market"]))
+            if k not in Bk.index or pd.isna(r.get("odds")):
+                continue
+            b = Bk.loc[[k]].iloc[0]
+            if abs(float(b["_l"]) - float(r["line"])) > 1e-9:
+                _good = (b["_l"] > r["line"]) == (str(r["side"]) == "Under")  # line up helps an Under, hurts an Over
+                rows.append(f"    {r['player']} {r['side']} {r['line']:g} {r['market']}: line now {b['_l']:g} -> moved "
+                            + ("YOUR way (you beat the later line)" if _good else "against you"))
+                continue
+            fair = b["_f"] if str(r["side"]) == "Over" else 1 - b["_f"]
+            clv = fair - implied_prob(r["odds"])
+            rows.append(f"    {r['player']} {r['side']} {r['line']:g} {r['market']} @ {int(r['odds']):+d}: later fair {fair:.1%} vs "
+                        f"break-even {implied_prob(r['odds']):.1%} -> CLV {clv:+.1%} ({'beat' if clv > 0 else 'behind'} the later price)")
+        print(f"  bets already placed vs B ({len(rows)} matched at B's main line):")
+        for x in rows:
+            print(x)
+
+
+def cmd_exposure(a):
+    """v2.24 / v15.25: the whole night's tickets together (11/16: 7 of 9 legs Unders, two parlays sharing BKN-PHI and
+    CHI-CLE, Demin in 2 bets, 0 of 4 hit). Reads the logged rows for the night/week: shared games and players, Over/Under
+    mix, and a 20,000-run simulation of the night with each leg drawn once (a leg in two bets wins or loses for both).
+    Legs in the same game are drawn independently, so 'all lose' is a FLOOR when same-game legs lean the same way."""
+    d = read_log(a.log)
+    if "date" in d.columns and "week" not in d.columns:
+        D = str(pd.Timestamp(a.date).date()) if a.date else str(pd.Timestamp.now(tz="America/New_York").date())
+        d = d[d["date"].astype(str).str.lstrip("'") == D]; lab = D
+    else:
+        wk = int(a.week) if a.week else int(pd.to_numeric(d["week"], errors="coerce").max())
+        d = d[pd.to_numeric(d["week"], errors="coerce") == wk]; lab = f"week {wk}"
+    if d.empty:
+        print(f"EXPOSURE {lab}: no logged bets (log them first, then run exposure)")
+        return
+    bt = d.get("bet_type", pd.Series("straight", index=d.index)).fillna("straight")
+    d = d[~d["result"].astype(str).str.upper().isin(["VOID", "PUSH"])] if "result" in d else d
+    tickets, legs = [], {}
+    def _key(r):
+        return (norm_name(r["player"]), str(r["market"]), str(r["side"]), round(float(r["line"]), 1) if pd.notna(r["line"]) else None)
+    def _p(r):
+        p = r.get("model_prob")
+        if pd.notna(p):
+            return float(p), False
+        o = r.get("odds")
+        return (1 / american_to_decimal(o), True) if pd.notna(o) else (0.5, True)
+    for _, r in d[bt == "straight"].iterrows():
+        k = _key(r); p, est = _p(r); legs.setdefault(k, {"p": p, "est": est, "team": r.get("team"), "opp": r.get("opp")})
+        tickets.append({"name": f"{r['player']} {r['side']} {r['line']:g} {r['market']}", "legs": [k],
+                        "stake": float(r.get("stake_usd") or r.get("units") or 0), "odds": r.get("odds_eff") if pd.notna(r.get("odds_eff")) else r.get("odds")})
+    for pid, g in d[bt == "leg"].groupby("parlay_id"):
+        ks = []
+        for _, r in g.iterrows():
+            k = _key(r); p, est = _p(r); legs.setdefault(k, {"p": p, "est": est, "team": r.get("team"), "opp": r.get("opp")}); ks.append(k)
+        pr = d[(bt == "parlay") & (d["parlay_id"] == pid)]
+        pr = pr.iloc[0] if len(pr) else None
+        tickets.append({"name": f"parlay {pid} ({len(ks)} legs)", "legs": ks,
+                        "stake": float(pr.get("stake_usd") or pr.get("units") or 0) if pr is not None else 0.0,
+                        "odds": (pr.get("odds_eff") if pd.notna(pr.get("odds_eff")) else pr.get("odds")) if pr is not None else None})
+    if not tickets:
+        print(f"EXPOSURE {lab}: no tickets found")
+        return
+    lk = list(legs)
+    use = {}
+    for t in tickets:
+        for k in t["legs"]:
+            use.setdefault(k, []).append(t["name"])
+    game = lambda k: " vs ".join(sorted([str(legs[k]["team"]), str(legs[k]["opp"])])) if pd.notna(legs[k]["team"]) else "?"
+    gm = {}
+    for k in lk:
+        gm.setdefault(game(k), set()).update(n for n in use[k])
+    ov = sum(1 for k in lk if str(k[2]).lower() == "over"); un = sum(1 for k in lk if str(k[2]).lower() == "under")
+    stake = sum(t["stake"] for t in tickets)
+    print(f"EXPOSURE {lab}: {len(tickets)} tickets, {len(lk)} different legs, ${stake:,.2f} staked | Overs {ov} / Unders {un}"
+          + (f"  <- {max(ov, un) / max(ov + un, 1):.0%} one side" if max(ov, un) >= 0.75 * (ov + un) and ov + un >= 4 else ""))
+    for k in lk:
+        if len(use[k]) > 1:
+            print(f"  SHARED LEG  {k[0]} {k[2]} {k[3]:g} {k[1]}: in {len(use[k])} tickets ({'; '.join(use[k])}) -> one miss sinks all of them")
+    pl = {}
+    for k in lk:
+        pl.setdefault(k[0], set()).update(use[k])
+    for p_, ts in pl.items():
+        if len(ts) > 1 and not any(len(use[k]) > 1 and k[0] == p_ for k in lk):
+            print(f"  SHARED PLAYER {p_}: in {len(ts)} tickets on different props")
+    nleg = {}
+    for k in lk:
+        nleg[game(k)] = nleg.get(game(k), 0) + 1
+    for g_, ts in sorted(gm.items()):
+        if len(ts) > 1 and nleg[g_] > 1:
+            print(f"  SHARED GAME {g_}: {len(ts)} tickets ({'; '.join(sorted(ts))}) -> legs in one game move together")
+    rng = np.random.default_rng(7)
+    N = 20000
+    P = np.array([legs[k]["p"] for k in lk])
+    W = rng.random((N, len(lk))) < P
+    ix = {k: i for i, k in enumerate(lk)}
+    prof = np.zeros(N); anyw = np.zeros(N, bool)
+    for t in tickets:
+        win = W[:, [ix[k] for k in t["legs"]]].all(axis=1)
+        dec = american_to_decimal(float(t["odds"])) if t["odds"] is not None and pd.notna(t["odds"]) else 2.0
+        prof += np.where(win, t["stake"] * (dec - 1), -t["stake"]); anyw |= win
+        t["p"] = float(win.mean())
+    print("  tickets (VPE win chance each):")
+    for t in tickets:
+        print(f"    {t['name'][:60]:60s} ${t['stake']:8.2f}  {t['p']:5.1%}")
+    est = [k for k in lk if legs[k]["est"]]
+    print(f"  ALL LOSE: {1 - anyw.mean():.1%} (at least one wins {anyw.mean():.1%}) | night in profit {np.mean(prof > 0):.1%}"
+          f" | expected ${prof.mean():+,.2f} | worst ${prof.min():+,.2f}, best ${prof.max():+,.2f}")
+    print("  note: same-game legs drawn independently, so ALL LOSE is a floor when same-game legs lean the same way"
+          + (f"; {len(est)} leg(s) had no VPE chance -> priced at the book's implied chance" if est else ""))
+
+
 def cmd_sweep(a):
     import json
     allp = pd.read_csv(a.all) if os.path.exists(a.all) else pd.DataFrame()
@@ -2344,14 +2512,22 @@ def cmd_sweep(a):
         games.setdefault(g, []).append(p)
     rank = lambda p: (0 if any(w.startswith(("straight", "parlay")) for w in why[p]) else 1, p)
     n_q = 0
+    # v2.24 / v15.25: dated queries (11/16: "is Zion playing tonight" returned a 2025 article; an undated "set to miss 10th
+    # straight game" was trusted). Month day year in every query + a freshness rule.
+    _td = pd.Timestamp.now(tz="America/New_York")
+    _ds = f"{_td.strftime('%B')} {_td.day} {_td.year}"
+    _ok = f"{(_td - pd.Timedelta(days=1)).strftime('%b')} {(_td - pd.Timedelta(days=1)).day}-{_td.strftime('%b')} {_td.day}, {_td.year}"
     print(f"NEWS SWEEP ({'HEAVY - final check' if a.heavy else 'every run'}): {len(why)} players in {len(games)} games")
     for g, ps in sorted(games.items()):
         print(f"\n  {g}")
-        print(f'    search: "{g.replace(" vs ", " ")} injury news minutes restriction today"')
+        print(f'    search: "{g.replace(" vs ", " ")} injury news minutes restriction {_ds}"')
         n_q += 1
         for p in sorted(ps, key=rank):
-            print(f'    - {p:<26} ({", ".join(why[p])})  search: "{p} status tonight minutes rotation role"')
+            print(f'    - {p:<26} ({", ".join(why[p])})  search: "{p} status tonight minutes rotation role {_ds}"')
             n_q += 1
+    print(f"\nFRESHNESS RULE: use only results dated {_ok} (today or yesterday). A result with an older date, or NO date"
+          " at all, is ignored even if it sounds current (\"set to miss his 10th straight game\" with no date = ignore)."
+          " Prefer the team's official injury report, beat writers and league sites that show a timestamp.")
     print(f"\n{n_q} searches. Any player reported out / doubtful / questionable / on a minutes limit / coming off the bench"
           " in a new role -> add to inj.txt (Out, Doubtful, Questionable, Limited) and rerun check + parlay + menu."
           "\n  ROLE-LOSS news = Limited (no Overs, minutes x0.8) even with no injury: out of the rotation, a DNP-CD in his last"
@@ -2532,6 +2708,9 @@ def load_calib_table(table, sport):
 # ---------- profit boosts: the one edge that holds even if the model has none ----------
 # At market prices a 2-3 leg parlay is +EV with a 20%+ boost and a 4-leg with 25%+; 5 legs needs ~30%. So a boost goes
 # on its own short parlay (most likely legs, checked +EV at market-only odds), not on the 10x parlay.
+BOOST_LEG = {"min_edge": None, "w": 5.0}  # v15.25: --boost-min-leg-edge sets a hard floor; w = close-call tilt
+
+
 def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, max_win=None, need_market_ev=True):
     col = "dec_" + book
     # low-vig legs first: value at market odds (no-vig chance x this book's price), not the shortest prices
@@ -2539,7 +2718,7 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
     ranked = ranked.drop_duplicates("player")
     # both sides in the candidate list (low-vig legs skew Under, and the Unders cap would block every combo)
     ranked = pd.concat([ranked[ranked["side"] == sd].head(PARLAY["pool"] // 2 + 1) for sd in ("Over", "Under")])
-    cand, best = ranked.to_dict("records"), None
+    cand, best, allc = ranked.to_dict("records"), None, []
     for n in range(max(min_legs, 2), max_legs + 1):
         for combo in itertools.combinations(cand, n):
             if len({str(c["game_id"]) for c in combo}) < n:
@@ -2559,8 +2738,17 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
                 continue
             # least risk for the payout: maximize long-run bankroll growth at a 5% stake (penalizes longshots)
             g = p * math.log(1 + 0.05 * (dec_eff - 1)) + (1 - p) * math.log(0.95)
-            if best is None or g > best[6] + 1e-12:
-                best = (p * dec_eff - 1, p, p_mkt, dec, dec_eff, combo, g)
+            ml = min(float(c.get("leg_edge", 0) or 0) for c in combo)
+            if BOOST_LEG["min_edge"] is not None and ml < BOOST_LEG["min_edge"]:
+                continue
+            allc.append((p * dec_eff - 1, p, p_mkt, dec, dec_eff, combo, g, ml))
+    if not allc:
+        return None
+    # v15.25: close calls go to the STRONGER legs: among combos within 10% of the best growth score, the score gets
+    # +BOOST_LEG["w"] x the weakest leg's edge (w 5: a +1% weakest leg = +5%); outside close calls nothing changes.
+    gmax = max(x[6] for x in allc)
+    close = [x for x in allc if x[6] >= gmax - 0.10 * abs(gmax)]
+    best = max(close, key=lambda x: x[6] * (1 + BOOST_LEG["w"] * x[7]) if x[6] > 0 else x[6] + BOOST_LEG["w"] * x[7] * 1e-4)
     return best[:6] if best and (best[6] > 0 or not need_market_ev) else None
 
 
@@ -3826,6 +4014,8 @@ if __name__ == "__main__":
     sub.choices["check"].add_argument("--shadow-out", default="shadow_new.json")
     sub.choices["check"].add_argument("--shadow-saved", help="get_values JSON of the Shadow tab's last rows (A:D): skip lines already saved (same-slate rerun)")
     sub.choices["log"].add_argument("--dry-run", action="store_true", help="rate the bets only, log nothing")
+    sub.choices["parlay"].add_argument("--boost-min-leg-edge", type=float,
+        help="v15.25: every boost leg needs at least this edge, e.g. 0.01 (default none: weakest-leg tilt on close calls)")
     for k, t in (("--boost-min-legs", int), ("--boost-max-legs", int), ("--boost-min-odds", float), ("--boost-max-win", float)):
         sub.choices["parlay"].add_argument(k, type=t)
     sub.choices["log"].add_argument("--parlays", default="vpe_parlays.json", help="parlays VPE built (from parlay)")
@@ -3843,6 +4033,8 @@ if __name__ == "__main__":
     ss.add_argument("--v2-before", type=int); ss.add_argument("--v2-after", type=int)
     mn = sub.add_parser("menu"); mn.add_argument("--all", default="bets_all.csv"); mn.add_argument("--bets", default="bets.csv")
     mn.add_argument("--parlays", default="vpe_parlays.json"); mn.add_argument("--calib", default="calib_tab.json")
+    ld_ = sub.add_parser("linediff"); ld_.add_argument("--a", required=True, help="earlier props CSV"); ld_.add_argument("--b", required=True, help="later props CSV"); ld_.add_argument("--log"); ld_.add_argument("--date")
+    ex2_ = sub.add_parser("exposure"); ex2_.add_argument("--log", default="pick_log.csv"); ex2_.add_argument("--date"); ex2_.add_argument("--week")
     sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
     sw_.add_argument("--parlays", default="vpe_parlays.json"); sw_.add_argument("--top", type=int, default=10)
     sw_.add_argument("--heavy", action="store_true", help="final check: every player with a qualifying line")
@@ -3896,6 +4088,6 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "close": cmd_close, "status": cmd_status,
+     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "close": cmd_close, "status": cmd_status,
      "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
 
