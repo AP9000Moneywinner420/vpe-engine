@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.28"
+VERSION = "NFL v15.29"
 
 # ==================== data ====================
 
@@ -951,7 +951,7 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
                 continue
             edge = prob - implied_prob(odds)
             ev = ev_per_unit(prob, odds)
-            tier = None if float(odds) <= KILL["short_odds"] else _tier(edge - (EST_MARGIN if fair_how == "1way" else 0.0), prob, cfg)  # v15.28 KILL
+            tier = None if _killed(mk, side, odds) else _tier(edge - (EST_MARGIN if fair_how == "1way" else 0.0), prob, cfg)  # v15.28 KILL
             if tier == "tier_3" and not profile["allow_tier3"]:
                 tier = None
             if tier and side == "Over" and p.get("blind_spot"):
@@ -1725,6 +1725,8 @@ LEAN = {"min_dec": 1.0 + 100.0 / 129.0,  # v15.28 KILL: no lean at -130 or short
 
 def lean_pool(allp, exclude=()):
     d = parlay_pool(allp, exclude, min_edge=LEAN["min_edge"], min_prob=LEAN["min_prob"])
+    if len(d):
+        d = d[np.array([not _killed(m_, s_) for m_, s_ in zip(d["market"], d["side"])], dtype=bool)]
     return d[d["best_dec"] >= LEAN["min_dec"] - 1e-9] if len(d) and "best_dec" in d else d
 
 def lean_straights(allp, exclude, unit_usd):
@@ -1826,7 +1828,8 @@ def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     d = d[(d["leg_edge"] - d["_estm"] >= (PARLAY["min_edge"] if min_edge is None else min_edge))
           & (d["leg_prob"] >= (PARLAY["min_prob"] if min_prob is None else min_prob))]
     if min_edge is None:   # v15.28 KILL: an unboosted parlay never uses a leg at -130 or shorter (boost builds may, down to -200)
-        d = d[d["best_dec"] > american_to_decimal(KILL["short_odds"]) + 1e-9]
+        d = d[d["best_dec"] > american_to_decimal(KILL["short_odds"]) + 1e-9] if _killed(odds=KILL["short_odds"]) else d
+        d = d[np.array([not _killed(m_, s_) for m_, s_ in zip(d["market"], d["side"])], dtype=bool)]
     # take-if: worst odds (at either book) at which this leg still clears min_edge
     # v2.23 / v15.24: at THIS pool's cutoff (boost pool -3%, leans pool its own), so a leg the pool keeps at its price
     # never shows a take_min above that price (was always the regular parlay cutoff -> "take if +105" on a +100 leg it kept)
@@ -2139,7 +2142,7 @@ def blend_leg(model_p, market_p, market=None, side=None):
 #     A gate lifts itself when the recent window recovers. The core projection math is never touched.
 LEARN = {"start": {"NBA": "2026-10-26", "NFL": "2026-W1"}, "window": 8000, "n0_tail": 600, "tail_cap": 0.04,
          "tail_bins": [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0], "bet_edge": 0.025, "gate_n": 150, "est_hold": 1.045}
-LEARNED = {"tail": None, "gate": {}, "pick": None}
+LEARNED = {"tail": None, "gate": {}, "pick": None, "kill": None}
 # v15.27 PICK SHRINK (approved 11/16). The legs VPE picks for parlays and boosts are the lines where its chance sits furthest
 # above the price, and that selection is mostly noise: 253 graded NBA pool legs said 54.2%, hit 50.2% (NFL 94: 55.9% -> 51.1%),
 # almost exactly the chance the PRICE implies once the book's hold is taken out. So a picked leg's chance is pulled a share k
@@ -2179,7 +2182,7 @@ def _learned_rows(path):
 
 
 def set_learned(path, sport):
-    LEARNED["tail"], LEARNED["gate"], LEARNED["pick"] = None, {}, None
+    LEARNED["tail"], LEARNED["gate"], LEARNED["pick"], LEARNED["kill"] = None, {}, None, None
     xs, ds, gates, ax = [], [], {}, []
     for r in _learned_rows(path):
         if str(r.get("sport", "")).upper() != sport:
@@ -2188,6 +2191,8 @@ def set_learned(path, sport):
             xs.append(float(r["key"])); ds.append(float(r["value"]))
         elif r["kind"] == "gate" and str(r["value"]) in ("1", "2"):
             gates[str(r["key"])] = int(r["value"])
+        elif r["kind"] == "kill":
+            LEARNED["kill"] = (LEARNED["kill"] or set()) | ({str(r["key"])} if str(r["value"]).strip() in ("1", "1.0") else set())
         elif r["kind"] == "pick":
             try:
                 LEARNED["pick"] = float(np.clip(float(r["value"]), 0.0, 1.0))
@@ -2205,7 +2210,7 @@ def set_learned(path, sport):
     if path:
         t = "none" if not xs else ", ".join(f"{x:.0%}->{d:+.1%}" for x, d in zip(LEARNED["tail"][0][len(ax):], LEARNED["tail"][1][len(ax):]) if abs(d) >= 0.005) or "none needed"
         g = ", ".join(f"{k} {'HALF' if v == 1 else 'PAUSED'}" for k, v in sorted(gates.items())) or "none"
-        print(f"LEARNED: tail fixes {t} | market gates {g} | pick shrink {_pick_k():.0%}"
+        print(f"LEARNED: tail fixes {t} | market gates {g} | pick shrink {_pick_k():.0%} | KILL list: {_kl()}"
               + (" (starting value)" if LEARNED.get("pick") is None else " (learned)"))
 
 
@@ -2328,6 +2333,16 @@ def cmd_learn(a):
               + (f" (was {float(was):.0%})" if was not in (None, "") else " (first fit)"))
     else:
         print(f"  pick shrink: only {n} graded pool legs (needs {PICK['min_n']}) -> stays at the starting {PICK['k0']:.0%}")
+    # v15.29: retune every 25 graded bets (KILL list), logged to the 'Tune log' tab
+    pk_ = {str(r["key"]) for (kd, _), r in prev.items() if kd == "kill" and str(r["value"]).strip() in ("1", "1.0")}
+    if not any(kd == "kill" for (kd, _) in prev):
+        pk_ = {"odds:short"}
+    kill_, trows = (retune(a.log, getattr(a, "tune_log", None), pk_, today) if getattr(a, "log", None) and os.path.exists(a.log) else (pk_, []))
+    for k_ in sorted(kill_ | pk_):
+        out.append([SPORT, "kill", k_, 1 if k_ in kill_ else 0, "", "KILL list: no unboosted tier / lean / parlay leg here" if k_ in kill_ else "lifted", today])
+    json.dump(trows, open(getattr(a, "tune_out", None) or "tune_new.json", "w"))
+    if trows:
+        print(f"  Tune log: {len(trows)} rows -> {getattr(a, 'tune_out', None) or 'tune_new.json'} (append to 'Tune log'!A1)")
     json.dump(out, open(a.out, "w"))
     print(f"Learned table -> {a.out}: clear 'Learned {SPORT}'!A:G, then write it at 'Learned {SPORT}'!A1. Save it as learned_tab.json"
           f" next to calib_tab.json before check/parlay/final/takeif.")
@@ -2418,6 +2433,90 @@ SB = {"min_bets": 30, "min_bucket": 400, "cal_max": 3.0, "clv_min": 0.50}  # sam
 
 KILL = {"short_odds": -130}   # v15.28 KILL list (approved 11/17): nothing priced -130 or shorter without a boost. 56 graded props there
 # hit 53.6% vs 62.6% needed, 18 tickets returned -32%, and the Shadow tab lost ~17% on thousands of lines shorter than -200.
+
+
+# v15.29 RETUNE LOOP (approved 11/17). Every 25 newly graded bets, `learn --log ... --tune-log ...` re-checks each slice of the
+# graded props (price band, market, side) and moves it on or off the KILL list. Guardrails: a slice is judged only with 30+
+# graded props; KILL needs a miss beyond 2 standard errors, LIFT needs the slice back AT OR ABOVE break-even (so one hot or cold week cannot flip
+# it); nothing is retuned between 25-bet marks. Every decision is a row in the 'Tune log' tab: what changed, why, before/after.
+TUNE = {"every": 25, "min_n": 30, "kill_se": 2.0, "lift_se": 0.0}
+TUNE_COLS = ["date", "sport", "graded_bets", "slice", "action", "n", "hit", "needed", "gap_pts", "why"]
+
+
+def _kl():
+    ks = {"odds:short"} if LEARNED.get("kill") is None else LEARNED["kill"]
+    return ", ".join(sorted(ks)) or "empty"
+
+
+def _killed(market=None, side=None, odds=None):
+    ks = LEARNED.get("kill")
+    ks = {"odds:short"} if ks is None else ks
+    if "odds:short" in ks and odds is not None and pd.notna(odds) and float(odds) <= KILL["short_odds"]:
+        return True
+    return (market is not None and f"market:{market}" in ks) or (side is not None and f"side:{side}" in ks)
+
+
+def retune(log_path, tune_path, prev_kill, today):
+    """Returns (kill keys now, rows for the Tune log). No rows = fewer than 25 newly graded bets: nothing changes."""
+    d = read_log(log_path)
+    res = d["result"].astype(str).str.upper()
+    bt = d.get("bet_type", pd.Series("straight", index=d.index)).fillna("straight")
+    g = d[res.isin(["WIN", "LOSS"])].copy()
+    g["w"] = (res[g.index] == "WIN").astype(float)
+    n_bets = int((bt[g.index] != "leg").sum())
+    last = 0
+    if tune_path and os.path.exists(tune_path):
+        for r in _values(tune_path):
+            if len(r) >= 3 and str(r[1]).upper() == SPORT:
+                try:
+                    last = max(last, int(float(r[2])))
+                except (TypeError, ValueError):
+                    pass
+    if n_bets - last < TUNE["every"]:
+        print(f"  retune: {n_bets - last} newly graded bets since the last retune (every {TUNE['every']}) -> thresholds unchanged")
+        return prev_kill, []
+    p = g[bt[g.index].isin(["straight", "leg"])].copy()
+    p["odds"] = pd.to_numeric(p["odds"], errors="coerce")
+    p = p[p["odds"].notna()]
+    p["need"] = p["odds"].map(implied_prob)
+    boosted = pd.to_numeric(p.get("boost_pct"), errors="coerce").fillna(0) > 0
+    slices = {"odds:short": p[(p["odds"] <= KILL["short_odds"]) & ~boosted]}
+    for mk, x in p.groupby("market"):
+        slices[f"market:{mk}"] = x
+    for sd, x in p.groupby(p["side"].astype(str).str.title()):
+        if sd in ("Over", "Under"):
+            slices[f"side:{sd}"] = x
+    kill, rows = set(prev_kill), []
+    allg = g[bt[g.index] != "leg"]
+    st = pd.to_numeric(allg["stake_usd"], errors="coerce").fillna(pd.to_numeric(allg["units"], errors="coerce"))
+    pf = pd.to_numeric(allg["profit_units"], errors="coerce").fillna(0)
+    r25 = pf.tail(TUNE["every"]).sum() / max(st.tail(TUNE["every"]).sum(), 1e-9)
+    rows.append([today, SPORT, n_bets, "ALL BETS", "checkpoint", n_bets, "", "", "",
+                 f"last {TUNE['every']} bets ROI {r25:+.1%}; all {n_bets} bets ROI {pf.sum() / max(st.sum(), 1e-9):+.1%} (${pf.sum():+.2f})"])
+    print(f"  retune at {n_bets} graded bets: last {TUNE['every']} ROI {r25:+.1%}")
+    for key, x in sorted(slices.items()):
+        n = len(x)
+        if n < 5:
+            continue
+        hit, need = float(x["w"].mean()), float(x["need"].mean())
+        se = math.sqrt(max(hit * (1 - hit), 1e-9) / n)
+        gap, was = hit - need, key in kill
+        act = "keep"
+        if n < TUNE["min_n"]:
+            why = f"only {n} graded props (needs {TUNE['min_n']}): too early, no change"
+        elif not was and gap < -TUNE["kill_se"] * se:
+            act, why = "KILL", f"hit {hit:.1%} vs {need:.1%} needed, a {abs(gap) / se:.1f}-SE miss on {n} props"
+            kill.add(key)
+        elif was and gap > -TUNE["lift_se"] * se:
+            act, why = "LIFT", f"back at or above break-even ({hit:.1%} vs {need:.1%} on {n} props)"
+            kill.discard(key)
+        else:
+            why = ("stays killed" if was else "inside the margin of error") + f" ({hit:.1%} vs {need:.1%}, {n} props)"
+        if act != "keep" or was or n >= TUNE["min_n"]:
+            rows.append([today, SPORT, n_bets, key, act, n, round(hit, 3), round(need, 3), round(100 * gap, 1), why])
+        if act != "keep":
+            print(f"    {act} {key}: {why}")
+    return kill, rows
 
 
 def cmd_newsflash(a):
@@ -3106,6 +3205,19 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
                   + ("OVERRIDE: the math clearly favors the Unders, using it" if over_ else "kept within the cap"))
         if over_:
             best = hv_
+    # v15.29 NO-FILLER RULE: a leg stays only if the parlay is worth more with it. If dropping a leg leaves a legal build
+    # (still meets the boost's minimum legs / odds) with a higher EV, that smaller build is used instead.
+    while best is not None and len(best[5]) > max(min_legs, 2):
+        ids = lambda c_: frozenset((x["player"], x["market"], x["side"]) for x in c_)
+        subs = {ids(best[5]) - {i_} for i_ in ids(best[5])}
+        better = [x for x in allc if ids(x[5]) in subs and x[0] > best[0] + 1e-9 and (not x[8] or best[8])]
+        if not better:
+            break
+        nb = max(better, key=lambda x: x[0])
+        gone = next(iter(ids(best[5]) - ids(nb[5])))
+        print(f"  NO-FILLER ({book} {boost:g}% boost): dropped {gone[0]} {gone[2]} {gone[1]}: the parlay is worth more without it"
+              f" (EV {best[0]:+.1%} -> {nb[0]:+.1%})")
+        best = nb
     return best[:6] if best and (best[6] > 0 or not need_market_ev) else None
 
 
@@ -4422,7 +4534,7 @@ if __name__ == "__main__":
     cl_.add_argument("--fetch-note", help="free text for the Close log note (e.g. which web-fetch was refused and the error)")
     fp_ = sub.add_parser("fetchpages"); fp_.add_argument("--out", default="lines_close"); fp_.add_argument("--status", default="fetch_status.json")
     fp_.add_argument("--markets", nargs="+")
-    ln = sub.add_parser("learn"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
+    ln = sub.add_parser("learn"); ln.add_argument("--log", help="pick log CSV: enables the 25-bet retune"); ln.add_argument("--tune-log", help="get_values JSON of the Tune log tab"); ln.add_argument("--tune-out", default="tune_new.json"); ln.add_argument("--json", nargs="+", required=True, help="Shadow window: one or more get_values JSON files, oldest first")
     ln.add_argument("--calib", default="calib_tab.json"); ln.add_argument("--learned", default="learned_tab.json")
     ln.add_argument("--out", default="learned_new.json")
     sw = sub.add_parser("shadow")
