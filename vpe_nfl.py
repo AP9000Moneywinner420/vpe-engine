@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.27"
+VERSION = "NFL v15.28"
 
 # ==================== data ====================
 
@@ -951,7 +951,7 @@ def evaluate_lines(lines, proj: Projector, injuries, overrides, cfg):
                 continue
             edge = prob - implied_prob(odds)
             ev = ev_per_unit(prob, odds)
-            tier = _tier(edge - (EST_MARGIN if fair_how == "1way" else 0.0), prob, cfg)  # v2.16: est. market
+            tier = None if float(odds) <= KILL["short_odds"] else _tier(edge - (EST_MARGIN if fair_how == "1way" else 0.0), prob, cfg)  # v15.28 KILL
             if tier == "tier_3" and not profile["allow_tier3"]:
                 tier = None
             if tier and side == "Over" and p.get("blind_spot"):
@@ -1718,7 +1718,8 @@ def market_prob_for(allp, player, mk, side, line, odds):
 # When nothing clears the edge bar, VPE still says which of tonight's lines are the least-bad to play, labeled LEAN.
 # Why: a night with no bets teaches the learning loop nothing new about placed bets and CLV, and boosts get used
 # either way. Leans are logged as suggested = "lean" (their own group in the Summary), never mixed with VPE picks.
-LEAN = {"min_dec": 1.0 / 0.6,  # v2.20: no lean shorter than -150 (11/16: 5-9, -118.7u, mostly -180 to -200 favourites)
+LEAN = {"min_dec": 1.0 + 100.0 / 129.0,  # v15.28 KILL: no lean at -130 or shorter (was -150)
+        "_was_min_dec": 1.0 / 0.6,  # v2.20: no lean shorter than -150 (11/16: 5-9, -118.7u, mostly -180 to -200 favourites)
         "min_edge": -0.04,   # leans may be up to 4 pts below break-even (anything worse is listed as a pass)
         "min_prob": 0.50, "straights": 3, "units": 0.5, "parlay_target": 4.0, "parlay_max_legs": 3}
 
@@ -1824,6 +1825,8 @@ def parlay_pool(allp, exclude=(), min_edge=None, min_prob=None):
     d["_estm"] = (d["mkt_est"].astype(str).str.lower().isin(["true", "1"]) * EST_MARGIN) if "mkt_est" in d else 0.0
     d = d[(d["leg_edge"] - d["_estm"] >= (PARLAY["min_edge"] if min_edge is None else min_edge))
           & (d["leg_prob"] >= (PARLAY["min_prob"] if min_prob is None else min_prob))]
+    if min_edge is None:   # v15.28 KILL: an unboosted parlay never uses a leg at -130 or shorter (boost builds may, down to -200)
+        d = d[d["best_dec"] > american_to_decimal(KILL["short_odds"]) + 1e-9]
     # take-if: worst odds (at either book) at which this leg still clears min_edge
     # v2.23 / v15.24: at THIS pool's cutoff (boost pool -3%, leans pool its own), so a leg the pool keeps at its price
     # never shows a take_min above that price (was always the regular parlay cutoff -> "take if +105" on a +100 leg it kept)
@@ -1983,6 +1986,13 @@ def cmd_parlay(a):
         os.remove(getattr(a, "leans_out", None) or "leans.csv")
     # ONE-PARLAY RULE (10/21-10/26: parlays were the whole loss, -$15.14 of -$15.89): recommend ONE parlay a night:
     # the BOOST parlay if there is one (+EV at market odds alone), else the biggest VPE could build (~10x), else ~4x.
+    if bps:   # v15.28 BOOST RANKER: every boost scored by true EV (after the pick shrink), best first
+        print("\nBOOST RANK (true EV after the pick shrink; vig = what the legs' hold costs before the boost pays it back):")
+        for i_, b in enumerate(sorted(bps, key=lambda x: -x.get("ev", -9)), 1):
+            ev_ = b.get("ev", 0.0)
+            verdict = "USE IT" if ev_ >= 0.05 and not b.get("lean") else ("THIN: about break-even" if ev_ > -0.02 and not b.get("lean") else "SAVE IT / lean only")
+            print(f"  #{i_} {b['name']} at {BOOK_NAME[b['book']]}: {len(b['legs'])} legs ({b.get('n_two', 0)} on two-sided main lines) | "
+                  f"hit {b['hit']:.1%} | vig paid {b.get('vig', 0):.1%} | EV {ev_:+.1%} = ${ev_ * b['stake_usd']:+.2f} on ${b['stake_usd']:.2f} | {verdict}")
     real = [b for b in built if not b.get("lean")]
     real_boosts = [b for b in bps if not b.get("lean")]
     if len(real_boosts) > 1:
@@ -2403,6 +2413,68 @@ SWEEP = {"top": 10, "per_game_queries": 1}
 
 
 SB = {"min_bets": 30, "min_bucket": 400, "cal_max": 3.0, "clv_min": 0.50}  # sample-size guardrails for the scoreboard
+
+
+
+KILL = {"short_odds": -130}   # v15.28 KILL list (approved 11/17): nothing priced -130 or shorter without a boost. 56 graded props there
+# hit 53.6% vs 62.6% needed, 18 tickets returned -32%, and the Shadow tab lost ~17% on thousands of lines shorter than -200.
+
+
+def cmd_newsflash(a):
+    """v15.28 NEWS SPEED: after an injury / lineup change and a rerun of `check`, compare the new run with the run before it
+    and list the props whose projection moved while the recorded line and price did not: the lines the book has not
+    corrected yet. Ranked by the edge it opened; role players and secondary stats are corrected slowest, stars' points fastest."""
+    import glob
+    new = pd.read_csv(a.all)
+    prev_path = a.prev
+    if not prev_path:
+        runs = sorted(glob.glob(os.path.join(a.runs, "bets_all_*.csv")))
+        same = [r for r in runs if os.path.getsize(r) and not pd.read_csv(r).equals(new)]
+        prev_path = same[-1] if same else None
+    if not prev_path or not os.path.exists(prev_path):
+        print("NEWSFLASH: no earlier run to compare with (run `check` before the news, then again after it)")
+        return
+    old = pd.read_csv(prev_path)
+    k = ["player", "market", "side", "line"]
+    for d in (new, old):
+        for c in ("model_prob", "blend_prob", "edge", "odds", "mean", "line"):
+            d[c] = pd.to_numeric(d.get(c), errors="coerce")
+    m = new.merge(old[k + ["model_prob", "blend_prob", "edge", "odds", "mean"] + (["injury"] if "injury" in old else [])], on=k, suffixes=("", "_old"))
+    inj = []
+    if "injury" in new and "injury_old" in m:
+        ch = m[m["injury"].fillna("").astype(str) != m["injury_old"].fillna("").astype(str)].drop_duplicates("player")
+        inj = [f"{r['player']} ({r['injury_old'] or 'active'} -> {r['injury'] or 'active'})" for _, r in ch.iterrows()]
+    m = m[(m["odds"] == m["odds_old"]) & m["model_prob"].notna() & m["model_prob_old"].notna()]
+    m["d_model"] = m["model_prob"] - m["model_prob_old"]
+    m["d_edge"] = m["edge"] - m["edge_old"]
+    f = m[(m["d_model"] >= a.min_move) & (m["edge"] >= a.min_edge) & m["odds"].between(PARLAY["min_odds"], PARLAY["max_odds"])].copy()
+    if "injury" in f:
+        f = f[f["injury"].fillna("").astype(str).str.strip() == ""]
+    star_stats = {"pts", "pra", "pass_yds", "rush_yds"}
+    def speed(r):
+        role = pd.notna(r.get("base_min")) and float(r["base_min"]) < 28
+        if r["market"] in star_stats and not role:
+            return 0, "FAST: a star's main stat, books fix it in minutes"
+        if role and r["market"] not in star_stats:
+            return 2, "SLOW: role player + secondary stat, often open the longest"
+        return 1, "MEDIUM"
+    sp = [speed(r) for _, r in f.iterrows()]
+    f["_sp"], f["speed"] = [x[0] for x in sp], [x[1] for x in sp]
+    f = f.sort_values(["d_edge", "edge"], ascending=False).drop_duplicates(["player", "market"]).head(a.top)
+    print(f"NEWSFLASH [{VERSION}]: this run vs {os.path.basename(prev_path)} | {len(m)} lines at an unchanged price"
+          + (f" | status changes: {'; '.join(inj[:8])}" if inj else ""))
+    if f.empty:
+        print(f"  nothing moved {a.min_move:.0%}+ in VPE's favour at an unchanged price: the news is not worth a bet on these lines")
+        return
+    print("  props the news moved that the recorded price has NOT caught up with (bet the FAST ones first, they close first):")
+    for _, r in f.sort_values(["_sp", "d_edge"], ascending=[True, False]).iterrows():
+        mo = r.get("min_odds")
+        print(f"    {r['player']} {r['side']} {r['line']:g} {r['market']} @ {int(r['odds']):+d}: proj {r['mean_old']:.1f} -> {r['mean']:.1f} | "
+              f"model {r['model_prob_old']:.1%} -> {r['model_prob']:.1%} | edge {r['edge_old']:+.1%} -> {r['edge']:+.1%}"
+              + (f" | take-if >= {int(mo):+d}" if pd.notna(mo) else "") + f" | {r['speed']}"
+              + (" | gap over the HOLD limit: here the gap IS the news, confirm the news is real before betting"
+                 if pd.notna(r.get("market_gap")) and float(r["market_gap"]) > CONFIG["model"].get("max_market_gap", 0.15) else ""))
+    print("  check each price in the app before betting: if it already moved, `reprice` it. Injured players are left out; the slip itself still follows the HOLD rule.")
 
 
 def cmd_scoreboard(a):
@@ -3852,6 +3924,8 @@ def print_boost_spec(spec, allp, stake, cols, keys, used, a):
     return {"name": f"BOOST {spec['label']}" + (" (LEAN)" if lean else ""), "target": 0, "book": bbook,
             "boost_pct": boost, "odds": decimal_to_american(dec), "take_if": decimal_to_american(tk), "hit": round(p, 4),
             "lean": lean, "ev": round(ev, 3), "stake_usd": stake,
+            "vig": round(1 - float(np.prod([float(c["market_prob"]) * float(c["dec_" + bbook]) for c in combo])), 3),
+            "n_two": int(sum(bool(c.get("two_sided")) for c in combo)),
             "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]}
 
 
@@ -4328,6 +4402,7 @@ if __name__ == "__main__":
     ss.add_argument("--v2-before", type=int); ss.add_argument("--v2-after", type=int)
     mn = sub.add_parser("menu"); mn.add_argument("--all", default="bets_all.csv"); mn.add_argument("--bets", default="bets.csv")
     mn.add_argument("--parlays", default="vpe_parlays.json"); mn.add_argument("--calib", default="calib_tab.json")
+    nf_ = sub.add_parser("newsflash"); nf_.add_argument("--all", default="bets_all.csv"); nf_.add_argument("--prev"); nf_.add_argument("--runs", default="runs"); nf_.add_argument("--min-move", type=float, default=0.03); nf_.add_argument("--min-edge", type=float, default=0.0); nf_.add_argument("--top", type=int, default=12)
     sbp_ = sub.add_parser("scoreboard"); sbp_.add_argument("--log", default="pick_log.csv"); sbp_.add_argument("--shadow", nargs="*"); sbp_.add_argument("--calib", default="calib_tab.json"); sbp_.add_argument("--since"); sbp_.add_argument("--since-week")
     ld_ = sub.add_parser("linediff"); ld_.add_argument("--a", required=True, help="earlier props CSV"); ld_.add_argument("--b", required=True, help="later props CSV"); ld_.add_argument("--log"); ld_.add_argument("--date")
     ex2_ = sub.add_parser("exposure"); ex2_.add_argument("--log", default="pick_log.csv"); ex2_.add_argument("--date"); ex2_.add_argument("--week")
@@ -4384,6 +4459,6 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "scoreboard": cmd_scoreboard, "close": cmd_close, "status": cmd_status,
+     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "scoreboard": cmd_scoreboard, "newsflash": cmd_newsflash, "close": cmd_close, "status": cmd_status,
      "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
 
