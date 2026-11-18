@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.31.0"
+VERSION = "NBA v2.32.0"
 
 # ==================== data ====================
 
@@ -4149,7 +4149,13 @@ def cmd_grade(a):
 # injury-aware model adds value (open MAE 11.31 -> 11.25 at 30% model) and its gap predicts where the line moves
 # (corr 0.47). So a game-line edge exists only BEFORE the line moves -> rate-only until CLV shows it in real bets.
 GAME = {"model_w": 0.30, "sd_margin": 12.5, "sd_total": 18.0, "held_margin": 4.0, "held_total": 6.0,
-        "inj_beta": 0.42, "repl_gs_per_min": 0.25, "half_life": 60, "lam": 2.0, "prior_w": 6.0}
+        "inj_beta": 0.42, "repl_gs_per_min": 0.25,
+        # v2.32 REST EDGE (Adrian 11/18, tested): a team on the 2nd night of a back-to-back against a rested opponent ran
+        # 2.6 pts (se 0.6) under the ratings over 596 such games in 2024-25 + 2025-26 (home team tired -3.4, visitor tired
+        # -1.9). A flat 2.0 lowered the margin miss in both seasons when fit on the other. Team-by-team home edges were
+        # tested the same day and NOT added: they made the miss worse at every setting and a team's home edge did not carry
+        # over (corr 0.05 half to half, 0.00 season to season).
+        "rest_pts": 2.0, "half_life": 60, "lam": 2.0, "prior_w": 6.0}
 SGP_CORR = {"sdM_market": 12.5, "sdT_market": 18.0, "bins": [0, 5, 10, 15, 20, 100], "stats": ["pts", "reb", "ast", "fg3m"], "starter": {"pts": {"bT": 0.16, "bM": 0.095, "shift": [0.045, 0.092, 0.035, 0.002, -0.164], "res_sd": 1.007}, "reb": {"bT": -0.05, "bM": 0.057, "shift": [0.096, 0.116, 0.02, -0.079, -0.17], "res_sd": 1.015}, "ast": {"bT": 0.113, "bM": 0.098, "shift": [0.004, 0.026, 0.017, 0.02, -0.058], "res_sd": 1.024}, "fg3m": {"bT": 0.105, "bM": 0.095, "shift": [-0.001, 0.02, 0.022, 0.035, -0.061], "res_sd": 0.976}}, "bench": {"pts": {"bT": 0.076, "bM": 0.035, "shift": [-0.044, -0.009, -0.048, -0.038, 0.093], "res_sd": 0.934}, "reb": {"bT": -0.056, "bM": 0.017, "shift": [0.04, 0.006, -0.03, -0.044, 0.016], "res_sd": 0.945}, "ast": {"bT": 0.062, "bM": 0.041, "shift": [-0.041, -0.001, -0.03, -0.038, 0.072], "res_sd": 0.931}, "fg3m": {"bT": 0.061, "bM": 0.043, "shift": [-0.02, -0.006, -0.017, -0.036, 0.052], "res_sd": 0.89}}, "within": [[1.0, 0.333, 0.209, 0.661], [0.333, 1.0, 0.255, 0.153], [0.209, 0.255, 1.0, 0.112], [0.661, 0.153, 0.112, 1.0]], "teammate": [[-0.009, 0.028, 0.049, -0.019], [0.028, 0.004, 0.016, 0.007], [0.049, 0.016, 0.003, 0.035], [-0.019, 0.007, 0.035, -0.014]], "opponent": [[0.012, 0.007, 0.008, 0.006], [0.007, 0.015, 0.006, 0.006], [0.008, 0.006, 0.006, 0.005], [0.006, 0.006, 0.005, 0.001]]}
 
 def _team_games(box):
@@ -4260,7 +4266,8 @@ def game_card(r, x, labels, cfg):
     L.append(f" 1 Team ratings (points per game vs an average team, opponent-adjusted, recent games weigh more, last season as a prior): "
              f"{g.get('home')} offense {g.get('off_h', 0):+.1f} / defense {g.get('def_h', 0):+.1f} | {g.get('away')} offense {g.get('off_a', 0):+.1f} / defense {g.get('def_a', 0):+.1f} "
              f"(defense: minus = allows fewer) | home court {g.get('hca', 0):+.1f}")
-    L.append(f" 2 Injuries: {g.get('inj_txt') or 'no rotation player listed Out / Doubtful'} -> home margin moves {g.get('inj', 0):+.1f}")
+    L.append(f" 2 Injuries: {g.get('inj_txt') or 'no rotation player listed Out / Doubtful'} -> home margin moves {g.get('inj', 0):+.1f}"
+             f" | Rest: {g.get('rest_txt', 'n/a')} -> home margin moves {g.get('rest', 0):+.1f} (home court is one league-wide number: team-by-team home edges were tested and did not hold up)")
     by = lambda m: f"{g.get('home') if m >= 0 else g.get('away')} by {abs(m):.1f}"
     L.append(f" 3 Ratings say: {by(g.get('m_mod', 0))}, total {g.get('t_mod', 0):.1f}")
     L.append(f" 4 The book says: {by(g.get('m_mkt', 0))}, total {g.get('t_mkt', 0):.1f}")
@@ -4312,6 +4319,9 @@ def cmd_games(a):
     unit_pct, kf, smax = cfg["unit_pct_of_bankroll"], cfg["staking"]["kelly_fraction"], cfg["staking"].get("straight_max_odds", 200)
     gapmax = cfg["model"]["max_market_gap"]
     rows, log = [], []
+    _tg = _team_games(state.cur) if len(state.cur) else None
+    _lastg = _tg[_tg["date"] < pd.Timestamp(date)].groupby("team")["date"].max().to_dict() if _tg is not None and len(_tg) else {}
+    b2b_ = lambda t: t in _lastg and (pd.Timestamp(date) - _lastg[t]).days == 1
     names = {}
     if outs is not None and len(outs):
         for _, o in outs.iterrows():
@@ -4328,6 +4338,12 @@ def cmd_games(a):
         m_mod, t_mod = _predict(model, home, away)
         ishift = GAME["inj_beta"] * (lost.get(away, 0.0) - lost.get(home, 0.0))
         m_mod += ishift
+        th, ta = b2b_(home), b2b_(away)
+        rshift = GAME["rest_pts"] * ((1 if ta and not th else 0) - (1 if th and not ta else 0))
+        rest_txt = (f"{away} on the 2nd night of a back-to-back, {home} rested" if rshift > 0 else
+                    f"{home} on the 2nd night of a back-to-back, {away} rested" if rshift < 0 else
+                    "both on a back-to-back" if th and ta else "no rest mismatch")
+        m_mod += rshift
         m_mkt = -hs if pd.notna(hs) else m_mod
         t_mkt = tot if pd.notna(tot) else t_mod
         wm, wt = W["margin"], W["total"]
@@ -4375,7 +4391,7 @@ def cmd_games(a):
             one = (f"ratings {'like' if pm > nv else 'do not like'} this side ({pm:.1%} vs the book's {nv:.1%}); after the mix VPE says {pb:.1%} "
                    f"against {be:.1%} needed at {odds:+d} -> {'a pick' if tier else 'not a straight pick'}")
             x = {"game": {"home": home, "away": away, "label": label, "off_h": off_.get(home, 0), "def_h": def_.get(home, 0),
-                          "off_a": off_.get(away, 0), "def_a": def_.get(away, 0), "hca": hca_, "inj": ishift, "inj_txt": inj_txt,
+                          "off_a": off_.get(away, 0), "def_a": def_.get(away, 0), "hca": hca_, "inj": ishift, "inj_txt": inj_txt, "rest": rshift, "rest_txt": rest_txt,
                           "m_mod": m_mod, "t_mod": t_mod, "m_mkt": m_mkt, "t_mkt": t_mkt, "w": w, "w_why": w_why("total" if mk == "total" else "margin"),
                           "center": cen, "sd": sd, "nv": nv, "nv_how": nv_how + ("; price not recorded, -110 assumed" if assumed else ""),
                           "block": block, "track": track, "one": one}}
@@ -4398,7 +4414,7 @@ def cmd_games(a):
             leg("ml", home, away, True, "Over", 0.0, r.get("home_ml"), r.get("away_ml"), f"{home} ML")
             leg("ml", away, home, False, "Over", 0.0, r.get("away_ml"), r.get("home_ml"), f"{away} ML")
         log.append([str(date.date()), away, home, round(m_mod, 2), round(t_mod, 2),
-                    "" if pd.isna(hs) else float(hs), "" if pd.isna(tot) else float(tot), inj_note, "", ""])
+                    "" if pd.isna(hs) else float(hs), "" if pd.isna(tot) else float(tot), (inj_note + (f" rest {rshift:+.1f}" if rshift else "")).strip(), "", ""])
     out = pd.DataFrame(rows)
     # one straight game-line pick per game (the best edge); the rest stay scored and can still be parlay / boost legs
     if len(out):
