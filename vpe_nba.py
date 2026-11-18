@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.34.0"
+VERSION = "NBA v2.35.0"
 
 # ==================== data ====================
 
@@ -1915,6 +1915,8 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
             te, v, eb, ee = rate_pick(s["prob"], odds, eff, cfg, sug)
             if kind == "lean":
                 v = "VPE lean (best available, no edge)" if not te else "VPE lean (+EV at the price taken)"
+            if s.get("held") and not sug:   # v2.35: rule order step 1, HELD beats any price or boost
+                te, v = None, f"HELD: not a VPE play ({s['held']})"
             mo = s.get("min_odds")
             if mo is not None and pd.notna(mo) and american_to_decimal(odds) < american_to_decimal(mo) - 1e-9:
                 v = (f"taken below take-if: {int(odds):+d} vs {int(mo):+d} (price moved after the recording)" if LOCK["on"]
@@ -3236,11 +3238,10 @@ def cmd_bookgap(a):
         h = allp[(allp["player"].map(norm_name) == norm_name(k)) & (allp["market"] == mk) & (allp["side"] == sd)
                  & ((pd.to_numeric(allp["line"], errors="coerce") - line).abs() < 1e-6)]
         if h.empty:
-            return None, False
+            return None, bool(held_reason(allp, k, mk, sd, line))   # v2.35: no exact line, but the player can still be HELD
         r = h.iloc[0]
         p = float(r["blend_prob"])
-        held = pd.notna(r.get("market_gap")) and float(r["market_gap"]) > CONFIG["model"]["max_market_gap"]
-        return p, bool(held)
+        return p, bool(held_reason(allp, k, mk, sd, line))
     FAIR = {}
     if getattr(a, "fair", None) and os.path.exists(a.fair):
         fr = pd.read_csv(a.fair)
@@ -3290,7 +3291,7 @@ def cmd_bookgap(a):
             elif price < PARLAY["min_odds"]:
                 verdict = "skip: shorter than -200"
             elif held:
-                verdict = "HELD by VPE (model vs market gap): skip"
+                verdict = "HELD: not a VPE play (" + (held_reason(allp, pl_, mk, sd_, ln_) or "held") + ")"
             elif gap >= BOOKGAP["take"] and (pv is None or pv >= implied_prob(price)):
                 verdict = "TAKE" + ("" if pv is not None else " (VPE has no number: book gap only)")
             elif gap >= BOOKGAP["take"]:
@@ -3372,7 +3373,7 @@ def cmd_links(a):
     print(f"LINKS: {n} of {len(seen)} suggested bets have a link")
 
 
-def cmd_sharepdf(a):
+def _sharepdf_short(a):
     """v2.34: a one-page (or two) shareable PDF of tonight's VPE picks: straight picks, the parlay(s) to place, leans and
     book-gap takes, each with price, take-if, win chance and a tappable bet-slip link when the odds feed has one.
     No stakes, no bankroll, nothing personal: safe to send to someone else."""
@@ -3477,6 +3478,365 @@ def cmd_sharepdf(a):
                                    "Information only, not betting advice. No outcome is guaranteed. 21+ and where legal.", SM)]
     doc.build(E)
     print(f"SHAREPDF: {n_bets} bets, {n_links} with a link -> {a.out}")
+
+
+def held_reason(allp, player, mk, side=None, line=None):
+    """v2.35 (rule order step 1): why this player / market is HELD tonight, or "" when it is not. Used by `log`,
+    `bookgap` and the day card so a HELD line is never rated as a VPE play anywhere."""
+    if allp is None or not len(allp):
+        return ""
+    m = CONFIG["model"]
+    pr = allp[allp["player"].map(norm_name) == norm_name(player)]
+    if pr.empty:
+        return ""
+    d = pr[pr["market"] == mk]
+    if len(d) and side is not None:
+        ds = d[d["side"] == side]
+        d = ds if len(ds) else d
+    if len(d) and line is not None:
+        ex = d[(pd.to_numeric(d["line"], errors="coerce") - float(line)).abs() < 1e-6]
+        d = ex if len(ex) else d.iloc[(pd.to_numeric(d["line"], errors="coerce") - float(line)).abs().argsort()[:1]]
+    r = d.iloc[0] if len(d) else pr.iloc[0]
+    inj = str(r.get("injury", "") or "").strip()
+    if inj.title() in ("Out", "Doubtful"):
+        return f"listed {inj.title()}"
+    if pd.notna(r.get("base_min")) and float(r["base_min"]) < m["min_minutes_to_bet"]:
+        return f"only {float(r['base_min']):.0f} normal minutes (under {m['min_minutes_to_bet']})" + (f", {inj.lower()}" if inj and inj != "nan" else "")
+    if len(d) and pd.notna(r.get("market_gap")) and float(r["market_gap"]) > m["max_market_gap"]:
+        return f"model vs market gap {float(r['market_gap']) * 100:.0f} pts (over {m['max_market_gap'] * 100:.0f})"
+    return ""
+
+
+def cmd_sharepdf(a):
+    """v2.35: the full DAY CARD from one command: every play with its legs, the numbers behind each, the full logic per
+    leg (from the same breakdown `explain` prints), bet-slip links, book gaps, shared risk and the run status. Built as
+    HTML and printed with the sandbox's Chromium; falls back to the short reportlab list if Chromium is not there.
+    It doubles as the run's last check: it re-applies HELD to everything it shows and prints a SHAREPDF: line."""
+    import json, html as _h
+    set_calib(getattr(a, "calib", None), SPORT)
+    cfg = CONFIG
+    allp = pd.read_csv(a.all) if os.path.exists(a.all) else pd.DataFrame()
+    if not len(allp):
+        print("SHAREPDF: no bets_all.csv -> run check first"); return
+    lock_from(allp)
+    L = pd.read_csv(a.links) if a.links and os.path.exists(a.links) else pd.DataFrame(columns=["bet", "market", "line", "side", "book", "odds", "url"])
+    if len(L):
+        L["_k"] = L["bet"].map(norm_name); L["line"] = pd.to_numeric(L["line"], errors="coerce")
+    e = lambda s_: _h.escape(str(s_))
+    MKN = {"pts": "points", "reb": "rebounds", "ast": "assists", "fg3m": "threes", "pra": "pts+reb+ast", "pr": "pts+reb", "pa": "pts+ast",
+           "ra": "reb+ast", "stl": "steals", "blk": "blocks", "stocks": "steals+blocks", "tov": "turnovers", "spread": "spread", "ml": "moneyline", "total": "total"}
+    am = lambda o: "-" if o is None or pd.isna(o) else f"{int(o):+d}"
+    pc = lambda p, d=0: "-" if p is None or pd.isna(p) else f"{float(p) * 100:.{d}f}%"
+    def label(pl, mk, sd, ln):
+        return f"{pl} ML" if mk == "ml" else (f"{pl} {float(ln):+g}" if mk == "spread" else f"{pl} {sd} {float(ln):g} {MKN.get(mk, mk)}")
+    def row_of(pl, mk, sd, ln):
+        h = allp[(allp["player"].map(norm_name) == norm_name(pl)) & (allp["market"] == mk) & (allp["side"] == sd)
+                 & ((pd.to_numeric(allp["line"], errors="coerce") - float(ln)).abs() < 1e-6)]
+        return h.iloc[0] if len(h) else None
+    stats = {"links": 0, "nolinks": 0}
+    def btn(pl, mk, sd, ln, book):
+        bk = str(book or "").split("/")[0].lower()
+        h = L[(L["_k"] == norm_name(pl)) & (L["market"] == mk) & (L["side"] == sd) & ((L["line"] - float(ln)).abs() < 1e-6)] if len(L) else L
+        hb = h[h["book"].astype(str).str.lower() == bk] if len(h) and bk else h
+        if len(hb):
+            r_ = hb.iloc[0]; stats["links"] += 1
+            return f'<a class="btn" href="{e(r_["url"])}">Open bet slip &middot; {e(BOOK_NAME.get(r_["book"], r_["book"]))} {am(r_["odds"])} &#8599;</a>'
+        stats["nolinks"] += 1
+        return f'<span class="nolink">No {e(BOOK_NAME.get(bk, bk or "book"))} link for this line: open it in the app</span>'
+    def bet_at(r, book=None):
+        if book:
+            return str(book).lower()
+        b = str(r.get("book", "")).split("/")
+        return (b[0] if r["side"] == "Over" or len(b) == 1 else b[1]).lower()
+    pool = pd.DataFrame()
+    try:
+        pool = pd.concat([parlay_pool(allp), parlay_pool(allp, (), min_edge=-0.04, min_prob=0.0)]).drop_duplicates(["player", "market", "side", "line"])
+    except Exception:
+        pass
+    def pool_row(pl, mk, sd, ln):
+        if not len(pool):
+            return None
+        h = pool[(pool["player"].map(norm_name) == norm_name(pl)) & (pool["market"] == mk) & (pool["side"] == sd)
+                 & ((pd.to_numeric(pool["line"], errors="coerce") - float(ln)).abs() < 1e-6)]
+        return h.iloc[0] if len(h) else None
+    rr_cls = lambda x_: {"STABLE": "g", "OK": "y", "SHAKY": "r"}.get(str(x_), "y")
+    plays, order = [], []   # order = [(pl, mk, sd, ln, book, role chip)]
+    pj = json.load(open(a.parlays)) if a.parlays and os.path.exists(a.parlays) else []
+    rec = [p for p in pj if p.get("recommended")]
+    oth = [p for p in pj if not p.get("recommended")]
+    bets = pd.read_csv(a.bets) if a.bets and os.path.exists(a.bets) else pd.DataFrame()
+    leans = pd.read_csv(a.leans) if a.leans and os.path.exists(a.leans) else pd.DataFrame()
+    gaps = pd.read_csv(a.gaps) if a.gaps and os.path.exists(a.gaps) else pd.DataFrame()
+    slip_keys_ = set()
+    def leg_rows(p_, role):
+        out, mk_prob, unders, flags = [], 1.0, 0, []
+        for l in p_.get("legs", []):
+            pl, mk, sd, ln = l[0], l[1], l[2], float(l[3])
+            r = row_of(pl, mk, sd, ln); q = pool_row(pl, mk, sd, ln)
+            order.append((pl, mk, sd, ln, p_.get("book"), role)); slip_keys_.add((norm_name(pl), mk, sd))
+            unders += sd == "Under"
+            if r is None:
+                out.append(f"<tr><td>{e(label(pl, mk, sd, ln))}</td><td colspan=5>not in tonight's scored lines</td></tr>"); continue
+            mk_prob *= float(r["market_prob"]) if pd.notna(r.get("market_prob")) else float(r["blend_prob"])
+            lp = float(q["leg_prob"]) if q is not None else float(r["blend_prob"])
+            tm = am(q["take_min"]) if q is not None and pd.notna(q.get("take_min")) else "-"
+            price = am(q["price_" + ("dk" if str(p_.get("book")) == "draftkings" else "fd")]) if q is not None and ("price_dk" in q) else am(r["odds"])
+            hr = held_reason(allp, pl, mk, sd, ln)
+            oth_held = [x for x in sorted(set(allp[(allp["player"].map(norm_name) == norm_name(pl)) & (pd.to_numeric(allp["market_gap"], errors="coerce") > cfg["model"]["max_market_gap"])]["market"])) if x != mk]
+            if hr:
+                flags.append(f"{pl}: HELD ({hr})")
+            elif oth_held:
+                flags.append(f"{pl}: held on his other markets ({', '.join(MKN.get(x, x) for x in oth_held)}): usually news the stats have not seen")
+            if str(r.get("role_risk")) == "SHAKY":
+                flags.append(f"{pl}: shaky role ({r.get('role_why')})")
+            note = f"proj {float(r['mean']):.1f} in {float(r['proj_min']):.0f} min" if mk not in GAME_MK else f"VPE number {float(r['mean']):+.1f}"
+            out.append(f"<tr><td><b>{e(pl)}</b> <span class='mut'>({e(r['team'])})</span><br>{e(sd if mk not in ('spread', 'ml') else '')} {e(f'{ln:g}' if mk != 'ml' else '')} {e(MKN.get(mk, mk))} "
+                       f"<span class='mut'>vs {e(r['opp'])}</span></td><td class='num'>{price}</td><td class='num'>{pc(lp)}</td>"
+                       f"<td><span class='chip {rr_cls(r.get('role_risk'))}'>{e(r.get('role_risk'))}</span></td><td class='num'>{tm}</td>"
+                       f"<td class='sm'>{e(note)}<br>{btn(pl, mk, sd, ln, p_.get('book'))}</td></tr>")
+        return out, mk_prob, unders, flags
+    def parlay_box(p_, role):
+        rows, mkp, unders, flags = leg_rows(p_, role)
+        n = len(p_.get("legs", []))
+        dec = american_to_decimal(p_["odds"]) if p_.get("odds") is not None else None
+        boost = float(p_.get("boost_pct") or 0)
+        decb = 1 + (dec - 1) * (1 + boost / 100) if dec else None
+        hit = float(p_.get("hit") or 0)
+        ev = p_.get("ev"); ev = hit * decb - 1 if ev is None and decb else ev
+        mev = mkp * decb - 1 if decb else None
+        price = (f"<s>{am(p_['odds'])}</s> &rarr; <b>{am(decimal_to_american(decb))}</b>" if boost else f"<b>{am(p_.get('odds'))}</b>")
+        tag = "LEAN" if p_.get("lean") else ("THE PLAY" if role == "THE parlay" else "reference")
+        cap = _under_max(n) if n else 0
+        notes = []
+        if boost and dec:
+            notes.append(f"Without the boost: EV {(hit * dec - 1) * 100:+.1f}% at {am(p_['odds'])}. Place it only with the {boost:g}% boost, only at {BOOK_NAME.get(p_.get('book'), p_.get('book'))}.")
+        notes.append(f"Unders {unders} of {n} legs (cap {cap}).")
+        notes += flags
+        return (f"<div class='play {'lean' if p_.get('lean') else ''}'><div class='ph'><span class='tag'>{tag}</span> <span class='pt'>{e(p_.get('name', 'Parlay'))} at {e(BOOK_NAME.get(p_.get('book'), p_.get('book', '')))}</span>"
+                f"<span class='pp'>{price}</span></div>"
+                f"<div class='sub'>Take-if before the boost: <b>{am(p_.get('take_if'))}</b> or better &middot; {n} legs on one ticket</div>"
+                f"<div class='boxes'><div class='bx'><div class='bl'>hit chance</div><div class='bv'>{pc(hit, 1)}</div></div>"
+                f"<div class='bx'><div class='bl'>market chance</div><div class='bv'>{pc(mkp, 1)}</div></div>"
+                f"<div class='bx'><div class='bl'>EV (engine est.)</div><div class='bv {'pos' if (ev or 0) > 0 else 'neg'}'>{(ev or 0) * 100:+.1f}%</div><div class='bl'>market-only {('%+.1f%%' % (mev * 100)) if mev is not None else '-'}</div></div></div>"
+                f"<table class='legs'><tr><th>Leg</th><th>Price</th><th>VPE win</th><th>Role</th><th>Take-if</th><th>Note / link</th></tr>{''.join(rows)}</table>"
+                f"<div class='note'>{'<br>'.join(e(x) for x in notes)}</div></div>")
+    S = []
+    if rec:
+        S.append("<h2>The play</h2>" + "".join(parlay_box(p_, "THE parlay") for p_ in rec))
+    def straight_table(df, role, title):
+        if not len(df):
+            return ""
+        rows = []
+        for _, b in df.iterrows():
+            pl, mk, sd, ln = b["player"], b["market"], b["side"], float(b["line"])
+            r = row_of(pl, mk, sd, ln)
+            if r is None:
+                continue
+            order.append((pl, mk, sd, ln, None, role)); slip_keys_.add((norm_name(pl), mk, sd))
+            hr = held_reason(allp, pl, mk, sd, ln)
+            why = f"proj {float(r['mean']):.1f} vs line {ln:g} in {float(r['proj_min']):.0f} min" if mk not in GAME_MK else f"VPE number {float(r['mean']):+.1f}"
+            edge = float(r["blend_prob"]) - implied_prob(r["odds"])
+            rows.append(f"<tr><td><b>{e(label(pl, mk, sd, ln))}</b> <span class='mut'>({e(r['team'])} vs {e(r['opp'])})</span>{'<br><span class=neg>HELD: not a VPE play (' + e(hr) + ')</span>' if hr else ''}</td>"
+                        f"<td class='num'>{am(r['odds'])}</td><td class='num'>{am(r.get('min_odds'))}</td>"
+                        f"<td class='num'>{pc(r['blend_prob'], 1)} / {pc(implied_prob(r['odds']), 1)} / <span class='{'pos' if edge > 0 else 'neg'}'>{edge * 100:+.1f}</span></td>"
+                        f"<td class='sm'>{e(why)} &middot; <span class='chip {rr_cls(r.get('role_risk'))}'>{e(r.get('role_risk'))}</span><br>{btn(pl, mk, sd, ln, bet_at(r))}</td></tr>")
+        return (f"<h2>{title}</h2><table class='legs'><tr><th>Bet</th><th>Price</th><th>Take-if</th><th>VPE win / needed / edge</th><th>Why / link</th></tr>{''.join(rows)}</table>") if rows else ""
+    S.append(straight_table(bets, "STRAIGHT", "Straight bets"))
+    S.append(straight_table(leans, "LEAN", "Leans (no edge: the closest lines to break-even)"))
+    if oth:
+        S.append("<h2>Other builds (reference only)</h2>" + "".join(parlay_box(p_, "reference") for p_ in oth[:3]))
+    # book gaps
+    skip_items = [x.strip() for x in (a.skip or "").split(";") if x.strip()]
+    if len(gaps):
+        rows = []
+        for _, g in gaps.head(12).iterrows():
+            pl = str(g["bet"]).split(" ")[0] if g["market"] in ("spread", "ml") else str(g["bet"]).split(" Over ")[0].split(" Under ")[0]
+            hr = held_reason(allp, pl, g["market"], g["side"], g["line"])
+            verdict = f"HELD: not a VPE play ({hr})" if hr else str(g["verdict"])
+            opp = any((norm_name(pl), g["market"], o_) in slip_keys_ for o_ in ("Over", "Under") if o_ != g["side"]) and g["market"] not in ("spread", "ml")
+            if hr and str(g["verdict"]).startswith("TAKE"):
+                skip_items.append(f"{g['bet']} at {g['book']}: the book gap says TAKE, but he is HELD ({hr})")
+            rows.append(f"<tr><td>{e(g['bet'])}{' <span class=neg>(opposite side of a bet on the slip)</span>' if opp else ''}</td><td>{e(BOOK_NAME.get(g['book'], g['book']))} {am(g['odds'])}</td>"
+                        f"<td class='num'>{pc(g['other_fair'], 1)} <span class='mut'>({e(g['other_book'])})</span></td><td class='num'>{pc(g['vpe_win'], 1) if pd.notna(g.get('vpe_win')) else '-'}</td>"
+                        f"<td class='{'pos' if verdict.startswith('TAKE') else ('neg' if verdict.startswith('HELD') else '')}'>{e(verdict)}</td></tr>")
+        S.append(f"<h2>Book gaps</h2><table class='legs'><tr><th>Bet</th><th>Price</th><th>Other books' fair</th><th>VPE</th><th>Verdict</th></tr>{''.join(rows)}</table>")
+    if skip_items:
+        S.append("<div class='skip'><b>SKIP TONIGHT</b><br>" + "<br>".join(e(x) for x in skip_items) + "</div>")
+    bl = [p for p in pj if p.get("boost_pct")]
+    if bl:
+        S.append("<h2>Boosts</h2><table class='legs'><tr><th>Boost</th><th>Book</th><th>Legs</th><th>EV (engine est.)</th><th>Verdict</th></tr>" + "".join(
+            f"<tr><td>{e(p_.get('name'))}</td><td>{e(BOOK_NAME.get(p_.get('book'), p_.get('book')))}</td><td class='num'>{len(p_.get('legs', []))}</td><td class='num'>{(p_.get('ev') or 0) * 100:+.1f}%</td>"
+            f"<td>{'LEAN: least-bad way to use it' if p_.get('lean') else ('USE IT' if (p_.get('ev') or 0) >= 0.05 else 'THIN: about break-even')}</td></tr>" for p_ in bl) + "</table>")
+    # shared risk
+    from collections import Counter, defaultdict
+    tick = defaultdict(list)
+    for pl, mk, sd, ln, bk, role in order:
+        tick[norm_name(pl)].append((pl, mk, sd, role))
+    sr = [f"<tr><td>{e(v[0][0])}</td><td>{e(', '.join(sorted({MKN.get(m_, m_) + ' ' + s_ for _, m_, s_, _ in v})))}</td><td>{len(v)} tickets / bets"
+          + (" &middot; <span class='neg'>opposite sides</span>" if len({s_ for _, _, s_, _ in v}) > 1 and len({m_ for _, m_, _, _ in v}) == 1 else "") + "</td></tr>" for v in tick.values() if len(v) > 1]
+    ou = Counter(sd for _, mk, sd, _, _, _ in order if mk not in ("spread", "ml"))
+    stc = Counter(MKN.get(mk, mk) for _, mk, _, _, _, _ in order)
+    S.append("<h2>Shared risk</h2><table class='legs'><tr><th>Player</th><th>Markets</th><th>Where</th></tr>" + ("".join(sr) or "<tr><td colspan=3>No player appears on more than one ticket.</td></tr>")
+             + f"</table><div class='sub'>Over / Under mix: {ou.get('Over', 0)} Overs, {ou.get('Under', 0)} Unders &middot; legs per stat: {e(', '.join(f'{k} {v}' for k, v in stc.most_common()))}</div>")
+    # full logic cards
+    def bar(lbl, v, cls):
+        return f"<div class='br'><span class='bn'>{lbl}</span><span class='bt'><span class='bf {cls}' style='width:{max(min(float(v), 1), 0) * 100:.1f}%'></span></span><span class='bv2'>{pc(v, 1)}</span></div>"
+    def chipf(name, f):
+        f = float(f)
+        return f"<span class='chip {'g' if f > 1.005 else ('r' if f < 0.995 else 'n')}'>{e(name)} &times;{f:.3f}</span>"
+    cards, seen = [], set()
+    for pl, mk, sd, ln, bk, role in order:
+        k = (norm_name(pl), mk, sd, ln)
+        if k in seen:
+            continue
+        seen.add(k)
+        r = row_of(pl, mk, sd, ln)
+        if r is None:
+            continue
+        r = r.to_dict()
+        try:
+            x = json.loads(r["x"])
+        except Exception:
+            x = {}
+        edge = float(r["blend_prob"]) - implied_prob(r["odds"])
+        hr = held_reason(allp, pl, mk, sd, ln)
+        head = (f"<div class='ch'><span class='cn'>{e(label(pl, mk, sd, ln))}</span> <span class='mut'>{e(r['team'])} vs {e(r['opp'])} &middot; {am(r['odds'])}</span> "
+                f"<span class='chip {'g' if edge > 0 else 'r'}'>edge {edge * 100:+.1f}</span> <span class='chip n'>{e(role)}</span>"
+                + (f" <span class='chip r'>HELD: not a VPE play</span>" if hr else "") + f"<span class='cb'>{btn(pl, mk, sd, ln, bk or bet_at(r))}</span></div>")
+        body = []
+        if mk in GAME_MK:
+            g = x.get("game", {})
+            by = lambda m_: f"{g.get('home') if m_ >= 0 else g.get('away')} by {abs(m_):.1f}"
+            steps = [("1 Team ratings", f"{g.get('home')} offense {g.get('off_h', 0):+.1f} / defense {g.get('def_h', 0):+.1f} &middot; {g.get('away')} offense {g.get('off_a', 0):+.1f} / defense {g.get('def_a', 0):+.1f} &middot; home court {g.get('hca', 0):+.1f}"),
+                     ("2 Injuries and rest", f"{e(g.get('inj_txt') or 'no rotation player out')} ({g.get('inj', 0):+.1f}) &middot; {e(g.get('rest_txt', 'n/a'))} ({g.get('rest', 0):+.1f})"),
+                     ("3 Ratings say", f"{e(by(g.get('m_mod', 0)))}, total {g.get('t_mod', 0):.1f}"), ("4 Book says", f"{e(by(g.get('m_mkt', 0)))}, total {g.get('t_mkt', 0):.1f}"),
+                     ("5 Mix", f"{g.get('w', 0) * 100:.0f}% ratings + {(1 - g.get('w', 0)) * 100:.0f}% book &rarr; VPE number {g.get('center', 0):.1f} (games land about {g.get('sd', 0):g} either side)"),
+                     ("8 Price and edge", f"{am(r['odds'])} &rarr; needs {pc(implied_prob(r['odds']), 1)} &rarr; edge {edge * 100:+.1f} &rarr; {e(str(r.get('tier')).replace('_', ' ') if isinstance(r.get('tier'), str) else (g.get('block') or 'no tier'))}"),
+                     ("9 Stake", f"{float(r['units']):g}u (VPE's size)" if isinstance(r.get("tier"), str) else "none as a straight"),
+                     ("10 Risk", e(g.get("track", "")))]
+            body.append("<div class='steps'>" + "".join(f"<div class='st'><span class='sn'>{a_}</span> {b_}</div>" for a_, b_ in steps) + "</div>")
+            body.append("<div class='bars'>" + bar("ratings", r["model_prob"], "m") + bar("market", r["market_prob"], "k") + bar("VPE win", r["blend_prob"], "v") + bar("needed", implied_prob(r["odds"]), "n") + "</div>")
+        else:
+            m_, c_, g, p = x.get("m", {}), x.get("c", {}), x.get("g", {}), x.get("p", {})
+            names = {"base": "base", "usage": "teammates out", "role": "recent role", "wo": "games without", "b2b": "back-to-back", "blow": "blowout risk",
+                     "restrict": "limit", "news": "news role", "nt": "new team", "final": "projected"}
+            chain, prev = [], None
+            for kk in ("base", "usage", "role", "wo", "b2b", "blow", "restrict", "news", "nt", "final"):
+                if kk not in m_ or m_[kk] is None:
+                    continue
+                v = float(m_[kk])
+                if prev is None or kk == "final" or abs(v - prev) >= 0.05:
+                    cls = "n" if prev is None or kk == "final" else ("g" if v > prev else "r")
+                    chain.append(f"<span class='chip {cls}'>{names[kk]} {v:.1f}</span>")
+                prev = v
+            body.append(f"<div class='st'><span class='sn'>1 Minutes</span> {' &rarr; '.join(chain)} <span class='mut'>last 3: {c_.get('l3', '-')} &middot; last 10: {c_.get('m10', '-')} &middot; starts {float(c_.get('sr', 0) or 0) * 100:.0f}% &middot; {c_.get('n', '-')} games</span></div>")
+            body.append(f"<div class='st'><span class='sn'>2 Game</span> {'home' if g.get('home') else 'away'} &middot; spread {g.get('spread') if g.get('spread') is not None else 'n/a'} &middot; total {g.get('total') if g.get('total') is not None else 'n/a'} &middot; {e(g.get('arch', ''))} vs {e(g.get('opp_style', ''))}</div>")
+            chips = []
+            for stn, sv in (x.get("s") or {}).items():
+                chips.append(f"<span class='chip n'>{e(stn)} {float(sv.get('raw', 0)):.3f}/min</span>")
+                for nm, kk in (("usage", "use"), ("defense vs position", "dvp"), ("style", "af"), ("game total", "ef")):
+                    if sv.get(kk) is not None:
+                        chips.append(chipf(nm, sv[kk]))
+            for nm, kk in (("pace", "pace"), ("home/away", "hf"), ("back-to-back", "b2br"), ("new team", "ntr")):
+                if g.get(kk) is not None:
+                    chips.append(chipf(nm, g[kk]))
+            body.append(f"<div class='st'><span class='sn'>3 Rate</span> {' '.join(chips)}</div>")
+            mu, sd_ = float(r["mean"]), float(x.get("sd") or math.sqrt(max(float(r["var"]), 1e-6)))
+            hi = max(mu + 2.5 * sd_, ln * 1.35, 1.0); pos = lambda v: max(min(v / hi, 1), 0) * 100
+            body.append(f"<div class='st'><span class='sn'>4 Projection vs line</span> <b>{mu:.1f}</b> vs <b>{ln:g}</b> <span class='mut'>(&plusmn;{sd_:.1f})</span>"
+                        f"<div class='pj'><span class='band' style='left:{pos(mu - sd_):.1f}%;width:{pos(mu + sd_) - pos(mu - sd_):.1f}%'></span>"
+                        f"<span class='mk line' style='left:{pos(ln):.1f}%'></span><span class='mk proj' style='left:{pos(mu):.1f}%'></span></div>"
+                        f"<span class='mut sm'>dark tick = line, orange tick = projection, band = &plusmn;1 sd</span></div>")
+            body.append("<div class='bars'>" + bar("model", r["model_prob"], "m") + bar("market", r["market_prob"], "k") + bar("VPE win", r["blend_prob"], "v") + bar("needed", implied_prob(r["odds"]), "n") + "</div>")
+            if p:
+                body.append(f"<div class='mono'>5-7 raw {pc(p.get('raw'), 1)} &rarr; calibrated {pc(p.get('cal'), 1)} | market {pc(p.get('fair'), 1)} ({e(p.get('how', ''))}) | mix {float(p.get('w', 0)) * 100:.0f}% model = {pc(p.get('mix'), 1)} | learned fix {float(p.get('learn', 0) or 0) * 100:+.1f} &rarr; {pc(p.get('fin'), 1)}</div>")
+            tier = r.get("tier") if isinstance(r.get("tier"), str) else None
+            body.append(f"<div class='st'><span class='sn'>8-9 Price</span> {am(r['odds'])} &rarr; needs {pc(implied_prob(r['odds']), 1)} &rarr; edge <span class='{'pos' if edge > 0 else 'neg'}'>{edge * 100:+.1f}</span> &rarr; "
+                        f"{e(tier.replace('_', ' ').upper()) if tier else 'no straight tier'}" + (f" &middot; {float(r['units']):g}u (VPE's size) &middot; take-if {am(r.get('min_odds'))}" if tier else "") + "</div>")
+            body.append(f"<div class='st'><span class='sn'>10 Risk</span> <span class='chip {rr_cls(r.get('role_risk'))}'>{e(r.get('role_risk'))}</span> {e(r.get('role_why', ''))} &middot; model vs market gap {float(r.get('market_gap') or 0) * 100:.0f} pts"
+                        + (f" &middot; <span class='neg'>HELD: {e(hr)}</span>" if hr else "") + "</div>")
+        q = pool_row(pl, mk, sd, ln)
+        if q is not None and "price_dk" in q:
+            body.append(f"<div class='st'><span class='sn'>11 As a parlay leg</span> DraftKings {am(q['price_dk'])} / FanDuel {am(q['price_fd'])} &rarr; best {e(q.get('bet_at', ''))} &middot; leg chance {pc(q['leg_prob'], 1)} &middot; leg edge {float(q['leg_edge']) * 100:+.1f} &middot; take-if {am(q.get('take_min'))}</div>")
+        try:
+            raw = game_card(r, x, [role], cfg) if mk in GAME_MK else explain_card(r, x, [role], cfg)
+        except Exception as ex_:
+            raw = f"(engine card unavailable: {ex_})"
+        body.append(f"<pre class='raw'>{e(raw)}</pre>")
+        cards.append(f"<div class='card'>{head}{''.join(body)}</div>")
+    if cards:
+        S.append("<h2>Full logic, leg by leg</h2>" + "".join(cards))
+    status_txt = open(a.status_file).read() if a.status_file and os.path.exists(a.status_file) else ""
+    _vm = re.search(r"RUN STATUS[^\n]*:\s*(GO|PARTIAL|HOLD)\b", status_txt) or re.search(r"->\s*(GO|PARTIAL|HOLD)\b", status_txt)
+    verdict = _vm.group(1) if _vm else "n/a"
+    if status_txt:
+        S.append(f"<h2>Run status</h2><pre class='raw big'>{e(status_txt.strip())}</pre>")
+    chips = [f"{p_.get('name')}: {'LEAN' if p_.get('lean') else 'USE IT'}" for p_ in rec] + ([f"{len(bets)} straight" + ("s" if len(bets) != 1 else "")] if len(bets) else ["no straight picks"]) \
+        + ([f"{int(gaps['verdict'].astype(str).str.startswith('TAKE').sum())} book-gap takes"] if len(gaps) else []) + [f"skip: {x.split(':')[0]}" for x in skip_items[:2]]
+    n_games = allp["game_id"].astype(str).nunique()
+    head = (f"<div class='top'><div class='h1'>VPE DAY CARD <span class='acc'>{e(a.title or str(allp['date'].iloc[0]))}</span></div>"
+            f"<div class='meta'>{VERSION} &middot; lines: {e(a.source or ('your ' + LOCK['books'] + ' prices' if LOCK['on'] else 'best of market'))}, {e(a.asof or 'time not given')} &middot; {n_games} games &middot; run status: <b>{verdict}</b></div>"
+            f"<div class='chips'>{''.join(f'<span class=chip2>{e(c)}</span>' for c in chips)}</div>"
+            f"<div class='flow'>{len(allp):,} lines scored &rarr; news sweep &rarr; rules (held, KILL list, price floor, Under cap) &rarr; the plays</div></div>")
+    css = """@page{size:Letter;margin:0.33in}*{box-sizing:border-box}body{font-family:Inter,'Helvetica Neue',Arial,sans-serif;font-size:9.6pt;color:#16181d;margin:0;line-height:1.32}
+.h1{font-family:'Barlow Condensed','Roboto Condensed','Arial Narrow','DejaVu Sans Condensed',Impact,sans-serif;font-weight:800;font-size:27pt;letter-spacing:.5px;line-height:1}.acc{color:#e8452c}
+.meta{color:#555;font-size:8.6pt;margin-top:3px}.chips{margin:6px 0 2px}.chip2{display:inline-block;background:#16181d;color:#fff;border-radius:3px;padding:2px 7px;margin:0 4px 4px 0;font-size:8.4pt;font-weight:600}
+.flow{font-size:8.4pt;color:#555;border-top:2px solid #e8452c;padding-top:4px;margin-top:2px}
+h2{font-family:'Barlow Condensed','Roboto Condensed','Arial Narrow','DejaVu Sans Condensed',sans-serif;font-size:15pt;font-weight:700;margin:12px 0 5px;text-transform:uppercase;letter-spacing:.4px;break-after:avoid;page-break-after:avoid}
+.play,.card,.skip,tr,.st,.bars{break-inside:avoid;page-break-inside:avoid}
+.play{border:1.5px solid #16181d;border-radius:6px;padding:8px 10px;margin-bottom:9px}.play.lean{border-style:dashed;border-color:#888}
+.ph{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}.tag{background:#e8452c;color:#fff;font-weight:700;font-size:8pt;padding:1px 6px;border-radius:3px}.lean .tag{background:#888}
+.pt{font-weight:700;font-size:11.5pt}.pp{margin-left:auto;font-family:'DejaVu Sans Mono',ui-monospace,Menlo,monospace;font-size:12pt}.pp s{color:#999}
+.sub{font-size:8.6pt;color:#444;margin:3px 0 6px}.boxes{display:flex;gap:7px;margin-bottom:6px}.bx{flex:1;background:#f3f4f6;border-radius:5px;padding:5px 8px}
+.bl{font-size:7.6pt;color:#555;text-transform:uppercase;letter-spacing:.3px}.bv{font-family:'DejaVu Sans Mono',ui-monospace,monospace;font-size:14pt;font-weight:700}
+table.legs{width:100%;border-collapse:collapse;table-layout:auto}table.legs th{text-align:left;font-size:7.8pt;text-transform:uppercase;color:#555;border-bottom:1.5px solid #16181d;padding:3px 5px}
+table.legs td{padding:4px 5px;border-bottom:1px solid #ddd;vertical-align:top;overflow-wrap:anywhere}.num{font-family:'DejaVu Sans Mono',ui-monospace,monospace;white-space:nowrap}
+.sm{font-size:8.2pt}.mut{color:#666;font-weight:400}.pos{color:#15803d;font-weight:700}.neg{color:#b91c1c;font-weight:700}
+.note{background:#fff7ed;border-left:3px solid #e8452c;padding:5px 8px;margin-top:6px;font-size:8.6pt}.skip{background:#fef2f2;border:1.5px solid #b91c1c;border-radius:6px;padding:7px 10px;margin:9px 0;color:#7f1d1d;font-size:9pt}
+.chip{display:inline-block;border-radius:3px;padding:0 5px;font-size:8pt;font-weight:600;margin:1px 2px 1px 0;white-space:nowrap}.chip.g{background:#dcfce7;color:#166534}.chip.r{background:#fee2e2;color:#991b1b}.chip.y{background:#fef9c3;color:#854d0e}.chip.n{background:#e5e7eb;color:#374151}
+.btn{display:inline-block;background:#e8452c;color:#fff!important;text-decoration:none;font-weight:700;font-size:8.2pt;padding:2px 8px;border-radius:4px;margin-top:2px;white-space:nowrap}
+.nolink{display:inline-block;border:1px dashed #999;color:#666;font-size:7.8pt;padding:1px 6px;border-radius:4px;margin-top:2px}
+.card{border:1px solid #c9ccd1;border-radius:6px;padding:7px 9px;margin-bottom:8px}.ch{display:flex;align-items:center;gap:6px;flex-wrap:wrap;border-bottom:1px solid #e5e7eb;padding-bottom:4px;margin-bottom:4px}
+.cn{font-weight:700;font-size:10.8pt}.cb{margin-left:auto}.st{font-size:8.7pt;margin:2px 0}.sn{font-weight:700;color:#e8452c;margin-right:3px}.steps .st{margin:1px 0}
+.pj{position:relative;height:9px;background:#e5e7eb;border-radius:4px;margin:3px 0 1px}.band{position:absolute;top:0;height:9px;background:#fdba74;border-radius:4px}
+.mk{position:absolute;top:-3px;width:2.5px;height:15px}.mk.line{background:#16181d}.mk.proj{background:#e8452c}
+.bars{margin:4px 0}.br{display:flex;align-items:center;gap:6px;font-size:8.2pt;margin:1px 0}.bn{width:52px;color:#444}.bt{flex:1;height:7px;background:#eef0f3;border-radius:4px;overflow:hidden}
+.bf{display:block;height:7px}.bf.m{background:#60a5fa}.bf.k{background:#9ca3af}.bf.v{background:#e8452c}.bf.n{background:#16181d}.bv2{width:44px;text-align:right;font-family:'DejaVu Sans Mono',ui-monospace,monospace}
+.mono{font-family:'DejaVu Sans Mono',ui-monospace,monospace;font-size:7.4pt;color:#444;margin:2px 0}
+pre.raw{font-family:'DejaVu Sans Mono',ui-monospace,monospace;font-size:5.6pt;line-height:1.25;color:#6b7280;white-space:pre-wrap;overflow-wrap:anywhere;border-top:1px dashed #d1d5db;margin:5px 0 0;padding-top:3px}pre.raw.big{font-size:7.4pt;color:#16181d;break-inside:avoid}
+.foot{font-size:7.6pt;color:#666;margin-top:8px;border-top:1px solid #ddd;padding-top:4px}"""
+    foot = ("<div class='foot'>Win chances are VPE's estimates (its own projection mixed with the sportsbooks' prices). EV figures are engine estimates. A link opens that sportsbook's bet slip with the bet "
+            "loaded: check the price there against the take-if before placing. Information only, not betting advice; no outcome is guaranteed. 21+ and where legal.</div>")
+    doc = f"<!doctype html><html><head><meta charset='utf-8'><title>VPE day card</title><style>{css}</style></head><body>{head}{''.join(x for x in S if x)}{foot}</body></html>"
+    hp = os.path.splitext(a.out)[0] + ".html"
+    open(hp, "w").write(doc)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            b = pw.chromium.launch()
+            pg = b.new_page()
+            pg.set_content(doc, wait_until="load")
+            pg.pdf(path=a.out, format="Letter", print_background=True, margin={"top": "0.33in", "bottom": "0.33in", "left": "0.33in", "right": "0.33in"})
+            b.close()
+    except Exception as ex_:
+        print(f"SHAREPDF: could not print the day card with Chromium ({type(ex_).__name__}: {str(ex_)[:120]}) -> short PDF instead; the full card is in {hp}")
+        return _sharepdf_short(a)
+    pages = n_ann = lonely = "?"
+    try:
+        from pypdf import PdfReader
+        rd = PdfReader(a.out)
+        pages, n_ann, lonely = len(rd.pages), 0, 0
+        heads = {"THE PLAY", "STRAIGHT BETS", "BOOK GAPS", "BOOSTS", "SHARED RISK", "FULL LOGIC, LEG BY LEG", "RUN STATUS", "OTHER BUILDS (REFERENCE ONLY)"}
+        for p_ in rd.pages:
+            n_ann += sum(1 for an in (p_.get("/Annots") or []) if "/URI" in str(an.get_object().get("/A", {})))
+            ls = [t.strip() for t in (p_.extract_text() or "").split("\n") if t.strip()]
+            lonely += 1 if ls and ls[-1].upper() in heads else 0
+    except Exception:
+        pass
+    held_shown = doc.count("HELD: not a VPE play")
+    ok = (n_ann == stats["links"]) if isinstance(n_ann, int) else True
+    print(f"SHAREPDF: day card -> {a.out} | {pages} pages | {len(cards)} logic cards | links {n_ann} working of {stats['links']} expected ({stats['nolinks']} bets without a link) "
+          f"| headings alone at a page end: {lonely} | HELD flags shown: {held_shown} | {'OK' if ok and lonely in (0, '?') else 'CHECK: fix before sending'}")
 
 
 def cmd_linediff(a):
@@ -4180,7 +4540,7 @@ def cmd_log(a):
         pb = blend_leg(pr, mp, mk, side)
         ex = hit[(hit["side"] == side) & (pd.to_numeric(hit["line"], errors="coerce") == float(line))]
         e0 = ex.iloc[0] if len(ex) else None
-        return {"prob": pb, "leg_prob": pb, "team": h["team"], "opp": h["opp"],
+        return {"held": held_reason(allp, player, mk, side, line), "prob": pb, "leg_prob": pb, "team": h["team"], "opp": h["opp"],
                 "rec_units": float(e0["units"]) if e0 is not None and pd.notna(e0.get("units")) else 0.0,
                 "min_odds": e0.get("min_odds") if e0 is not None and pd.notna(e0.get("tier")) and str(e0.get("tier")) not in ("", "nan") else None}, ""
 
@@ -6365,7 +6725,8 @@ if __name__ == "__main__":
     bgp_.add_argument("--out", default="bookgap.csv"); bgp_.add_argument("--sheet-out", default="bookgap_new.json"); bgp_.add_argument("--slip", default="slip.csv")
     sp2_ = sub.add_parser("sharepdf"); sp2_.add_argument("--all", default="bets_all.csv"); sp2_.add_argument("--bets", default="bets.csv"); sp2_.add_argument("--leans", default="leans.csv")
     sp2_.add_argument("--parlays", default="vpe_parlays.json"); sp2_.add_argument("--gaps", default="bookgap.csv"); sp2_.add_argument("--links", default="links.csv")
-    sp2_.add_argument("--out", default="VPE_picks.pdf"); sp2_.add_argument("--title"); sp2_.add_argument("--asof")
+    sp2_.add_argument("--out", default="VPE_day_card.pdf"); sp2_.add_argument("--title"); sp2_.add_argument("--asof")
+    sp2_.add_argument("--calib"); sp2_.add_argument("--source"); sp2_.add_argument("--status-file", default="status.txt"); sp2_.add_argument("--skip", default="")
     lk_ = sub.add_parser("links"); lk_.add_argument("--links", default="links.csv"); lk_.add_argument("--bets", default="bets.csv"); lk_.add_argument("--leans", default="leans.csv")
     lk_.add_argument("--parlays", default="vpe_parlays.json"); lk_.add_argument("--gaps", default="bookgap.csv")
     ld_ = sub.add_parser("linediff"); ld_.add_argument("--a", required=True, help="earlier props CSV"); ld_.add_argument("--b", required=True, help="later props CSV"); ld_.add_argument("--log"); ld_.add_argument("--date")
