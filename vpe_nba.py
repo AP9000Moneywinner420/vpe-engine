@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.33.0"
+VERSION = "NBA v2.34.0"
 
 # ==================== data ====================
 
@@ -3372,6 +3372,113 @@ def cmd_links(a):
     print(f"LINKS: {n} of {len(seen)} suggested bets have a link")
 
 
+def cmd_sharepdf(a):
+    """v2.34: a one-page (or two) shareable PDF of tonight's VPE picks: straight picks, the parlay(s) to place, leans and
+    book-gap takes, each with price, take-if, win chance and a tappable bet-slip link when the odds feed has one.
+    No stakes, no bankroll, nothing personal: safe to send to someone else."""
+    import json, subprocess, sys
+    try:
+        from reportlab.lib.pagesizes import letter
+    except ImportError:
+        print("SETUP: reportlab missing -> pip install reportlab")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "reportlab", "--break-system-packages"], check=False)
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    allp = pd.read_csv(a.all) if os.path.exists(a.all) else pd.DataFrame()
+    L = pd.read_csv(a.links) if a.links and os.path.exists(a.links) else pd.DataFrame(columns=["bet", "market", "line", "side", "book", "odds", "url"])
+    if len(L):
+        L["_k"] = L["bet"].map(norm_name); L["line"] = pd.to_numeric(L["line"], errors="coerce")
+    MKN = {"pts": "points", "reb": "rebounds", "ast": "assists", "fg3m": "threes", "pra": "pts+reb+ast", "pr": "pts+reb", "pa": "pts+ast",
+           "ra": "reb+ast", "stl": "steals", "blk": "blocks", "stocks": "steals+blocks", "tov": "turnovers", "spread": "spread", "ml": "moneyline", "total": "total"}
+    def label(pl, mk, sd, ln):
+        if mk == "ml":
+            return f"{pl} moneyline"
+        if mk == "spread":
+            return f"{pl} {float(ln):+g}"
+        return f"{pl} {sd} {float(ln):g} {MKN.get(mk, mk)}"
+    def row_of(pl, mk, sd, ln):
+        if not len(allp):
+            return None
+        h = allp[(allp["player"].map(norm_name) == norm_name(pl)) & (allp["market"] == mk) & (allp["side"] == sd)
+                 & ((pd.to_numeric(allp["line"], errors="coerce") - float(ln)).abs() < 1e-6)]
+        return h.iloc[0] if len(h) else None
+    def link(pl, mk, sd, ln, book=None):
+        if not len(L):
+            return ""
+        h = L[(L["_k"] == norm_name(pl)) & (L["market"] == mk) & (L["side"] == sd) & ((L["line"] - float(ln)).abs() < 1e-6)]
+        if book:
+            h = h[h["book"].astype(str).str.lower() == str(book).lower()]   # a parlay goes on one book: only that book's link
+        return " &nbsp; ".join(f'<link href="{r["url"]}" color="#1a56db"><u>Open at {BOOK_NAME.get(r["book"], r["book"])} ({int(r["odds"]):+d})</u></link>' for _, r in h.iterrows())
+    ss = getSampleStyleSheet()
+    H1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=18, spaceAfter=2, alignment=0)
+    H2 = ParagraphStyle("h2", parent=ss["Heading2"], fontSize=12, spaceBefore=10, spaceAfter=4)
+    P = ParagraphStyle("p", parent=ss["BodyText"], fontSize=9, leading=12)
+    SM = ParagraphStyle("sm", parent=P, fontSize=7.5, textColor=colors.HexColor("#555555"))
+    doc = SimpleDocTemplate(a.out, pagesize=letter, leftMargin=0.6 * inch, rightMargin=0.6 * inch, topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+                            title="VPE picks", author="VPE")
+    E = [Paragraph(f"VPE picks: {a.title or (str(allp['date'].iloc[0]) if len(allp) and 'date' in allp else '')}", H1),
+         Paragraph(f"NBA | prices as of {a.asof or 'the run'} | {VERSION}. Take a bet only at the listed take-if price or better: prices move.", SM)]
+    def table(rows, widths):
+        t = Table(rows, colWidths=widths, repeatRows=1)
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eeeeee")), ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                               ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LINEBELOW", (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
+                               ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+        return t
+    W = [2.5 * inch, 0.75 * inch, 0.8 * inch, 0.75 * inch, 2.5 * inch]
+    hdr = [Paragraph(f"<b>{x}</b>", P) for x in ("Bet", "Price", "Take-if", "Win chance", "Link")]
+    n_links = n_bets = 0
+    def bet_row(pl, mk, sd, ln, book=None, odds=None, takeif=None, prob=None):
+        nonlocal n_links, n_bets
+        r = row_of(pl, mk, sd, ln)
+        odds = odds if odds is not None else (int(r["odds"]) if r is not None and pd.notna(r["odds"]) else None)
+        prob = prob if prob is not None else (float(r["blend_prob"]) if r is not None else None)
+        takeif = None if takeif == "leg" else (takeif if takeif is not None else (int(r["min_odds"]) if r is not None and pd.notna(r.get("min_odds")) else None))
+        lk = link(pl, mk, sd, ln, book)
+        n_bets += 1; n_links += 1 if lk else 0
+        team = f" ({r['team']} vs {r['opp']})" if r is not None and mk not in GAME_MK else ""
+        return [Paragraph(label(pl, mk, sd, ln) + team, P), Paragraph(f"{odds:+d}" if odds is not None else "-", P),
+                Paragraph(f"{takeif:+d} or better" if takeif is not None else "see ticket", P), Paragraph(f"{prob:.0%}" if prob is not None else "-", P),
+                Paragraph(lk or "ladder / alt line: find it in the app", P)]
+    if a.bets and os.path.exists(a.bets):
+        b = pd.read_csv(a.bets)
+        if len(b):
+            E.append(Paragraph("Straight bets", H2))
+            E.append(table([hdr] + [bet_row(r["player"], r["market"], r["side"], r["line"]) for _, r in b.iterrows()], W))
+    if a.parlays and os.path.exists(a.parlays):
+        pj = json.load(open(a.parlays))
+        for p_ in [x for x in pj if x.get("recommended")] or pj[:1]:
+            tag = " (lean: no edge, the least-bad play)" if p_.get("lean") else ""
+            E.append(Paragraph(f"{p_.get('name', 'Parlay')} at {BOOK_NAME.get(p_.get('book'), p_.get('book', ''))}{tag}", H2))
+            bits = [f"about {int(p_['odds']):+d}" if p_.get("odds") is not None else "", f"take-if {int(p_['take_if']):+d} before any boost" if p_.get("take_if") is not None else "",
+                    f"hit chance {float(p_['hit']):.0%}" if p_.get("hit") is not None else "", f"boost {p_['boost_pct']:g}%" if p_.get("boost_pct") else ""]
+            E.append(Paragraph(" | ".join(x for x in bits if x) + ". All legs go on one ticket.", SM))
+            E.append(table([hdr] + [bet_row(l[0], l[1], l[2], l[3], book=p_.get("book"), takeif="leg") for l in p_.get("legs", [])], W))
+    if a.leans and os.path.exists(a.leans):
+        ln_ = pd.read_csv(a.leans)
+        if len(ln_):
+            E.append(Paragraph("Leans (no edge: the closest lines to break-even)", H2))
+            E.append(table([hdr] + [bet_row(r["player"], r["market"], r["side"], r["line"]) for _, r in ln_.iterrows()], W))
+    if a.gaps and os.path.exists(a.gaps):
+        g = pd.read_csv(a.gaps)
+        g = g[g["verdict"].astype(str).str.startswith("TAKE")]
+        if len(g):
+            E.append(Paragraph("Book gaps (this book's price beats the rest of the market)", H2))
+            rows = []
+            for _, r in g.iterrows():
+                pl = str(r["bet"]).split(" ")[0] if r["market"] in ("spread", "ml") else str(r["bet"]).split(" Over ")[0].split(" Under ")[0]
+                rows.append(bet_row(pl, r["market"], r["side"], r["line"], book=r["book"], odds=int(r["odds"]), takeif=int(r["odds"]),
+                                    prob=float(r["vpe_win"]) if pd.notna(r.get("vpe_win")) else float(r["other_fair"])))
+            E.append(table([hdr] + rows, W))
+    E += [Spacer(1, 10), Paragraph("How to read this: win chance is VPE's estimate, mixed from its own projection and the sportsbooks' prices. A link opens that "
+                                   "sportsbook's bet slip with the bet loaded; check the price there against the take-if before placing. "
+                                   "Information only, not betting advice. No outcome is guaranteed. 21+ and where legal.", SM)]
+    doc.build(E)
+    print(f"SHAREPDF: {n_bets} bets, {n_links} with a link -> {a.out}")
+
+
 def cmd_linediff(a):
     """v2.24 / v15.25: two recordings of the same night (or a recording vs the closing page): MAIN two-sided lines only
     (ladders are too noisy to compare: 11/16, 736 of 1,180 matched prices 'changed'). Shows real moves, flags jumps that
@@ -6256,6 +6363,9 @@ if __name__ == "__main__":
     bgp_.add_argument("--book-a", default="fanduel"); bgp_.add_argument("--book-b", default="draftkings")
     bgp_.add_argument("--games-a"); bgp_.add_argument("--games-b"); bgp_.add_argument("--fair"); bgp_.add_argument("--all", default="bets_all.csv"); bgp_.add_argument("--date")
     bgp_.add_argument("--out", default="bookgap.csv"); bgp_.add_argument("--sheet-out", default="bookgap_new.json"); bgp_.add_argument("--slip", default="slip.csv")
+    sp2_ = sub.add_parser("sharepdf"); sp2_.add_argument("--all", default="bets_all.csv"); sp2_.add_argument("--bets", default="bets.csv"); sp2_.add_argument("--leans", default="leans.csv")
+    sp2_.add_argument("--parlays", default="vpe_parlays.json"); sp2_.add_argument("--gaps", default="bookgap.csv"); sp2_.add_argument("--links", default="links.csv")
+    sp2_.add_argument("--out", default="VPE_picks.pdf"); sp2_.add_argument("--title"); sp2_.add_argument("--asof")
     lk_ = sub.add_parser("links"); lk_.add_argument("--links", default="links.csv"); lk_.add_argument("--bets", default="bets.csv"); lk_.add_argument("--leans", default="leans.csv")
     lk_.add_argument("--parlays", default="vpe_parlays.json"); lk_.add_argument("--gaps", default="bookgap.csv")
     ld_ = sub.add_parser("linediff"); ld_.add_argument("--a", required=True, help="earlier props CSV"); ld_.add_argument("--b", required=True, help="later props CSV"); ld_.add_argument("--log"); ld_.add_argument("--date")
@@ -6320,4 +6430,4 @@ if __name__ == "__main__":
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "pyarrow"], check=False)
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
      "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "scoreboard": cmd_scoreboard, "newsflash": cmd_newsflash, "close": cmd_close, "status": cmd_status, "styles": cmd_styles,
-     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "bookgap": cmd_bookgap, "links": cmd_links, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "sgpbuild": cmd_sgpbuild, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
+     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "bookgap": cmd_bookgap, "links": cmd_links, "sharepdf": cmd_sharepdf, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "sgpbuild": cmd_sgpbuild, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
