@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.30.0"
+VERSION = "NBA v2.31.0"
 
 # ==================== data ====================
 
@@ -2839,6 +2839,21 @@ def cmd_learn(a):
               + (f" (was {float(was):.0%})" if was not in (None, "") else " (first fit)"))
     else:
         print(f"  pick shrink: only {n} graded pool legs (needs {PICK['min_n']}) -> stays at the starting {PICK['k0']:.0%}")
+    # v2.31 SIDE WATCH (report only, nothing applied): on two-sided lines, when VPE leans Over vs Under, does the lean show up?
+    # 11/18 check: on ~5,000 graded lines there was no Over/Under difference worth a rule (two-sided: Over leans 140, said
+    # 49.3% hit 52.9%; Under leans 225, said 51.3% hit 48.9%; both inside 1 standard error), so the win-chance math is unchanged.
+    _both = (d["oo"].str.match(r"^[+-]?\d+(\.0)?$") & d["uo"].str.match(r"^[+-]?\d+(\.0)?$")).to_numpy()
+    _pk, _ov = d["pk"].to_numpy(), d["over"].to_numpy()
+    _sw = []
+    for side, m in (("Over", _both & (q - _pk > 0.005)), ("Under", _both & (q - _pk < -0.005))):
+        n_ = int(m.sum())
+        if n_ < 30:
+            _sw.append(f"{side} leans {n_} (too few)")
+            continue
+        said_ = float((q[m] if side == "Over" else 1 - q[m]).mean()); got_ = float((_ov[m] if side == "Over" else 1 - _ov[m]).mean())
+        z_ = (got_ - said_) / max(np.sqrt(said_ * (1 - said_) / n_), 1e-9)
+        _sw.append(f"{side} leans {n_}: said {said_:.1%} hit {got_:.1%} (z {z_:+.1f})" + (" FLAG for upgrade chat" if abs(z_) >= 2 and n_ >= 300 else ""))
+    print("  side watch (two-sided lines, report only): " + " | ".join(_sw))
     # v2.28: retune every 25 graded bets (KILL list), logged to the 'Tune log' tab
     pk_ = {str(r["key"]) for (kd, _), r in prev.items() if kd == "kill" and str(r["value"]).strip() in ("1", "1.0")}
     if not any(kd == "kill" for (kd, _) in prev):
@@ -3163,6 +3178,136 @@ def cmd_scoreboard(a):
             be_line(f"{mk}", x)
     npass = sum(v == "PASS" for _, v in lights)
     print("  SCOREBOARD: " + " | ".join(f"{k}: {v}" for k, v in lights) + f"  -> {npass} of 4 green")
+
+
+# ---------- v2.31: cross-book gap finder ----------
+# The book's price has been the best predictor (11/16 audit), so one honest way to an edge is a price at one of his
+# two books that is better than what the OTHER book says is fair. For every prop / game line both books post at the
+# same line: the other book's no-vig chance for that side minus the break-even of this book's price = the gap.
+BOOKGAP = {"take": 0.02, "watch": 0.01}
+BOOKGAP_COLS = ["date", "bet", "market", "side", "line", "book", "odds", "other_book", "other_fair", "gap", "vpe_win", "verdict", "result"]
+
+def _bg_props(path):
+    d = _read_loose_csv(path)
+    d["mk"] = d["market"].map(lambda m: canon_market(m) or str(m))
+    d["_k"] = d["player"].map(norm_name)
+    d["line"] = pd.to_numeric(d["line"], errors="coerce")
+    for c in ("over_odds", "under_odds"):
+        d[c] = d[c].map(_odds) if c in d else None
+    return d.dropna(subset=["line"])
+
+def _bg_games(path):
+    g = _read_loose_csv(path)
+    g["home"], g["away"] = g["home"].map(norm_team), g["away"].map(norm_team)
+    rows = []
+    for _, r in g.iterrows():
+        f = lambda c: _odds(r.get(c)) if c in g.columns else None
+        n = lambda c: pd.to_numeric(str(r.get(c)).replace("+", "").replace("PK", "0").replace("pk", "0"), errors="coerce") if c in g.columns else np.nan
+        hs, tot = n("home_spread"), n("total")
+        if pd.notna(hs):
+            rows.append({"player": r["home"], "_k": r["home"], "mk": "spread", "line": float(hs), "over_odds": f("spread_home_odds"), "under_odds": f("spread_away_odds"),
+                         "lab_o": f"{r['home']} {hs:+g}", "lab_u": f"{r['away']} {-hs:+g}"})
+        if pd.notna(tot):
+            mu = f"{r['away']}@{r['home']}"
+            rows.append({"player": mu, "_k": mu, "mk": "total", "line": float(tot), "over_odds": f("over_odds"), "under_odds": f("under_odds"),
+                         "lab_o": f"{mu} Over {tot:g}", "lab_u": f"{mu} Under {tot:g}"})
+        rows.append({"player": r["home"], "_k": r["home"], "mk": "ml", "line": 0.0, "over_odds": f("home_ml"), "under_odds": f("away_ml"),
+                     "lab_o": f"{r['home']} ML", "lab_u": f"{r['away']} ML"})
+    return pd.DataFrame(rows)
+
+def cmd_bookgap(a):
+    """Props and game lines posted at BOTH of his books at the same line: where one book's price beats the other book's
+    fair (no-vig) chance. TAKE = gap >= 2 pts and VPE's own win chance does not disagree. Rate + suggest; logged like picks."""
+    import json
+    na, nb = a.book_a.lower(), a.book_b.lower()
+    A, B = _bg_props(a.a), _bg_props(a.b)
+    for X in (A, B):
+        X["lab_o"] = X["player"].astype(str) + " Over " + X["line"].map("{:g}".format) + " " + X["mk"]
+        X["lab_u"] = X["player"].astype(str) + " Under " + X["line"].map("{:g}".format) + " " + X["mk"]
+    if a.games_a and a.games_b and os.path.exists(a.games_a) and os.path.exists(a.games_b):
+        A, B = pd.concat([A, _bg_games(a.games_a)], ignore_index=True), pd.concat([B, _bg_games(a.games_b)], ignore_index=True)
+    allp = pd.read_csv(a.all) if a.all and os.path.exists(a.all) else pd.DataFrame()
+    def vpe(k, mk, side, line):
+        if not len(allp):
+            return None, False
+        sd = "Over" if mk in ("spread", "ml") else side
+        h = allp[(allp["player"].map(norm_name) == norm_name(k)) & (allp["market"] == mk) & (allp["side"] == sd)
+                 & ((pd.to_numeric(allp["line"], errors="coerce") - line).abs() < 1e-6)]
+        if h.empty:
+            return None, False
+        r = h.iloc[0]
+        p = float(r["blend_prob"])
+        held = pd.notna(r.get("market_gap")) and float(r["market_gap"]) > CONFIG["model"]["max_market_gap"]
+        return p, bool(held)
+    key = ["_k", "mk", "line"]
+    M = A.drop_duplicates(key).merge(B.drop_duplicates(key), on=key, suffixes=("_a", "_b"))
+    rows, arbs = [], []
+    date = a.date or str(today_et().date())
+    for _, r in M.iterrows():
+        oa, ua, ob, ub = r["over_odds_a"], r["under_odds_a"], r["over_odds_b"], r["under_odds_b"]
+        ok = lambda x: x is not None and not pd.isna(x)
+        fa = implied_prob(oa) / (implied_prob(oa) + implied_prob(ua)) if ok(oa) and ok(ua) else None   # book a's fair P(over side)
+        fb = implied_prob(ob) / (implied_prob(ob) + implied_prob(ub)) if ok(ob) and ok(ub) else None
+        mk, line = r["mk"], float(r["line"])
+        for side, price, bk, ref, refbk, lab in (("Over", oa, na, fb, nb, r["lab_o_a"]), ("Under", ua, na, None if fb is None else 1 - fb, nb, r["lab_u_a"]),
+                                                 ("Over", ob, nb, fa, na, r["lab_o_a"]), ("Under", ub, nb, None if fa is None else 1 - fa, na, r["lab_u_a"])):
+            if not ok(price) or ref is None or abs(float(price)) < 100:
+                continue
+            price = int(price)
+            gap = ref - implied_prob(price)
+            if gap < BOOKGAP["watch"]:
+                continue
+            # a spread / ml "Under" row is the other team: look it up as that team's own row
+            pl_, sd_, ln_ = (r["player_a"] if mk not in GAME_MK else r["_k"]), side, line
+            if mk in ("spread", "ml"):   # the "Under" side of a spread / ml row is the other team: store it as that team's own row
+                pl_, sd_, ln_ = (lab.split(" ")[0], "Over", (-line if mk == "spread" else 0.0)) if side == "Under" else (r["_k"], "Over", line)
+            pv, held = vpe(pl_, mk, sd_, ln_)
+            if price <= KILL["short_odds"] and _killed(odds=price):
+                verdict = "KILL price (-130 or shorter): boost leg only"
+            elif price < PARLAY["min_odds"]:
+                verdict = "skip: shorter than -200"
+            elif held:
+                verdict = "HELD by VPE (model vs market gap): skip"
+            elif gap >= BOOKGAP["take"] and (pv is None or pv >= implied_prob(price)):
+                verdict = "TAKE" + ("" if pv is not None else " (VPE has no number: book gap only)")
+            elif gap >= BOOKGAP["take"]:
+                verdict = "WATCH: VPE's own chance is under break-even"
+            else:
+                verdict = "WATCH"
+            rows.append({"date": date, "bet": lab, "market": mk, "side": sd_, "line": ln_, "book": bk, "odds": price, "other_book": refbk,
+                         "other_fair": round(ref, 3), "gap": round(gap, 3), "vpe_win": None if pv is None else round(pv, 3), "verdict": verdict, "result": "",
+                         "_k": pl_})
+        if ok(oa) and ok(ub) and 1 / american_to_decimal(oa) + 1 / american_to_decimal(ub) < 0.999:
+            arbs.append(f"{r['lab_o_a']} {int(oa):+d} at {na} + {r['lab_u_a']} {int(ub):+d} at {nb}: both sides together return {1 / (1 / american_to_decimal(oa) + 1 / american_to_decimal(ub)) - 1:+.1%} whatever happens")
+        if ok(ob) and ok(ua) and 1 / american_to_decimal(ob) + 1 / american_to_decimal(ua) < 0.999:
+            arbs.append(f"{r['lab_o_a']} {int(ob):+d} at {nb} + {r['lab_u_a']} {int(ua):+d} at {na}: both sides together return {1 / (1 / american_to_decimal(ob) + 1 / american_to_decimal(ua)) - 1:+.1%} whatever happens")
+    out = pd.DataFrame(rows, columns=BOOKGAP_COLS + ["_k"]).sort_values("gap", ascending=False)
+    # different main lines for the same player / stat = a middle chance (two-sided at both books)
+    two = lambda X: X[X["over_odds"].notna() & X["under_odds"].notna() & ~X["mk"].isin(["ml"])].drop_duplicates(["_k", "mk"])
+    D = two(A).merge(two(B), on=["_k", "mk"], suffixes=("_a", "_b"))
+    D = D[(D["line_a"] - D["line_b"]).abs() >= 0.5]
+    pd.set_option("display.width", 250)
+    print(f"BOOK GAPS [{VERSION}] {na} vs {nb}: {len(M)} lines posted at both books at the same line | {len(out)} where one price beats the other book's fair chance by {BOOKGAP['watch']:.0%}+")
+    print(f"  TAKE = gap >= {BOOKGAP['take']:.0%} and VPE's own win chance is at or above break-even. Unproven edge: every row is saved to the 'Book gaps' tab and judged by results.")
+    if len(out):
+        print(out[BOOKGAP_COLS[1:-1]].head(25).to_string(index=False))
+    else:
+        print("  none tonight: the two books agree within their vig on every shared line")
+    for x in arbs[:8]:
+        print("  BOTH-SIDES GAP: " + x)
+    if len(D):
+        print(f"\n  DIFFERENT LINES ({len(D)}): same player and stat, the books disagree on the line itself (a middle chance; `check` prints MIDDLES when both are in props.csv):")
+        for _, r in D.head(12).iterrows():
+            print(f"    {r['player_a']} {r['mk']}: {na} {r['line_a']:g} ({int(r['over_odds_a']):+d}/{int(r['under_odds_a']):+d}) vs {nb} {r['line_b']:g} ({int(r['over_odds_b']):+d}/{int(r['under_odds_b']):+d})")
+    take = out[out["verdict"].str.startswith("TAKE")] if len(out) else out
+    print(f"\nBOOKGAP: {len(M)} shared lines, {len(take)} TAKE, {len(out) - len(take)} watch/skip, {len(arbs)} both-sides gaps, {len(D)} different lines")
+    out[BOOKGAP_COLS].to_csv(a.out, index=False)
+    json.dump([[("" if (isinstance(v, float) and math.isnan(v)) or v is None else v) for v in r] for r in out[BOOKGAP_COLS].itertuples(index=False, name=None)], open(a.sheet_out, "w"))
+    if len(take) and a.slip and os.path.exists(a.slip):   # a TAKE is a VPE suggestion: `log` marks it suggested = yes
+        s = pd.read_csv(a.slip)
+        add = pd.DataFrame({"player": take["_k"].to_list(), "market": take["market"].to_list(), "side": take["side"].to_list(), "kind": "pick"})
+        pd.concat([s, add], ignore_index=True).drop_duplicates(["player", "market", "side"]).to_csv(a.slip, index=False)
+    print(f"saved -> {a.out} | rows for the 'Book gaps' tab -> {a.sheet_out}")
 
 
 def cmd_linediff(a):
@@ -6029,6 +6174,10 @@ if __name__ == "__main__":
     mn.add_argument("--calib", default="calib_tab.json")
     nf_ = sub.add_parser("newsflash"); nf_.add_argument("--all", default="bets_all.csv"); nf_.add_argument("--prev"); nf_.add_argument("--runs", default="runs"); nf_.add_argument("--min-move", type=float, default=0.03); nf_.add_argument("--min-edge", type=float, default=0.0); nf_.add_argument("--top", type=int, default=12)
     sbp_ = sub.add_parser("scoreboard"); sbp_.add_argument("--log", default="nba_pick_log.csv"); sbp_.add_argument("--shadow", nargs="*"); sbp_.add_argument("--calib", default="calib_tab.json"); sbp_.add_argument("--since"); sbp_.add_argument("--since-week")
+    bgp_ = sub.add_parser("bookgap"); bgp_.add_argument("--a", required=True); bgp_.add_argument("--b", required=True)
+    bgp_.add_argument("--book-a", default="fanduel"); bgp_.add_argument("--book-b", default="draftkings")
+    bgp_.add_argument("--games-a"); bgp_.add_argument("--games-b"); bgp_.add_argument("--all", default="bets_all.csv"); bgp_.add_argument("--date")
+    bgp_.add_argument("--out", default="bookgap.csv"); bgp_.add_argument("--sheet-out", default="bookgap_new.json"); bgp_.add_argument("--slip", default="slip.csv")
     ld_ = sub.add_parser("linediff"); ld_.add_argument("--a", required=True, help="earlier props CSV"); ld_.add_argument("--b", required=True, help="later props CSV"); ld_.add_argument("--log"); ld_.add_argument("--date")
     ex2_ = sub.add_parser("exposure"); ex2_.add_argument("--log", default="nba_pick_log.csv"); ex2_.add_argument("--date"); ex2_.add_argument("--week")
     sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
@@ -6091,4 +6240,4 @@ if __name__ == "__main__":
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "pyarrow"], check=False)
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
      "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "scoreboard": cmd_scoreboard, "newsflash": cmd_newsflash, "close": cmd_close, "status": cmd_status, "styles": cmd_styles,
-     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "sgpbuild": cmd_sgpbuild, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
+     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "bookgap": cmd_bookgap, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "sgpbuild": cmd_sgpbuild, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
