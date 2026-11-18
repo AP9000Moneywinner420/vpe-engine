@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.32.0"
+VERSION = "NBA v2.33.0"
 
 # ==================== data ====================
 
@@ -1276,8 +1276,10 @@ LOCK = {"on": False, "books": ""}
 
 def detect_lock(books):
     b = pd.Series(books).astype(str).str.lower().str.replace(" ", "", regex=False)
-    on = len(b) > 0 and b.isin(["draftkings", "fanduel"]).all()
-    LOCK["on"], LOCK["books"] = bool(on), " + ".join(sorted({BOOK_NAME_L.get(x, x) for x in b.unique()})) if on else ""
+    # v2.33: an "over book/under book" pair made only of his two books (the odds feed's DK + FD merge) is still his exact price
+    parts = {x for v in b.unique() for x in str(v).split("/")}
+    on = len(b) > 0 and parts <= {"draftkings", "fanduel"}
+    LOCK["on"], LOCK["books"] = bool(on), " + ".join(sorted({BOOK_NAME_L.get(x, x) for x in parts})) if on else ""
     return LOCK["on"]
 
 def lock_from(allp):
@@ -3239,8 +3241,22 @@ def cmd_bookgap(a):
         p = float(r["blend_prob"])
         held = pd.notna(r.get("market_gap")) and float(r["market_gap"]) > CONFIG["model"]["max_market_gap"]
         return p, bool(held)
+    FAIR = {}
+    if getattr(a, "fair", None) and os.path.exists(a.fair):
+        fr = pd.read_csv(a.fair)
+        col = {"draftkings": ("fair_ex_dk", "n_ex_dk"), "fanduel": ("fair_ex_fd", "n_ex_fd")}
+        for _, x in fr.iterrows():
+            e = {}
+            for bkn in (na, nb):
+                if bkn in col and pd.notna(x.get(col[bkn][0])) and pd.notna(x.get(col[bkn][1])) and int(x[col[bkn][1]]) >= 2:
+                    e[bkn], e["n_" + bkn] = float(x[col[bkn][0]]), int(x[col[bkn][1]])
+            if e:
+                FAIR[(norm_name(x["player"]), canon_market(x["market"]) or str(x["market"]), float(x["line"]))] = e
     key = ["_k", "mk", "line"]
-    M = A.drop_duplicates(key).merge(B.drop_duplicates(key), on=key, suffixes=("_a", "_b"))
+    M = A.drop_duplicates(key).merge(B.drop_duplicates(key), on=key, suffixes=("_a", "_b"), how="outer" if FAIR else "inner")
+    for c_ in ("lab_o", "lab_u", "player"):   # a line only one book posts can still be judged against the other books
+        if c_ + "_a" in M and c_ + "_b" in M:
+            M[c_ + "_a"] = M[c_ + "_a"].fillna(M[c_ + "_b"])
     rows, arbs = [], []
     date = a.date or str(today_et().date())
     for _, r in M.iterrows():
@@ -3249,8 +3265,15 @@ def cmd_bookgap(a):
         fa = implied_prob(oa) / (implied_prob(oa) + implied_prob(ua)) if ok(oa) and ok(ua) else None   # book a's fair P(over side)
         fb = implied_prob(ob) / (implied_prob(ob) + implied_prob(ub)) if ok(ob) and ok(ub) else None
         mk, line = r["mk"], float(r["line"])
-        for side, price, bk, ref, refbk, lab in (("Over", oa, na, fb, nb, r["lab_o_a"]), ("Under", ua, na, None if fb is None else 1 - fb, nb, r["lab_u_a"]),
-                                                 ("Over", ob, nb, fa, na, r["lab_o_a"]), ("Under", ub, nb, None if fa is None else 1 - fa, na, r["lab_u_a"])):
+        refa, refb = na, nb
+        fx = FAIR.get((r["_k"], mk, line))
+        if fx:   # v2.33: judge each book against the average no-vig chance of the OTHER books in the feed (2+ books)
+            if fx.get(na) is not None:
+                fb, refb = fx[na], f"{fx['n_' + na]} other books"      # reference for a bet placed at book a
+            if fx.get(nb) is not None:
+                fa, refa = fx[nb], f"{fx['n_' + nb]} other books"      # reference for a bet placed at book b
+        for side, price, bk, ref, refbk, lab in (("Over", oa, na, fb, refb, r["lab_o_a"]), ("Under", ua, na, None if fb is None else 1 - fb, refb, r["lab_u_a"]),
+                                                 ("Over", ob, nb, fa, refa, r["lab_o_a"]), ("Under", ub, nb, None if fa is None else 1 - fa, refa, r["lab_u_a"])):
             if not ok(price) or ref is None or abs(float(price)) < 100:
                 continue
             price = int(price)
@@ -3308,6 +3331,45 @@ def cmd_bookgap(a):
         add = pd.DataFrame({"player": take["_k"].to_list(), "market": take["market"].to_list(), "side": take["side"].to_list(), "kind": "pick"})
         pd.concat([s, add], ignore_index=True).drop_duplicates(["player", "market", "side"]).to_csv(a.slip, index=False)
     print(f"saved -> {a.out} | rows for the 'Book gaps' tab -> {a.sheet_out}")
+
+
+def cmd_links(a):
+    """v2.33: one-tap bet-slip links (from the odds feed's links.csv) for every bet VPE suggests tonight: straight picks,
+    the parlay's legs, leans and BOOK GAP takes. A link opens that book's bet slip with the line loaded."""
+    import json
+    if not (a.links and os.path.exists(a.links)):
+        print("LINKS: no links file (the odds feed was not used this run) -> he opens the bets in the app as usual")
+        return
+    L = pd.read_csv(a.links)
+    L["_k"] = L["bet"].map(norm_name); L["line"] = pd.to_numeric(L["line"], errors="coerce")
+    want = []
+    for p_ in (a.bets, a.leans):
+        if p_ and os.path.exists(p_):
+            b = pd.read_csv(p_)
+            want += [(r["player"], r["market"], r["side"], float(r["line"]), "pick" if p_ == a.bets else "lean") for _, r in b.iterrows()]
+    if a.parlays and os.path.exists(a.parlays):
+        for pj in json.load(open(a.parlays)):
+            want += [(l[0], l[1], l[2], float(l[3]), pj.get("name", "parlay")) for l in pj.get("legs", [])]
+    if a.gaps and os.path.exists(a.gaps):
+        g = pd.read_csv(a.gaps)
+        g = g[g["verdict"].astype(str).str.startswith("TAKE")]
+        want += [(str(r["bet"]).split(" Over ")[0].split(" Under ")[0] if r["market"] not in ("spread", "ml") else str(r["bet"]).split(" ")[0],
+                  r["market"], r["side"], float(r["line"]), "book gap") for _, r in g.iterrows()]
+    seen, n = set(), 0
+    print("BET LINKS (tap to open the bet slip; check the price against the take-if before you place it):")
+    for pl, mk, sd, ln, why in want:
+        k = (norm_name(pl), mk, sd, ln)
+        if k in seen:
+            continue
+        seen.add(k)
+        h = L[(L["_k"] == k[0]) & (L["market"] == mk) & (L["side"] == sd) & ((L["line"] - ln).abs() < 1e-6)]
+        lab = f"{pl} {'' if mk in ('spread', 'ml') else sd + ' '}{ln:g} {mk}" if mk != "ml" else f"{pl} ML"
+        if h.empty:
+            print(f"  {lab} [{why}]: no link for this line (ladder / alt line): open it in the app")
+            continue
+        n += 1
+        print(f"  {lab} [{why}]: " + " | ".join(f"{BOOK_NAME.get(r['book'], r['book'])} {int(r['odds']):+d} {r['url']}" for _, r in h.iterrows()))
+    print(f"LINKS: {n} of {len(seen)} suggested bets have a link")
 
 
 def cmd_linediff(a):
@@ -6192,8 +6254,10 @@ if __name__ == "__main__":
     sbp_ = sub.add_parser("scoreboard"); sbp_.add_argument("--log", default="nba_pick_log.csv"); sbp_.add_argument("--shadow", nargs="*"); sbp_.add_argument("--calib", default="calib_tab.json"); sbp_.add_argument("--since"); sbp_.add_argument("--since-week")
     bgp_ = sub.add_parser("bookgap"); bgp_.add_argument("--a", required=True); bgp_.add_argument("--b", required=True)
     bgp_.add_argument("--book-a", default="fanduel"); bgp_.add_argument("--book-b", default="draftkings")
-    bgp_.add_argument("--games-a"); bgp_.add_argument("--games-b"); bgp_.add_argument("--all", default="bets_all.csv"); bgp_.add_argument("--date")
+    bgp_.add_argument("--games-a"); bgp_.add_argument("--games-b"); bgp_.add_argument("--fair"); bgp_.add_argument("--all", default="bets_all.csv"); bgp_.add_argument("--date")
     bgp_.add_argument("--out", default="bookgap.csv"); bgp_.add_argument("--sheet-out", default="bookgap_new.json"); bgp_.add_argument("--slip", default="slip.csv")
+    lk_ = sub.add_parser("links"); lk_.add_argument("--links", default="links.csv"); lk_.add_argument("--bets", default="bets.csv"); lk_.add_argument("--leans", default="leans.csv")
+    lk_.add_argument("--parlays", default="vpe_parlays.json"); lk_.add_argument("--gaps", default="bookgap.csv")
     ld_ = sub.add_parser("linediff"); ld_.add_argument("--a", required=True, help="earlier props CSV"); ld_.add_argument("--b", required=True, help="later props CSV"); ld_.add_argument("--log"); ld_.add_argument("--date")
     ex2_ = sub.add_parser("exposure"); ex2_.add_argument("--log", default="nba_pick_log.csv"); ex2_.add_argument("--date"); ex2_.add_argument("--week")
     sw_ = sub.add_parser("sweep"); sw_.add_argument("--all", default="bets_all.csv"); sw_.add_argument("--bets", default="bets.csv")
@@ -6256,4 +6320,4 @@ if __name__ == "__main__":
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "pyarrow"], check=False)
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
      "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "scoreboard": cmd_scoreboard, "newsflash": cmd_newsflash, "close": cmd_close, "status": cmd_status, "styles": cmd_styles,
-     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "bookgap": cmd_bookgap, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "sgpbuild": cmd_sgpbuild, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
+     "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "bookgap": cmd_bookgap, "links": cmd_links, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "sgpbuild": cmd_sgpbuild, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
