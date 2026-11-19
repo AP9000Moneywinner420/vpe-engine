@@ -24,16 +24,22 @@ jobs:
         run: |
           if [ -z "$TOKEN" ]; then echo "VPE_ODDS_DISPATCH_TOKEN is not set: nothing to do"; exit 0; fi
           end=$(( $(date +%s) + 19200 ))   # 5 h 20 min, then hand over to a fresh run
+          # awake = 8 AM to 1 AM Eastern (so the morning task can start it early); pokes only 11 AM to 1 AM
+          awake() { h=$(TZ=America/New_York date +%-H); [ "$h" -ge 8 ] || [ "$h" -lt 1 ]; }
           inside() { h=$(TZ=America/New_York date +%-H); [ "$h" -ge 11 ] || [ "$h" -lt 1 ]; }
-          while [ "$(date +%s)" -lt "$end" ] && inside; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-              -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/AP9000Moneywinner420/vpe-odds/actions/workflows/feed.yml/dispatches -d '{"ref":"main"}')
-            echo "$(TZ=America/New_York date '+%H:%M ET') feed poke -> HTTP $code"
+          while [ "$(date +%s)" -lt "$end" ] && awake; do
+            if inside; then
+              code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/AP9000Moneywinner420/vpe-odds/actions/workflows/feed.yml/dispatches -d '{"ref":"main"}')
+              echo "$(TZ=America/New_York date '+%H:%M ET') feed poke -> HTTP $code"
+            else
+              echo "$(TZ=America/New_York date '+%H:%M ET') waiting for 11 AM"
+            fi
             sleep 1200
           done
-          if inside; then
+          if awake; then
             gh api -X POST repos/${{ github.repository }}/actions/workflows/clock.yml/dispatches -f ref=main && echo "handed over to a fresh clock run"
           else
-            echo "outside game hours: clock stops until tomorrow"
+            echo "after 1 AM: clock stops until tomorrow"
           fi
