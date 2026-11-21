@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.35.0"
+VERSION = "NBA v2.36.0"
 
 # ==================== data ====================
 
@@ -904,7 +904,12 @@ def project(state, sl, outs, rosters, cfg, flags=None, sure=None, limited=None, 
         sl["af_" + s] = af
         if flags.get("dvp", True) and len(state.dvp):
             idx = pd.MultiIndex.from_arrays([sl["opp"], sl["pos"]])
-            dv = state.dvp[s].reindex(idx).fillna(1.0).to_numpy()
+            # v2.36 (research desk 11/20, re-tested in the engine): made threes are rated by the 3-point ATTEMPTS a defense
+            # allows to the position, not the makes. The 3P% a defense "allows" is mostly luck and does not carry over;
+            # attempts allowed do. Walk-forward on 34,007 player-games (2024-25, 2025-26, 2026-27): the attempts factor had
+            # lower error in all three seasons (pooled 3.9 SE), and it is ~110% real vs ~69% for the makes factor.
+            _dc = "fg3a" if s == "fg3m" and "fg3a" in state.dvp.columns else s
+            dv = state.dvp[_dc].reindex(idx).fillna(1.0).to_numpy()
         else:
             dv = 1.0
         rate = P["r_" + s].reindex(sl.index).to_numpy() * sl["u_" + s].to_numpy()
