@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.36.0"
+VERSION = "NBA v2.37.0"
 
 # ==================== data ====================
 
@@ -4771,6 +4771,22 @@ def fit_game_w(hist_path):
         d = pd.DataFrame([list(r) + [""] * (len(vals[0]) - len(r)) for r in vals[1:]], columns=vals[0])
         for c in ("model_margin", "model_total", "home_spread", "total", "act_margin", "act_total"):
             d[c] = pd.to_numeric(d[c], errors="coerce")
+        # v2.37: the tab is not trusted blindly. (1) A night saved more than once (11/18 was saved three times) counts once:
+        # one row per date + matchup, the latest line. (2) Results are re-read from the final scores, so a wrong or
+        # missing grade in the tab cannot bend the learned weight (11/18 WSH@TOR was typed in as +28 / 224; it was -4 / 202).
+        d["home"], d["away"] = d["home"].map(norm_team), d["away"].map(norm_team)
+        n_raw = len(d)
+        d = d.drop_duplicates(["date", "away", "home"], keep="last").copy()
+        fixed = 0
+        for i, r in d.iterrows():
+            sc = _game_scores(str(r["date"])[:10])
+            if r["home"] in sc and f"{r['away']}@{r['home']}" in sc:
+                am_, at_ = sc[r["home"]], sc[f"{r['away']}@{r['home']}"]
+                if pd.isna(r["act_margin"]) or abs(float(r["act_margin"]) - am_) > 0.01 or pd.isna(r["act_total"]) or abs(float(r["act_total"]) - at_) > 0.01:
+                    fixed += 1
+                d.loc[i, ["act_margin", "act_total"]] = [am_, at_]
+        if n_raw != len(d) or fixed:
+            print(f"  game-line history: {n_raw} rows in the tab -> {len(d)} games after removing repeats; {fixed} results re-read from the final score")
         g = d.dropna(subset=["act_margin", "model_margin", "home_spread"])
         grid = np.arange(0, 0.61, 0.05)
         def best(mod, mkt, act):
@@ -4949,6 +4965,16 @@ def cmd_games(a):
             leg("ml", away, home, False, "Over", 0.0, r.get("away_ml"), r.get("home_ml"), f"{away} ML")
         log.append([str(date.date()), away, home, round(m_mod, 2), round(t_mod, 2),
                     "" if pd.isna(hs) else float(hs), "" if pd.isna(tot) else float(tot), (inj_note + (f" rest {rshift:+.1f}" if rshift else "")).strip(), "", ""])
+    # v2.37: only games not already in the 'Games NBA' tab for this date go into games_log.json, so a rerun never saves a night twice
+    n_log = len(log)
+    try:
+        if getattr(a, "hist", None) and os.path.exists(a.hist):
+            hv = _values(a.hist)
+            hi = {c: k for k, c in enumerate(hv[0])}
+            have = {(str(r[hi["date"]])[:10], norm_team(r[hi["away"]]), norm_team(r[hi["home"]])) for r in hv[1:] if len(r) > max(hi["date"], hi["away"], hi["home"])}
+            log = [r for r in log if (r[0], r[1], r[2]) not in have]
+    except Exception as e:
+        print(f"  ! could not check the tab for repeats ({e}): appending all rows")
     out = pd.DataFrame(rows)
     # one straight game-line pick per game (the best edge); the rest stay scored and can still be parlay / boost legs
     if len(out):
@@ -4980,7 +5006,8 @@ def cmd_games(a):
             add = picks.reindex(columns=list(b0.columns) if len(b0.columns) else cols)
             pd.concat([b0, add], ignore_index=True).to_csv(bp, index=False)
         print(f"MERGED: {len(out)} game-line rows -> {a.all} ({len(picks)} picks -> {bp or 'no bets file'}). Run parlay / explain / menu AFTER this.")
-    print(f"saved -> {a.out} | ratings log rows -> {a.log_out} (append to 'Games NBA'; grade with gamesgrade)")
+    print(f"saved -> {a.out} | GAMES LOG: {len(log)} new rows -> {a.log_out} ({n_log - len(log)} of tonight's games already in 'Games NBA': not repeated)"
+          + ("" if getattr(a, "hist", None) else " | no --hist given: check the tab for tonight's date before appending"))
 
 GAMES_COLS = ["date", "away", "home", "model_margin", "model_total", "home_spread", "total", "injuries", "act_margin", "act_total"]
 
