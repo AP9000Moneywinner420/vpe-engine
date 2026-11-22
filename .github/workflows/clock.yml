@@ -31,7 +31,7 @@ jobs:
             if inside; then
               code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
                 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
-                https://api.github.com/repos/AP9000Moneywinner420/vpe-odds/actions/workflows/feed.yml/dispatches -d '{"ref":"main"}')
+                https://api.github.com/repos/AP9000Moneywinner420/vpe-odds/actions/workflows/feed.yml/dispatches -d '{"ref":"main","inputs":{"src":"clock"}}')
               echo "$(TZ=America/New_York date '+%H:%M ET') feed poke -> HTTP $code"
             else
               echo "$(TZ=America/New_York date '+%H:%M ET') waiting for 11 AM"
