@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.38.0"
+VERSION = "NBA v2.39.0"
 
 # ==================== data ====================
 
@@ -4235,7 +4235,24 @@ def load_calib_table(table, sport):
 # ---------- profit boosts: the one edge that holds even if the model has none ----------
 # At market prices a 2-3 leg parlay is +EV with a 20%+ boost and a 4-leg with 25%+; 5 legs needs ~30%. So a boost goes
 # on its own short parlay (most likely legs, checked +EV at market-only odds), not on the 10x parlay.
-def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, max_win=None, need_market_ev=True):
+def boost_stake_frac(p, dec_eff, cap=0.05):
+    """Share of bankroll VPE would put on a boost build: the usual 5%, or half-Kelly when the build is long enough that
+    half-Kelly is smaller. A build that is not +EV keeps 5% (its score stays negative, as before)."""
+    ev_ = p * dec_eff - 1
+    return min(cap, 0.5 * ev_ / (dec_eff - 1)) if ev_ > 0 and dec_eff > 1 else cap
+
+
+def boost_parlay(*a, **k):
+    """v2.39: the usual search first (score at a flat 5% stake, unchanged). Only when that finds nothing that is +EV does
+    it look again with the score taken at the stake that fits a long build (half-Kelly). Before, a boost whose own terms
+    force long odds ("4+ legs, +400 or longer") could never score above zero and was always told SAVE IT (11/22)."""
+    r = _boost_parlay_core(*a, **k)
+    if r is None and k.get("need_market_ev", True) and (len(a) < 9 or a[8]):
+        r = _boost_parlay_core(*a, **dict(k, fitted=True))
+    return r
+
+
+def _boost_parlay_core(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, max_win=None, need_market_ev=True, fitted=False):
     col = "dec_" + book
     # low-vig legs first: value at market odds (no-vig chance x this book's price), not the shortest prices
     ranked = pool.assign(_mv=pool["market_prob"] * pool[col] * (1 + pool["market"].map(BOOST_PREF).fillna(0.0) / 6)
@@ -4270,7 +4287,8 @@ def boost_parlay(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, 
             if need_market_ev and p_mkt * dec_eff < 1:  # must be +EV even if the model adds nothing
                 continue
             # least risk for the payout: maximize long-run bankroll growth at a 5% stake (penalizes longshots)
-            g = p * math.log(1 + 0.05 * (dec_eff - 1)) + (1 - p) * math.log(0.95)
+            f_ = boost_stake_frac(p, dec_eff) if fitted else 0.05   # v2.39: fitted = second look for long builds only
+            g = p * math.log(1 + f_ * (dec_eff - 1)) + (1 - p) * math.log(1 - f_)
             if g > 0:  # v2.22: on close calls prefer threes / PRA legs (+3% of the growth score per leg)
                 g *= 1 + sum(BOOST_PREF.get(c["market"], 0.0) for c in combo)
             ml = min(float(c.get("leg_edge", 0) or 0) for c in combo)
@@ -6182,30 +6200,43 @@ def parlay_take_if(p, boost=0.0, p_mkt=None):
 
 
 def parse_boosts(spec):
-    """--boosts "fd30:3leg:+100:win25,fd25,dk30": book + % and optional rules per boost: Nleg = min legs, maxN = max
-    legs, +X/-X = min total odds, winN = max extra winnings ($), any = no rules beyond the defaults (rules confirmed)."""
+    """--boosts "fd30:3leg:+100:win25,fd25,dk30:4leg:+400": book + % and that boost's own terms, read off the boost.
+    Terms (v2.39: forgiving spellings, more terms, and an unreadable term STOPS that boost instead of being ignored):
+      4leg / 4+legs / min4leg = minimum legs · max6 = maximum legs · +400 / 400 / 400+ = minimum TOTAL odds before the boost
+      leg-200 / each-200 = every leg at this price or longer · props = player props only · games = game lines only
+      win25 = extra winnings capped at $25 · maxbet10 = most that can be staked · any = the boost has no terms."""
     out = []
     for tok in [t.strip() for t in (spec or "").split(",") if t.strip()]:
         parts = tok.lower().replace(" ", "").split(":")
         m = re.match(r"^(fd|fanduel|dk|draftkings)(\d+(?:\.\d+)?)%?$", parts[0])
         if not m:
-            print(f"BOOSTS: can't read '{tok}' (format: fd30, dk25:3leg:+100:win25)")
+            print(f"BOOSTS: can't read '{tok}' (format: fd30, dk25:4leg:+400:leg-200:win25)")
             continue
         b = {"book": "fanduel" if m.group(1).startswith("f") else "draftkings", "pct": float(m.group(2)),
              "label": tok, "given": len(parts) > 1}
-        for q in parts[1:]:
-            if re.fullmatch(r"\d+leg?s?", q):
-                b["min_legs"] = int(re.match(r"\d+", q).group())
-            elif re.fullmatch(r"max\d+", q):
-                b["max_legs"] = int(q[3:])
-            elif re.fullmatch(r"[+-]\d+", q):
-                b["min_odds"] = float(q)
+        for q0 in parts[1:]:
+            q = q0.replace("legs", "leg")
+            if re.fullmatch(r"(?:min)?\d+\+?leg\+?", q):
+                b["min_legs"] = int(re.search(r"\d+", q).group())
+            elif re.fullmatch(r"max\d+(?:leg)?", q):
+                b["max_legs"] = int(re.search(r"\d+", q).group())
+            elif re.fullmatch(r"(?:legmin|leg|each)[+-]\d{3,}", q):
+                b["leg_min"] = float(re.search(r"[+-]\d+", q).group())
+            elif re.fullmatch(r"(?:min)?[+-]?\d{3,}\+?", q):
+                b["min_odds"] = float(re.search(r"[+-]?\d+", q).group())
             elif re.fullmatch(r"win\d+(\.\d+)?", q):
                 b["max_win"] = float(q[3:])
-            elif q == "sgp":  # v2.23: same-game-only boost (FD "3+ leg SGP"): built by `sgpbuild`, not `parlay`
+            elif re.fullmatch(r"(?:maxbet|bet|stake)\d+(\.\d+)?", q):
+                b["max_bet"] = float(re.search(r"\d+(\.\d+)?", q).group())
+            elif q in ("props", "propsonly", "playerprops"):
+                b["only"] = "props"
+            elif q in ("games", "gamelines", "gamesonly"):
+                b["only"] = "games"
+            elif q == "sgp":  # same-game-only boost (FD "3+ leg SGP"): built by `sgpbuild`, not `parlay`
                 b["sgp"] = True
             elif q not in ("any", "norules"):
-                print(f"BOOSTS: ignored '{q}' in {tok}")
+                b.setdefault("bad", []).append(q0)
+                print(f"BOOSTS: can't read the term '{q0}' in {tok} -> that boost is NOT built until its terms are fixed")
         out.append(b)
     return out
 
@@ -6225,9 +6256,31 @@ def print_boost_spec(spec, allp, stake, cols, keys, used, a):
     pool = parlay_pool(allp, excl, min_edge=-0.03, min_prob=0.5)
     min_dec = american_to_decimal(spec["min_odds"]) if spec.get("min_odds") else 1.0
     lo, hi, mw = int(spec.get("min_legs") or 2), int(spec.get("max_legs") or 4), spec.get("max_win")
+    hi = max(hi, lo)   # v2.39: a "5+ legs" boost used to search 5..4 legs (nothing) and say SAVE IT
+    if spec.get("bad"):   # v2.39 (11/22: a "4+ legs, +400" boost was built on a term the engine had silently ignored)
+        print(f"\n=== BOOST {spec['label']}: NOT BUILT. Can't read the term(s) {', '.join(repr(x) for x in spec['bad'])}. Terms VPE reads: "
+              "4leg (min legs), max6, +400 (min total odds), leg-200 (every leg this price or longer), props, games, win25, maxbet10, any. "
+              "Fix the spec and rerun `parlay` with all boosts; never show a build for a boost whose terms were not all read. ===")
+        return None
+    if spec.get("max_bet"):
+        stake = min(stake, float(spec["max_bet"]))
+    if spec.get("only") and len(pool):
+        gm_ = pool["market"].isin(GAME_MK)
+        pool = pool[~gm_] if spec["only"] == "props" else pool[gm_]
+    if spec.get("leg_min") is not None and len(pool):
+        pool = pool[pool["dec_" + bbook] >= american_to_decimal(spec["leg_min"]) - 1e-9]
     print(f"\n=== BOOST PARLAY {spec['label']}: {boost:g}% profit boost at {BOOK_NAME.get(bbook, bbook)} ===")
-    rules = (f"{lo}-{hi} legs" + (f", min total odds {int(spec['min_odds']):+d}" if spec.get("min_odds") else "")
+    rules = ((f"exactly {lo} legs" if lo == hi else f"{lo}-{hi} legs") + (f", min total odds {int(spec['min_odds']):+d}" if spec.get("min_odds") else "")
+             + (f", every leg {int(spec['leg_min']):+d} or longer" if spec.get("leg_min") is not None else "")
+             + (f", {'player props' if spec['only'] == 'props' else 'game lines'} only" if spec.get("only") else "")
+             + (f", stake capped at ${spec['max_bet']:g}" if spec.get("max_bet") else "")
              + (f", extra winnings capped at ${mw:g}" if mw else ""))
+    ng_ = pool["game_id"].astype(str).nunique() if len(pool) else 0
+    if ng_ < lo:
+        print(f"  rules used: {rules}")
+        print(f"  CAN'T QUALIFY TONIGHT: this boost needs {lo} legs and VPE builds one leg per game, but only {ng_} game(s) have a leg "
+              "that passes these terms. Say exactly that; SAVE the boost (or ask whether it allows same-game legs).")
+        return None
     print(f"  rules used: {rules}" + ("" if spec.get("given") else
           "  (DEFAULTS - VPE doesn't know this boost's rules: read min legs / min odds / max win off the boost and pass "
           "them, e.g. fd30:3leg:+100:win25, or :any if it has none)"))
@@ -6251,6 +6304,26 @@ def print_boost_spec(spec, allp, stake, cols, keys, used, a):
           f"(market {p_mkt:.1%}) | EV {ev:+.0%} (EV at market odds alone {p_mkt * dec_eff - 1:+.0%}) | "
           f"Unders {sum(c['side'] == 'Under' for c in combo)}")
     print(pd.DataFrame(combo)[[c for c in cols if c in combo[0]]].to_string(index=False))
+    _f = boost_stake_frac(p, dec_eff)
+    if not lean and p * math.log(1 + 0.05 * (dec_eff - 1)) + (1 - p) * math.log(0.95) <= 0:
+        print(f"  LONG BUILD: +EV with the boost, but it hits {p:.0%} of the time, so VPE's own size for it is {_f:.1%} of bankroll "
+              "(half-Kelly), not the usual 5%. VPE's suggestion only.")
+    # v2.39 RULES CHECK: the build against every term of this boost, one line the run shows as a table
+    _legs = [float(c["dec_" + bbook]) for c in combo]
+    _ck = [(f"legs {len(combo)} (needs {lo}" + ("" if lo == hi else f" to {hi}") + ")", lo <= len(combo) <= hi)]
+    if spec.get("min_odds"):
+        _ck.append((f"total odds {decimal_to_american(dec):+d} before the boost (needs {int(spec['min_odds']):+d} or longer)", dec >= min_dec - 1e-9))
+    if spec.get("leg_min") is not None:
+        _ck.append((f"shortest leg {decimal_to_american(min(_legs)):+d} (needs {int(spec['leg_min']):+d} or longer)", min(_legs) >= american_to_decimal(spec["leg_min"]) - 1e-9))
+    if spec.get("only"):
+        _ok = all((c["market"] in GAME_MK) == (spec["only"] == "games") for c in combo)
+        _ck.append((("player props only" if spec["only"] == "props" else "game lines only"), _ok))
+    if spec.get("max_bet"):
+        _ck.append((f"stake ${stake:.2f} (max ${spec['max_bet']:g})", stake <= spec["max_bet"] + 1e-9))
+    _ck.append(("one leg per game", len({str(c["game_id"]) for c in combo}) == len(combo)))
+    print("  RULES CHECK: " + " | ".join(f"{t_}: {'OK' if o_ else 'FAIL'}" for t_, o_ in _ck)
+          + (" -> QUALIFIES for this boost" if all(o_ for _, o_ in _ck) else " -> DOES NOT QUALIFY: do not show this build")
+          + ("" if spec.get("given") else " (boost terms were NOT given: defaults used)"))
     # where the edge actually comes from: without the boost, and at the other book (11/9: P2 placed at DK, no boost: -3.5%)
     ev0, evm0 = p * dec - 1, p_mkt * dec - 1
     msg = f"  WITHOUT the boost at {BOOK_NAME[bbook]}: EV {ev0:+.1%} (market-only {evm0:+.1%})"
