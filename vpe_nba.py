@@ -1911,6 +1911,10 @@ def build_log_rows(placed, score, cfg, unit, slip, stamp):
                 r.update({"edge": round(s["prob"] - implied_prob(odds), 3), "tier": _tier(s["prob"] - implied_prob(odds), s["prob"], cfg) or "off_model"})
             return r, (s or {}).get("leg_prob", (s or {}).get("prob")), sug, s
         stake, boost = float(b["stake"]), _num(b["boost_pct"])
+        if STRAIGHTS.get("shadow") and sug and kind != "lean" and not boost:
+            # v2.38: VPE suggests no unboosted straight, so a slip leg (or best-available line) bet on its own is his own pick
+            sug = False
+            r["suggested"] = "no"
         r.update({"bet_type": "straight", "units": round(stake / unit, 2), "stake_usd": stake,
                   "boost_pct": boost or np.nan, "face_usd": _face(b), "bonus_bet": _bonus(b),
                   "rec_units": LEAN["units"] if kind == "lean" else ((s or {}).get("rec_units", 0.0) if sug else 0.0)})
