@@ -1,16 +1,18 @@
-# One on-demand poke of the private odds feed (used by the 6:37 PM closing task, which cannot reach the private repo itself).
+# One on-demand pull of the odds feed (used by the closing-prices task). 11/23: it starts feed-run.yml in this repo,
+# which does the pull on free minutes and falls back to the private repo by itself.
 name: poke-feed
 on:
   workflow_dispatch:
+permissions:
+  actions: write
 jobs:
   poke:
     runs-on: ubuntu-latest
     steps:
-      - name: Ask the feed for a fresh pull
+      - name: Ask for a fresh pull
         env:
-          TOKEN: ${{ secrets.VPE_ODDS_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$TOKEN" ]; then echo "VPE_ODDS_DISPATCH_TOKEN is not set"; exit 1; fi
-          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/AP9000Moneywinner420/vpe-odds/actions/workflows/feed.yml/dispatches -d '{"ref":"main"}')
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/feed-run.yml/dispatches -d '{"ref":"main"}')
           echo "feed poke -> HTTP $code"; [ "$code" = "204" ]

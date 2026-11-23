@@ -1,0 +1,54 @@
+# Runs the odds feed's pull on this public repo's free minutes (11/23, Adrian's OK). The feed's code and all of its data
+# stay in the private repo vpe-odds: this job checks the code out with a token, runs it, and pushes the result back to
+# the private `feed` branch. Logs on a public repo are public, so nothing from the feed is printed here: timings only.
+# Needs two secrets in THIS repo: UNABATED_API_KEY, and VPE_ODDS_DISPATCH_TOKEN with "Contents: read and write" on
+# vpe-odds. Until both are in place it simply asks the private repo to do the pull, exactly as before.
+name: feed-run
+on:
+  workflow_dispatch:
+    inputs:
+      src:
+        description: "who asked for this pull (the 20-minute clock passes 'clock')"
+        required: false
+        default: ""
+permissions:
+  contents: read
+concurrency:
+  group: feed-run
+  cancel-in-progress: false
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Pull and publish (timings only in this log)
+        env:
+          UNABATED_API_KEY: ${{ secrets.UNABATED_API_KEY }}
+          TOKEN: ${{ secrets.VPE_ODDS_DISPATCH_TOKEN }}
+          FEED_SRC: ${{ inputs.src }}
+        run: |
+          fallback() {
+            echo "running in the private repo instead: $1"
+            if [ -z "$TOKEN" ]; then echo "VPE_ODDS_DISPATCH_TOKEN is not set"; exit 1; fi
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/AP9000Moneywinner420/vpe-odds/actions/workflows/feed.yml/dispatches \
+              -d "{\"ref\":\"main\",\"inputs\":{\"src\":\"$FEED_SRC\"}}")
+            echo "private feed poke -> HTTP $code"; [ "$code" = "204" ]; exit $?
+          }
+          if [ -z "$UNABATED_API_KEY" ]; then fallback "UNABATED_API_KEY is not set in this repo"; fi
+          R="https://x-access-token:${TOKEN}@github.com/AP9000Moneywinner420/vpe-odds"
+          git clone -q --depth 1 "$R" odds > /dev/null 2>&1 || fallback "the token cannot read the feed repo (needs Contents: read and write)"
+          cd odds
+          git clone -q --depth 1 -b feed "$R" prev > /dev/null 2>&1 || mkdir -p prev
+          if ! python3 feed.py > /tmp/feed.log 2>&1; then
+            grep -E "^[a-z_]+: (HTTP [0-9]+|[0-9.]+ MB)" /tmp/feed.log || true
+            fallback "the pull failed here"
+          fi
+          grep -E "^[a-z_]+: [0-9.]+ MB" /tmp/feed.log || true
+          mkdir out && cp -r feed/* out/ && cd out
+          git init -q -b feed
+          git config user.name "vpe-odds-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A && git commit -q -m "feed $(date -u +%Y-%m-%dT%H:%MZ)" > /dev/null
+          git push -q -f "$R" feed > /dev/null 2>&1 || fallback "the token cannot write the feed branch (needs Contents: read and write)"
+          echo "published to the private feed branch"

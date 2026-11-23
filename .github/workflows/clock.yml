@@ -29,9 +29,10 @@ jobs:
           inside() { h=$(TZ=America/New_York date +%-H); [ "$h" -ge 11 ] || [ "$h" -lt 1 ]; }
           while [ "$(date +%s)" -lt "$end" ] && awake; do
             if inside; then
+              # 11/23: the pull now runs in this repo (feed-run.yml, free minutes); it falls back to the private repo by itself
               code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-                -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
-                https://api.github.com/repos/AP9000Moneywinner420/vpe-odds/actions/workflows/feed.yml/dispatches -d '{"ref":"main","inputs":{"src":"clock"}}')
+                -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/${{ github.repository }}/actions/workflows/feed-run.yml/dispatches -d '{"ref":"main","inputs":{"src":"clock"}}')
               echo "$(TZ=America/New_York date '+%H:%M ET') feed poke -> HTTP $code"
             else
               echo "$(TZ=America/New_York date '+%H:%M ET') waiting for 11 AM"
