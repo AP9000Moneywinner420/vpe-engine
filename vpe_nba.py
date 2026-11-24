@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 SPORT = "NBA"
-VERSION = "NBA v2.39.0"
+VERSION = "NBA v2.40.0"
 
 # ==================== data ====================
 
@@ -1757,6 +1757,7 @@ def cmd_check(a):
         print(f"NBA MODE: MODEL STRAIGHTS SHADOW-ONLY (v2.38) -> {len(picks)} model straight pick(s) withheld from the slip. "
               "They stay scored in bets_all.csv and are graded in the Shadow tab; never present them as bets. "
               "Parlays, boost builds and book gaps are unchanged; `parlay` prints the BEST AVAILABLE table.")
+        picks.to_csv("shadow_picks.csv", index=False)   # v2.40: tracked in the Shadow builds tab, never shown as bets
         picks = picks.iloc[0:0]
     parlays = build_parlays(picks, cfg)
     unit = cfg["bankroll"] * cfg["unit_pct_of_bankroll"]
@@ -2357,6 +2358,7 @@ def best_parlay(pool, target, book, boost=0.0, under_share=None):
 def cmd_parlay(a):
     if getattr(a, "boost_min_leg_edge", None) is not None:  # v2.24 / v15.25
         BOOST_LEG["min_edge"] = float(a.boost_min_leg_edge)
+    PROFIT["fee"] = float(getattr(a, "fee", 0) or 0) / 100
     set_calib(getattr(a, "calib", None), SPORT)
     allp = pd.read_csv(a.all)
     if lock_from(allp):
@@ -2488,10 +2490,15 @@ def cmd_parlay(a):
     # ONE-PARLAY RULE (10/21-10/26: parlays were the whole loss, -$15.14 of -$15.89): recommend ONE parlay a night:
     # the BOOST parlay if there is one (+EV at market odds alone), else the biggest VPE could build (~10x), else ~4x.
     if bps:   # v2.27 BOOST RANKER: every boost scored by true EV (after the pick shrink), best first
-        print("\nBOOST RANK (true EV after the pick shrink; vig = what the legs' hold costs before the boost pays it back):")
-        for i_, b in enumerate(sorted(bps, key=lambda x: -x.get("ev", -9)), 1):
-            ev_ = b.get("ev", 0.0)
-            verdict = "USE IT" if ev_ >= 0.05 and not b.get("lean") else ("THIN: about break-even" if ev_ > -0.02 and not b.get("lean") else ("SAVE IT (not +EV: reference only)" if LEAN.get("off") else "SAVE IT / lean only"))
+        print("\nBOOST RANK (" + ("value at FAIR prices after the books' cut and any fee, no model opinion" if PROFIT["on"] else "true EV after the pick shrink")
+              + "; vig = what the legs' hold costs before the boost pays it back):")
+        _evk = "ev_fair" if PROFIT["on"] else "ev"
+        for i_, b in enumerate(sorted(bps, key=lambda x: -x.get(_evk, -9)), 1):
+            ev_ = b.get(_evk, 0.0)
+            if PROFIT["on"]:
+                verdict = "SAVE IT (not +EV at fair prices: reference only)" if b.get("lean") or ev_ < 0 else ("USE IT" if ev_ >= PROFIT["use"] else "THIN: small plus, use only if the boost would expire unused")
+            else:
+                verdict = "USE IT" if ev_ >= 0.05 and not b.get("lean") else ("THIN: about break-even" if ev_ > -0.02 and not b.get("lean") else ("SAVE IT (not +EV: reference only)" if LEAN.get("off") else "SAVE IT / lean only"))
             print(f"  #{i_} {b['name']} at {BOOK_NAME[b['book']]}: {len(b['legs'])} legs ({b.get('n_two', 0)} on two-sided main lines) | "
                   f"hit {b['hit']:.1%} | vig paid {b.get('vig', 0):.1%} | EV {ev_:+.1%} = ${ev_ * b['stake_usd']:+.2f} on ${b['stake_usd']:.2f} | {verdict}")
     real = [b for b in built if not b.get("lean")]
@@ -2502,7 +2509,7 @@ def cmd_parlay(a):
         print(f"\nONE-PARLAY RULE (one per boost): place ONLY these {len(real_boosts)} BOOST parlays, no leg shared: "
               + " | ".join(f"{b['name']} at {BOOK_NAME[b['book']]} {b['odds']:+d} (take-if {b['take_if']:+d})" for b in real_boosts)
               + ". Any other parlay above = reference only.")
-    elif built and (real or not LEAN.get("off")):
+    elif built and ((real and not PROFIT["on"]) or (bp and not bp.get("lean")) or not LEAN.get("off")):
         # boost parlay (real, then lean) > biggest real parlay > lean parlay (v2.38: never a lean build)
         rec = (bp if bp and not bp.get("lean") else None) or (max(real, key=lambda b: b["target"]) if real else None) \
             or bp or built[-1]
@@ -2511,10 +2518,40 @@ def cmd_parlay(a):
                if rec.get("lean") else "")
         print(f"\nONE-PARLAY RULE: place ONLY the {rec['name']} parlay at {BOOK_NAME[rec['book']]} "
               f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}{', take-if ' + format(rec['take_if'], '+d') if rec.get('take_if') is not None and not rec.get('lean') else ''}){tag}. Any other parlay above = reference only.")
+    elif PROFIT["on"] and real:
+        print("\nONE-PARLAY RULE (PROFIT MODE): no boost worth using, so VPE recommends NO parlay. The ~4x / ~10x builds above are "
+              "REFERENCE ONLY (graded in the Shadow builds tab): without a boost every leg pays the books' cut and nothing pays it back. "
+              "If he plays one anyway it is logged as his own pick. The BEST AVAILABLE table above is rate-only.")
     else:
         print("\nONE-PARLAY RULE: no VPE parlay tonight (nothing is +EV). Tonight's plays are the BEST AVAILABLE lines "
               "printed above (rate-only); any boost build above is reference only (SAVE the boost).")
     import json
+    # v2.40 SHADOW BUILDS: everything VPE built or withheld tonight, one row each, for the 'Shadow builds' tab. Graded next
+    # morning by `shadowgrade`, so every switched-off idea keeps a record and profit mode can be reversed on evidence.
+    try:
+        _d = str(allp["date"].iloc[0])[:10] if "date" in allp and len(allp) else str(today_et())[:10]
+        _lt = lambda legs: ";".join(f"{l[0]}|{l[1]}|{l[2]}|{float(l[3]):g}" for l in legs)
+        _rows = []
+        for b in built + SHADOW_ALT:
+            kind = ("boost_model_pick" if "(model pick)" in b["name"] else ("boost_reference" if b.get("lean") else "boost_fair_pick")) \
+                if b.get("boost_pct") else ("lean_parlay" if b.get("lean") else f"parlay_x{int(b.get('target') or 0)}")
+            _rows.append([_d, kind, b["name"], b.get("book", ""), b.get("odds", ""), b.get("boost_pct", 0) or 0, b.get("hit", ""),
+                          b.get("hit_fair", ""), b.get("ev_fair", ""), _lt(b["legs"]), "", ""])
+        _lf = getattr(a, "leans_out", None) or "leans.csv"
+        if LEAN.get("off") and os.path.exists(_lf):
+            for _, r_ in pd.read_csv(_lf).iterrows():
+                _rows.append([_d, "best_available", f"{r_['player']} {r_['side']} {r_['line']} {r_['market']}", str(r_.get("bet_at", "")),
+                              int(r_["bet_odds"]), 0, round(float(r_["leg_prob"]), 4), round(float(r_.get("market_prob", 0) or 0), 4), "",
+                              _lt([[r_["player"], r_["market"], r_["side"], r_["line"]]]), "", ""])
+        if os.path.exists("shadow_picks.csv"):
+            for _, r_ in pd.read_csv("shadow_picks.csv").iterrows():
+                _rows.append([_d, "straight_" + str(r_.get("tier", "")), f"{r_['player']} {r_['side']} {r_['line']} {r_['market']}", str(r_.get("book", "")),
+                              int(r_["odds"]), 0, round(float(r_.get("blend_prob", r_.get("model_prob", 0)) or 0), 4),
+                              round(float(r_.get("market_prob", 0) or 0), 4), "", _lt([[r_["player"], r_["market"], r_["side"], r_["line"]]]), "", ""])
+        json.dump(_rows, open("shadow_builds.json", "w"))
+        print(f"\nSHADOW BUILDS: {len(_rows)} row(s) -> shadow_builds.json (append ONCE per night to the 'Shadow builds' tab, after the last parlay run)")
+    except Exception as e_:
+        print(f"\nSHADOW BUILDS: not written ({e_}); nothing else is affected")
     json.dump(built, open(getattr(a, "parlays_out", None) or "vpe_parlays.json", "w"), indent=1)
     if len(pool):
         keys += list(zip(pool.head(6)["player"], pool.head(6)["market"], pool.head(6)["side"]))
@@ -4255,7 +4292,8 @@ def boost_parlay(*a, **k):
 def _boost_parlay_core(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec=1.0, max_win=None, need_market_ev=True, fitted=False):
     col = "dec_" + book
     # low-vig legs first: value at market odds (no-vig chance x this book's price), not the shortest prices
-    ranked = pool.assign(_mv=pool["market_prob"] * pool[col] * (1 + pool["market"].map(BOOST_PREF).fillna(0.0) / 6)
+    _cut = pool["market"].map(lambda m_: 1 - (PROFIT["prop_cut"] if PROFIT["on"] and m_ not in GAME_MK else 0.0))   # v2.40
+    ranked = pool.assign(_mv=pool["market_prob"] * _cut * pool[col] * (1 + pool["market"].map(BOOST_PREF).fillna(0.0) / 6)
                          ).sort_values(["_mv", "leg_prob"], ascending=False)
     # v2.26: boosts are built from TWO-SIDED main lines (both prices recorded = real, lower hold: all two-sided sides in the
     # Shadow tab returned -6.6% vs -9.7% on one-sided ladder rungs). Ladder rungs only when too few main lines exist.
@@ -4283,9 +4321,13 @@ def _boost_parlay_core(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec
                 extra = min(extra, max_win)
             dec_eff = dec + extra / stake
             p = float(np.prod([c["leg_prob"] for c in combo]))
-            p_mkt = float(np.prod([c["market_prob"] for c in combo]))
-            if need_market_ev and p_mkt * dec_eff < 1:  # must be +EV even if the model adds nothing
+            p_mkt = float(np.prod([_fair_leg(c) for c in combo]))   # v2.40: fair price (props carry the measured extra cut)
+            fee_ = 1 + (PROFIT["fee"] if PROFIT["on"] else 0.0)
+            if need_market_ev and p_mkt * dec_eff < fee_:  # must be +EV at fair prices, after any fee, with no model opinion
                 continue
+            p_model = p
+            if PROFIT["on"]:   # score on the fair chance; the model only tilts it
+                p = p_mkt + PROFIT["model_w"] * (p_model - p_mkt)
             # least risk for the payout: maximize long-run bankroll growth at a 5% stake (penalizes longshots)
             f_ = boost_stake_frac(p, dec_eff) if fitted else 0.05   # v2.39: fitted = second look for long builds only
             g = p * math.log(1 + f_ * (dec_eff - 1)) + (1 - p) * math.log(1 - f_)
@@ -4294,7 +4336,7 @@ def _boost_parlay_core(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec
             ml = min(float(c.get("leg_edge", 0) or 0) for c in combo)
             if BOOST_LEG["min_edge"] is not None and ml < BOOST_LEG["min_edge"]:
                 continue
-            allc.append((p * dec_eff - 1, p, p_mkt, dec, dec_eff, combo, g, ml, uh))
+            allc.append((p * dec_eff / fee_ - 1, p_model, p_mkt, dec, dec_eff, combo, g, ml, uh))
     if not allc:
         return None
     # v2.24 / v15.25: close calls go to the STRONGER legs (11/16: the FD 25% builds used legs at +0.1% to +0.4% edge, so
@@ -4644,6 +4686,76 @@ def cmd_log(a):
     if slip is None:
         print(f"  ! no slip found at {a.slip}: run `check --out bets.csv` first so VPE picks can be told apart")
     print(f"\nlogged {len(rows)} rows -> {a.log} (total rows {len(new)})")
+
+def cmd_shadowgrade(a):
+    """v2.40: grade the 'Shadow builds' tab (rows A:L as JSON) from box scores and final scores. Prints the record by kind
+    and writes [{"row": n, "values": [result, legs_hit]}] for the rows that were still blank. Report-only."""
+    import json
+    j = json.load(open(a.builds))
+    rows = j.get("values", []) if isinstance(j, dict) else j
+    out, boxes, tally = [], {}, {}
+    for n_, r in enumerate(rows, 1):
+        r = list(r) + [""] * (12 - len(r))
+        d_ = str(r[0]).lstrip("'")[:10]
+        if not d_[:4].isdigit():
+            continue
+        res = str(r[10]).strip().upper()
+        if not res:
+            if d_ not in boxes:
+                try:
+                    bx = load_box(season_for(pd.Timestamp(d_)), max_age_hours=1)
+                    boxes[d_] = (bx[bx["date"] == pd.Timestamp(d_)], _game_scores(d_))
+                except Exception:
+                    boxes[d_] = (pd.DataFrame(), {})
+            bx, gs_ = boxes[d_]
+            if bx.empty:
+                continue
+            legs_ = []
+            for leg in [x for x in str(r[9]).split(";") if x.count("|") == 3]:
+                pl, mk, sd, ln = leg.split("|"); ln = float(ln)
+                if mk in GAME_MK:
+                    v_ = gs_.get(pl.strip().upper())
+                    if v_ is None:
+                        legs_.append(None); continue
+                    x_ = v_ + ln if mk == "spread" else (v_ if mk == "ml" else v_ - ln)
+                    x_ = -x_ if (mk == "total" and sd == "Under") else x_
+                    legs_.append("PUSH" if x_ == 0 else ("WIN" if x_ > 0 else "LOSS"))
+                elif mk in MARKETS:
+                    row = bx[bx["_key"] == norm_name(pl)]
+                    if row.empty or not bool(row["played"].iloc[0]):
+                        legs_.append("VOID"); continue
+                    act = float(row[MARKETS[mk]].sum(axis=1).iloc[0])
+                    legs_.append("PUSH" if act == ln else ("WIN" if (act > ln) == (sd == "Over") else "LOSS"))
+                else:
+                    legs_.append(None)
+            if not legs_ or any(x is None for x in legs_):
+                continue
+            live = [x for x in legs_ if x in ("WIN", "LOSS")]
+            res = "LOSS" if "LOSS" in live else ("WIN" if live else "VOID")
+            r[10], r[11] = res, f"{legs_.count('WIN')}/{len(legs_)}"
+            out.append({"row": n_, "values": [r[10], r[11]]})
+        if res in ("WIN", "LOSS"):
+            try:
+                dec = american_to_decimal(float(r[4]))
+                dec = 1 + (dec - 1) * (1 + float(r[5] or 0) / 100)
+            except Exception:
+                continue
+            t = tally.setdefault(str(r[1]), [0, 0, 0.0, 0.0])
+            t[0] += 1; t[1] += res == "WIN"; t[2] += (dec - 1) if res == "WIN" else -1.0
+            try:
+                t[3] += float(r[8]) if str(r[8]) != "" else 0.0
+            except Exception:
+                pass
+    json.dump(out, open(a.out, "w"))
+    print(f"SHADOW BUILDS: graded {len(out)} new row(s) -> {a.out} (write each row's two values to columns K:L of that row)")
+    for k_ in sorted(tally):
+        n_, w_, u_, e_ = tally[k_]
+        print(f"  {k_}: {w_}-{n_ - w_} | {u_:+.1f}u at 1u each" + (f" (fair-price math expected {e_:+.1f}u)" if k_.startswith("boost") else ""))
+    if not tally:
+        print("  nothing graded yet")
+    print("  Report-only. boost_fair_pick = what profit mode builds; boost_model_pick = what the old model-first builder would have "
+          "built for the same boost; parlay_x4 / x10, straight_* and best_available = switched off, still tracked.")
+
 
 def cmd_grade(a):
     cfg = _cfg(a)
@@ -6183,6 +6295,22 @@ def nba_x(p, mk, mu, var, oo, uo, pchain):
 MARKET_EXTRA = {"pts": 0.02}  # v2.22: extra edge by market. 11/16 Shadow test: VPE's side on points lost 15.1% (1,068
                               # lines), the worst market by far; threes -1.7%, PRA -2.1%, assists -6.9%, rebounds -8.6%
 BOOST_LEG = {"min_edge": None, "w": 5.0}  # v2.24 / v15.25: --boost-min-leg-edge sets a hard floor; w = close-call tilt
+# v2.40 PROFIT MODE (Adrian 11/24: "it just has to make me money"). Through 11/23 his boosted tickets were +409u on 626u staked
+# and everything without a boost was -317u on 789u. A boost is the one place the math is on his side before any model
+# opinion, so the boost builder now works from FAIR prices first:
+#   - a leg's fair chance = its no-vig market chance, minus prop_cut for player props (graded two-sided prop lines
+#     returned -5.2% a side against -3.4% implied by the books' own prices; game lines carry about 2.3% a side);
+#   - builds are scored on that fair chance with the model as a quarter-weight tilt (model_w), not the other way round;
+#   - the verdict (USE IT / THIN / SAVE IT) comes from the fair-price value after any fee, never from the model alone;
+#   - with no boost VPE recommends no parlay: the ~4x / ~10x builds are reference only.
+# Everything switched off stays graded in the 'Shadow builds' tab, so this can be reversed on evidence. "on": False = old way.
+PROFIT = {"on": True, "model_w": 0.25, "prop_cut": 0.015, "use": 0.05, "fee": 0.0}
+SHADOW_ALT = []   # what the old model-first builder would have picked for each boost (graded in 'Shadow builds', never shown as a bet)
+
+
+def _fair_leg(c):
+    mp = float(c["market_prob"])
+    return mp * (1 - PROFIT["prop_cut"]) if PROFIT["on"] and c["market"] not in GAME_MK else mp
 BOOST_PREF = {"fg3m": 0.03, "pra": 0.03}  # v2.22: boost parlays lean toward VPE's best markets on close calls
 EST_MARGIN = 0.015  # extra edge a pick needs when its market chance comes from ONE price (no main O/U to read it off):
                     # the hold on those is assumed (7%), and ~10% real hold would cost ~1.5 pts of market chance
@@ -6304,6 +6432,26 @@ def print_boost_spec(spec, allp, stake, cols, keys, used, a):
           f"(market {p_mkt:.1%}) | EV {ev:+.0%} (EV at market odds alone {p_mkt * dec_eff - 1:+.0%}) | "
           f"Unders {sum(c['side'] == 'Under' for c in combo)}")
     print(pd.DataFrame(combo)[[c for c in cols if c in combo[0]]].to_string(index=False))
+    ev_fair = p_mkt * dec_eff / (1 + (PROFIT["fee"] if PROFIT["on"] else 0.0)) - 1
+    if PROFIT["on"]:
+        _n_game = sum(c["market"] in GAME_MK for c in combo)
+        print(f"  FAIR-PRICE VALUE: {ev_fair:+.1%} of the stake (no model opinion: fair chance {p_mkt:.1%} x boosted payout"
+              + (f", after the {PROFIT['fee']:.0%} fee" if PROFIT["fee"] else "") + f") = ${ev_fair * stake:+.2f} expected on ${stake:.2f} | "
+              f"legs: {_n_game} game line(s), {len(combo) - _n_game} prop(s) | "
+              + ("reference only" if lean else ("USE IT" if ev_fair >= PROFIT["use"] else "THIN: a small plus, worth using only if the boost would expire unused")))
+        if not lean:   # what the old model-first builder would have picked: tracked, never shown as a bet
+            import contextlib, io
+            PROFIT["on"] = False
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    r2 = boost_parlay(pool, bbook, boost, stake, lo, hi, min_dec, mw)
+            finally:
+                PROFIT["on"] = True
+            if r2 and {(c["player"], c["market"], c["side"]) for c in r2[5]} != {(c["player"], c["market"], c["side"]) for c in combo}:
+                SHADOW_ALT.append({"name": f"BOOST {spec['label']} (model pick)", "book": bbook, "boost_pct": boost,
+                                   "odds": decimal_to_american(r2[3]), "hit": round(r2[1], 4), "hit_fair": round(r2[2], 4),
+                                   "ev_fair": round(r2[2] * r2[4] - 1, 3),
+                                   "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in r2[5]]})
     _f = boost_stake_frac(p, dec_eff)
     if not lean and p * math.log(1 + 0.05 * (dec_eff - 1)) + (1 - p) * math.log(0.95) <= 0:
         print(f"  LONG BUILD: +EV with the boost, but it hits {p:.0%} of the time, so VPE's own size for it is {_f:.1%} of bankroll "
@@ -6348,7 +6496,7 @@ def print_boost_spec(spec, allp, stake, cols, keys, used, a):
         keys += [(c["player"], c["market"], c["side"]) for c in combo]
     return {"name": f"BOOST {spec['label']}" + ((" (reference)" if LEAN.get("off") else " (LEAN)") if lean else ""), "target": 0, "book": bbook,
             "boost_pct": boost, "odds": decimal_to_american(dec), "take_if": decimal_to_american(tk), "hit": round(p, 4),
-            "lean": lean, "ev": round(ev, 3), "stake_usd": stake,
+            "lean": lean, "ev": round(ev, 3), "ev_fair": round(ev_fair, 3), "hit_fair": round(p_mkt, 4), "stake_usd": stake,
             "vig": round(1 - float(np.prod([float(c["market_prob"]) * float(c["dec_" + bbook]) for c in combo])), 3),
             "n_two": int(sum(bool(c.get("two_sided")) for c in combo)),
             "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]}
@@ -6790,6 +6938,7 @@ if __name__ == "__main__":
     for name in ("board", "slate", "check"):
         sub.choices[name].add_argument("--injuries", help='"Name:Out;Name:Questionable;Name:Out:PHI"')
     sub.choices["styles"].add_argument("--team"); sub.choices["styles"].add_argument("--stat")
+    sg_ = sub.add_parser("shadowgrade"); sg_.add_argument("--builds", required=True); sg_.add_argument("--out", default="shadow_builds_graded.json")
     gm_ = sub.add_parser("games"); gm_.add_argument("--date"); gm_.add_argument("--games", required=True)
     gm_.add_argument("--injuries", default=""); gm_.add_argument("--out", default="game_bets.csv")
     gm_.add_argument("--log-out", default="games_log.json"); gm_.add_argument("--bankroll", type=float); gm_.add_argument("--profile")
@@ -6843,6 +6992,7 @@ if __name__ == "__main__":
     sub.choices["parlay"].add_argument("--parlays-out", default="vpe_parlays.json")
     sub.choices["parlay"].add_argument("--boost", type=float, help="profit boost %% (gets its own BOOST parlay)")
     sub.choices["parlay"].add_argument("--boosts", help='several boosts in one run, e.g. "fd30:3leg:+100:win25,fd25,dk30"')
+    sub.choices["parlay"].add_argument("--fee", type=float, default=0.0, help="v2.40: add-on fee as %% of the stake (Bet Protect+ / Early Exit+ = 3)")
     sub.choices["parlay"].add_argument("--boost-book", default="draftkings", help="draftkings|fanduel (where the boost is)")
     sub.choices["log"].add_argument("--sheet-out", default="sheet_new.json", help="new rows for the Pick Log sheet")
     for name in ("check", "parlay", "log"):
@@ -6937,5 +7087,5 @@ if __name__ == "__main__":
         print("SETUP: pyarrow missing -> pip install pyarrow")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "pyarrow"], check=False)
     {"board": cmd_board, "slate": cmd_slate, "lines": cmd_lines, "check": cmd_check, "log": cmd_log,
-     "grade": cmd_grade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "scoreboard": cmd_scoreboard, "newsflash": cmd_newsflash, "close": cmd_close, "status": cmd_status, "styles": cmd_styles,
+     "grade": cmd_grade, "shadowgrade": cmd_shadowgrade, "backtest": cmd_backtest, "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "scoreboard": cmd_scoreboard, "newsflash": cmd_newsflash, "close": cmd_close, "status": cmd_status, "styles": cmd_styles,
      "takeif": cmd_takeif, "frames": cmd_frames, "games": cmd_games, "bookgap": cmd_bookgap, "links": cmd_links, "sharepdf": cmd_sharepdf, "gamesgrade": cmd_gamesgrade, "sgp": cmd_sgp, "sgpbuild": cmd_sgpbuild, "vig": cmd_vig, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
