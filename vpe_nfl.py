@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.32"
+VERSION = "NFL v15.33"
 
 # ==================== data ====================
 
@@ -1909,6 +1909,7 @@ def best_parlay(pool, target, book, boost=0.0, under_share=None):
 def cmd_parlay(a):
     if getattr(a, "boost_min_leg_edge", None) is not None:  # v2.24 / v15.25
         BOOST_LEG["min_edge"] = float(a.boost_min_leg_edge)
+    PROFIT["fee"] = float(getattr(a, "fee", 0) or 0) / 100
     set_calib(getattr(a, "calib", None), SPORT)
     allp = pd.read_csv(a.all)
     if lock_from(allp):
@@ -2036,10 +2037,15 @@ def cmd_parlay(a):
     # ONE-PARLAY RULE (10/21-10/26: parlays were the whole loss, -$15.14 of -$15.89): recommend ONE parlay a night:
     # the BOOST parlay if there is one (+EV at market odds alone), else the biggest VPE could build (~10x), else ~4x.
     if bps:   # v15.28 BOOST RANKER: every boost scored by true EV (after the pick shrink), best first
-        print("\nBOOST RANK (true EV after the pick shrink; vig = what the legs' hold costs before the boost pays it back):")
-        for i_, b in enumerate(sorted(bps, key=lambda x: -x.get("ev", -9)), 1):
-            ev_ = b.get("ev", 0.0)
-            verdict = "USE IT" if ev_ >= 0.05 and not b.get("lean") else ("THIN: about break-even" if ev_ > -0.02 and not b.get("lean") else ("SAVE IT (not +EV: reference only)" if LEAN.get("off") else "SAVE IT / lean only"))
+        print("\nBOOST RANK (" + ("value at FAIR prices after the books' cut and any fee, no model opinion" if PROFIT["on"] else "true EV after the pick shrink")
+              + "; vig = what the legs' hold costs before the boost pays it back):")
+        _evk = "ev_fair" if PROFIT["on"] else "ev"
+        for i_, b in enumerate(sorted(bps, key=lambda x: -x.get(_evk, -9)), 1):
+            ev_ = b.get(_evk, 0.0)
+            if PROFIT["on"]:
+                verdict = "SAVE IT (not +EV at fair prices: reference only)" if b.get("lean") or ev_ < 0 else ("USE IT" if ev_ >= PROFIT["use"] else "THIN: small plus, use only if the boost would expire unused")
+            else:
+                verdict = "USE IT" if ev_ >= 0.05 and not b.get("lean") else ("THIN: about break-even" if ev_ > -0.02 and not b.get("lean") else ("SAVE IT (not +EV: reference only)" if LEAN.get("off") else "SAVE IT / lean only"))
             print(f"  #{i_} {b['name']} at {BOOK_NAME[b['book']]}: {len(b['legs'])} legs ({b.get('n_two', 0)} on two-sided main lines) | "
                   f"hit {b['hit']:.1%} | vig paid {b.get('vig', 0):.1%} | EV {ev_:+.1%} = ${ev_ * b['stake_usd']:+.2f} on ${b['stake_usd']:.2f} | {verdict}")
     real = [b for b in built if not b.get("lean")]
@@ -2050,7 +2056,7 @@ def cmd_parlay(a):
         print(f"\nONE-PARLAY RULE (one per boost): place ONLY these {len(real_boosts)} BOOST parlays, no leg shared: "
               + " | ".join(f"{b['name']} at {BOOK_NAME[b['book']]} {b['odds']:+d} (take-if {b['take_if']:+d})" for b in real_boosts)
               + ". Any other parlay above = reference only.")
-    elif built and (real or not LEAN.get("off")):
+    elif built and ((real and not PROFIT["on"]) or (bp and not bp.get("lean")) or not LEAN.get("off")):
         # boost parlay (real, then lean) > biggest real parlay > lean parlay (v15.31: never a lean build)
         rec = (bp if bp and not bp.get("lean") else None) or (max(real, key=lambda b: b["target"]) if real else None) \
             or bp or built[-1]
@@ -2059,6 +2065,10 @@ def cmd_parlay(a):
                if rec.get("lean") else "")
         print(f"\nONE-PARLAY RULE: place ONLY the {rec['name']} parlay at {BOOK_NAME[rec['book']]} "
               f"({rec['odds']:+d}, hit {rec['hit']:.1%}, ${rec['stake_usd']:.2f}{', take-if ' + format(rec['take_if'], '+d') if rec.get('take_if') is not None and not rec.get('lean') else ''}){tag}. Any other parlay above = reference only.")
+    elif PROFIT["on"] and real:
+        print("\nONE-PARLAY RULE (PROFIT MODE): no boost worth using, so VPE recommends NO parlay. The ~4x / ~10x builds above are "
+              "REFERENCE ONLY (graded in the Shadow builds tab): without a boost every leg pays the books' cut and nothing pays it back. "
+              "If he plays one anyway it is logged as his own pick. The BEST AVAILABLE table above is rate-only.")
     else:
         print("\nONE-PARLAY RULE: no VPE parlay this week (nothing is +EV). The plays are the BEST AVAILABLE lines "
               "printed above (rate-only); any boost build above is reference only (SAVE the boost).")
@@ -3377,6 +3387,22 @@ def load_calib_table(table, sport):
 # At market prices a 2-3 leg parlay is +EV with a 20%+ boost and a 4-leg with 25%+; 5 legs needs ~30%. So a boost goes
 # on its own short parlay (most likely legs, checked +EV at market-only odds), not on the 10x parlay.
 BOOST_LEG = {"min_edge": None, "w": 5.0}  # v15.25: --boost-min-leg-edge sets a hard floor; w = close-call tilt
+# v15.33 PROFIT MODE (Adrian 11/24: "it just has to make me money"). Through 11/23 his boosted tickets were +409u on 626u staked
+# and everything without a boost was -317u on 789u. A boost is the one place the math is on his side before any model
+# opinion, so the boost builder now works from FAIR prices first:
+#   - a leg's fair chance = its no-vig market chance, minus prop_cut for player props (graded two-sided prop lines
+#     returned -5.2% a side against -3.4% implied by the books' own prices; game lines carry about 2.3% a side);
+#   - builds are scored on that fair chance with the model as a quarter-weight tilt (model_w), not the other way round;
+#   - the verdict (USE IT / THIN / SAVE IT) comes from the fair-price value after any fee, never from the model alone;
+#   - with no boost VPE recommends no parlay: the ~4x / ~10x builds are reference only.
+# Everything switched off stays graded in the 'Shadow builds' tab, so this can be reversed on evidence. "on": False = old way.
+PROFIT = {"on": True, "model_w": 0.25, "prop_cut": 0.015, "use": 0.05, "fee": 0.0}
+SHADOW_ALT = []   # what the old model-first builder would have picked for each boost (graded in 'Shadow builds', never shown as a bet)
+
+
+def _fair_leg(c):
+    mp = float(c["market_prob"])
+    return mp * (1 - PROFIT["prop_cut"]) if PROFIT["on"] and c["market"] not in GAME_MK else mp
 
 
 def boost_stake_frac(p, dec_eff, cap=0.05):
@@ -3426,16 +3452,20 @@ def _boost_parlay_core(pool, book, boost, stake, min_legs=2, max_legs=4, min_dec
                 extra = min(extra, max_win)
             dec_eff = dec + extra / stake
             p = float(np.prod([c["leg_prob"] for c in combo]))
-            p_mkt = float(np.prod([c["market_prob"] for c in combo]))
-            if need_market_ev and p_mkt * dec_eff < 1:  # must be +EV even if the model adds nothing
+            p_mkt = float(np.prod([_fair_leg(c) for c in combo]))   # v15.33: fair price (props carry the measured extra cut)
+            fee_ = 1 + (PROFIT["fee"] if PROFIT["on"] else 0.0)
+            if need_market_ev and p_mkt * dec_eff < fee_:  # must be +EV at fair prices, after any fee, with no model opinion
                 continue
+            p_model = p
+            if PROFIT["on"]:   # score on the fair chance; the model only tilts it
+                p = p_mkt + PROFIT["model_w"] * (p_model - p_mkt)
             # least risk for the payout: maximize long-run bankroll growth at a 5% stake (penalizes longshots)
             f_ = boost_stake_frac(p, dec_eff) if fitted else 0.05   # v15.32: fitted = second look for long builds only
             g = p * math.log(1 + f_ * (dec_eff - 1)) + (1 - p) * math.log(1 - f_)
             ml = min(float(c.get("leg_edge", 0) or 0) for c in combo)
             if BOOST_LEG["min_edge"] is not None and ml < BOOST_LEG["min_edge"]:
                 continue
-            allc.append((p * dec_eff - 1, p, p_mkt, dec, dec_eff, combo, g, ml, uh))
+            allc.append((p * dec_eff / fee_ - 1, p_model, p_mkt, dec, dec_eff, combo, g, ml, uh))
     if not allc:
         return None
     # v15.25: close calls go to the STRONGER legs: among combos within 10% of the best growth score, the score gets
@@ -4308,6 +4338,26 @@ def print_boost_spec(spec, allp, stake, cols, keys, used, a):
           f"(market {p_mkt:.1%}) | EV {ev:+.0%} (EV at market odds alone {p_mkt * dec_eff - 1:+.0%}) | "
           f"Unders {sum(c['side'] == 'Under' for c in combo)}")
     print(pd.DataFrame(combo)[[c for c in cols if c in combo[0]]].to_string(index=False))
+    ev_fair = p_mkt * dec_eff / (1 + (PROFIT["fee"] if PROFIT["on"] else 0.0)) - 1
+    if PROFIT["on"]:
+        _n_game = sum(c["market"] in GAME_MK for c in combo)
+        print(f"  FAIR-PRICE VALUE: {ev_fair:+.1%} of the stake (no model opinion: fair chance {p_mkt:.1%} x boosted payout"
+              + (f", after the {PROFIT['fee']:.0%} fee" if PROFIT["fee"] else "") + f") = ${ev_fair * stake:+.2f} expected on ${stake:.2f} | "
+              f"legs: {_n_game} game line(s), {len(combo) - _n_game} prop(s) | "
+              + ("reference only" if lean else ("USE IT" if ev_fair >= PROFIT["use"] else "THIN: a small plus, worth using only if the boost would expire unused")))
+        if not lean:   # what the old model-first builder would have picked: tracked, never shown as a bet
+            import contextlib, io
+            PROFIT["on"] = False
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    r2 = boost_parlay(pool, bbook, boost, stake, lo, hi, min_dec, mw)
+            finally:
+                PROFIT["on"] = True
+            if r2 and {(c["player"], c["market"], c["side"]) for c in r2[5]} != {(c["player"], c["market"], c["side"]) for c in combo}:
+                SHADOW_ALT.append({"name": f"BOOST {spec['label']} (model pick)", "book": bbook, "boost_pct": boost,
+                                   "odds": decimal_to_american(r2[3]), "hit": round(r2[1], 4), "hit_fair": round(r2[2], 4),
+                                   "ev_fair": round(r2[2] * r2[4] - 1, 3),
+                                   "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in r2[5]]})
     _f = boost_stake_frac(p, dec_eff)
     if not lean and p * math.log(1 + 0.05 * (dec_eff - 1)) + (1 - p) * math.log(0.95) <= 0:
         print(f"  LONG BUILD: +EV with the boost, but it hits {p:.0%} of the time, so VPE's own size for it is {_f:.1%} of bankroll "
@@ -4352,7 +4402,7 @@ def print_boost_spec(spec, allp, stake, cols, keys, used, a):
         keys += [(c["player"], c["market"], c["side"]) for c in combo]
     return {"name": f"BOOST {spec['label']}" + ((" (reference)" if LEAN.get("off") else " (LEAN)") if lean else ""), "target": 0, "book": bbook,
             "boost_pct": boost, "odds": decimal_to_american(dec), "take_if": decimal_to_american(tk), "hit": round(p, 4),
-            "lean": lean, "ev": round(ev, 3), "stake_usd": stake,
+            "lean": lean, "ev": round(ev, 3), "ev_fair": round(ev_fair, 3), "hit_fair": round(p_mkt, 4), "stake_usd": stake,
             "vig": round(1 - float(np.prod([float(c["market_prob"]) * float(c["dec_" + bbook]) for c in combo])), 3),
             "n_two": int(sum(bool(c.get("two_sided")) for c in combo)),
             "legs": [[c["player"], c["market"], c["side"], float(c["line"])] for c in combo]}
@@ -4805,6 +4855,7 @@ if __name__ == "__main__":
     sub.choices["parlay"].add_argument("--all-picks", action="store_true", help="NFL: ignore boosts+leans-only mode")
     sub.choices["parlay"].add_argument("--boost", type=float, help="profit boost %% (gets its own BOOST parlay)")
     sub.choices["parlay"].add_argument("--boosts", help='several boosts in one run, e.g. "fd30:3leg:+100:win25,fd25,dk30"')
+    sub.choices["parlay"].add_argument("--fee", type=float, default=0.0, help="v15.33: add-on fee as %% of the stake (Bet Protect+ / Early Exit+ = 3)")
     sub.choices["parlay"].add_argument("--boost-book", default="draftkings", help="draftkings|fanduel (where the boost is)")
     sub.choices["log"].add_argument("--sheet-out", default="sheet_new.json", help="new rows for the Pick Log sheet")
     for name in ("check", "parlay", "log"):
