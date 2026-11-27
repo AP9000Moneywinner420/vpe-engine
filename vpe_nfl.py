@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 SPORT = "NFL"
-VERSION = "NFL v15.33"
+VERSION = "NFL v15.34"
 
 # ==================== data ====================
 
@@ -2942,6 +2942,226 @@ def cmd_bookgap(a):
     print(f"saved -> {a.out} | rows for the 'Book gaps' tab -> {a.sheet_out}")
 
 
+# ---------- v15.34 SAME-GAME PARLAYS (Adrian 11/26: two DK 30% SGP boosts went unrated on Thanksgiving) ----------
+# NFL books price a same-game parlay themselves, so the ticket's price can only be read off the app. What VPE can do is
+# work out how often the legs really hit TOGETHER and say what that price has to be. How the legs move together is measured
+# from this season's and last season's box scores (same player, teammates, opponents, by position and market), never
+# guessed. Each leg's own chance is its fair market chance (profit mode), with the model as a small tilt.
+SGP_N = 40000
+SGP_MIN = {"pass_yds": 150, "pass_tds": 0.8, "pass_att": 22, "pass_comp": 14, "pass_int": 0.0, "rush_yds": 25, "rush_att": 7,
+           "rec_yds": 25, "receptions": 2.5, "rush_rec_yds": 35, "anytime_td": 0.2}
+_SGP_CORR = {}
+
+
+def sgp_corr_table(season):
+    """{(relation, posA, marketA, posB, marketB): (rho, n)} from player-week box scores (this season + last)."""
+    if _SGP_CORR:
+        return _SGP_CORR
+    fr = []
+    for s_ in (season - 1, season):
+        try:
+            d = load_stats(s_)
+        except Exception:
+            continue
+        d = d[d["position"].isin(["QB", "RB", "FB", "WR", "TE"])].copy()
+        d["pos"] = d["position"].replace({"FB": "RB"})
+        for m, spec in MARKETS.items():
+            x = d[["player_id", "pos", "season", "week", "team", "opponent_team"]].copy()
+            x["v"] = d[spec["cols"]].fillna(0).sum(axis=1)
+            g = x.groupby(["player_id", "season"])["v"]
+            x["mu"], x["sd"], x["n"] = g.transform("mean"), g.transform("std"), g.transform("size")
+            x = x[(x["n"] >= 5) & (x["sd"] > 0) & (x["mu"] >= SGP_MIN.get(m, 0)) & x["pos"].isin(spec["pos"])]
+            x["z"] = ((x["v"] - x["mu"]) / x["sd"]).clip(-3, 3)
+            x["m"] = m
+            fr.append(x[["player_id", "pos", "season", "week", "team", "opponent_team", "m", "z"]])
+    if not fr:
+        return _SGP_CORR
+    L = pd.concat(fr, ignore_index=True)
+    a, b = L.add_suffix("_a"), L.add_suffix("_b")
+    def tally(j, rel):
+        j = j.assign(zz=j["z_a"] * j["z_b"])
+        for k, g in j.groupby(["pos_a", "m_a", "pos_b", "m_b"]):
+            n = len(g)
+            if n >= 60:
+                rho = float(np.corrcoef(g["z_a"], g["z_b"])[0, 1])
+                _SGP_CORR[(rel,) + k] = (rho * n / (n + 150), n)   # shrunk toward 0 on thin samples
+    j = a.merge(b, left_on=["player_id_a", "season_a", "week_a"], right_on=["player_id_b", "season_b", "week_b"])
+    tally(j[j["m_a"] != j["m_b"]], "same")
+    j = a.merge(b, left_on=["season_a", "week_a", "team_a"], right_on=["season_b", "week_b", "team_b"])
+    tally(j[j["player_id_a"] != j["player_id_b"]], "teammate")
+    j = a.merge(b, left_on=["season_a", "week_a", "team_a"], right_on=["season_b", "week_b", "opponent_team_b"])
+    tally(j, "opponent")
+    return _SGP_CORR
+
+
+def sgp_rho(tab, la, lb):
+    if la["player"] == lb["player"]:
+        rel = "same"
+    elif la["team"] == lb["team"]:
+        rel = "teammate"
+    else:
+        rel = "opponent"
+    if rel == "same" and la["market"] == lb["market"]:
+        return 0.95, 9999
+    r = tab.get((rel, la["pos"], la["market"], lb["pos"], lb["market"])) or tab.get((rel, lb["pos"], lb["market"], la["pos"], la["market"]))
+    if r is None:
+        return 0.0, 0
+    sgn = (1 if la["side"] == "Over" else -1) * (1 if lb["side"] == "Over" else -1)
+    return max(-0.9, min(0.9, r[0] * sgn)), r[1]
+
+
+def sgp_joint(legs, tab, seed=7):
+    """Chance every leg hits, legs moving together the way box scores say. Returns (joint, independent product, pair notes)."""
+    n = len(legs)
+    R, notes = np.eye(n), []
+    for i in range(n):
+        for j in range(i + 1, n):
+            rho, cnt = sgp_rho(tab, legs[i], legs[j])
+            R[i, j] = R[j, i] = rho
+            notes.append((legs[i]["label"], legs[j]["label"], rho, cnt))
+    w, V = np.linalg.eigh(R)                       # nearest valid correlation matrix
+    R = (V * np.clip(w, 1e-6, None)) @ V.T
+    dd = np.sqrt(np.diag(R)); R = R / dd[:, None] / dd[None, :]
+    Z = np.random.default_rng(seed).multivariate_normal(np.zeros(n), R, size=SGP_N)
+    thr = np.array([st.norm.ppf(1 - min(max(l["p"], 1e-4), 1 - 1e-4)) for l in legs])
+    joint = float((Z > thr).all(axis=1).mean())
+    return joint, float(np.prod([l["p"] for l in legs])), notes
+
+
+def _sgp_leg_p(r):
+    fair = float(r["market_prob"]) * (1 - (PROFIT["prop_cut"] if PROFIT["on"] else 0.0))
+    return fair + PROFIT["model_w"] * (float(r["blend_prob"]) - fair)
+
+
+def _sgp_rows(path):
+    d = pd.read_csv(path)
+    d = d[d["market_prob"].notna() & d["blend_prob"].notna()].copy()
+    d["_k"] = d["player"].map(norm_name)
+    return d
+
+
+def _sgp_value(joint, price, boost, fee):
+    dec = american_to_decimal(price)
+    return joint * (1 + (dec - 1) * (1 + boost / 100)) / (1 + fee / 100) - 1
+
+
+def _sgp_take_if(joint, boost, fee, need=0.0):
+    dec = 1 + ((1 + need) * (1 + fee / 100) / max(joint, 1e-6) - 1) / (1 + boost / 100)
+    return decimal_to_american(max(dec, 1.01))
+
+
+def cmd_sgp(a):
+    """Rate a same-game parlay at the price the app shows. --leg "Player;market;Over;line" (repeat), --price +450."""
+    d = _sgp_rows(a.all)
+    legs = []
+    for s_ in a.leg:
+        t = [x.strip() for x in s_.split(";")]
+        mk, sd, ln = canon_market(t[1]), t[2].title(), float(t[3])
+        sd = "Over" if sd in ("Yes", "Over") else "Under"
+        r = d[(d["_k"] == norm_name(t[0])) & (d["market"] == mk) & (d["side"] == sd) & ((d["line"] - ln).abs() < 0.01)]
+        if r.empty:
+            near = d[(d["_k"] == norm_name(t[0])) & (d["market"] == mk)]
+            sys.exit(f"SGP: no scored line for {t[0]} {sd} {ln} {mk}. Lines VPE has for him in that market: "
+                     + (", ".join(sorted({f"{x:g}" for x in near['line']})) or "none")
+                     + ". Add that exact line and its prices to props.csv, rerun `check`, then rerun `sgp`.")
+        r = r.iloc[0]
+        legs.append({"player": r["player"], "team": r["team"], "opp": r["opp"], "pos": {"FB": "RB"}.get(r["pos"], r["pos"]), "market": mk,
+                     "side": sd, "line": ln, "game_id": r["game_id"], "p": _sgp_leg_p(r), "fair": float(r["market_prob"]),
+                     "label": f"{r['player']} {sd} {ln:g} {mk}"})
+    season = int(str(legs[0]["game_id"])[:4]) if str(legs[0]["game_id"])[:4].isdigit() else pd.Timestamp.now().year
+    tab = sgp_corr_table(season)
+    joint, ind = 1.0, 1.0
+    print(f"\nSGP CHECK - {len(legs)} legs | how legs move together: measured on {len(tab)} position/market pairs from box scores")
+    for gid in dict.fromkeys(l["game_id"] for l in legs):
+        gl = [l for l in legs if l["game_id"] == gid]
+        j_, i_, notes = sgp_joint(gl, tab)
+        joint *= j_; ind *= i_
+        for la, lb, rho, cnt in notes:
+            print(f"  {la}  +  {lb}: " + ("no data for this pair (treated as unrelated)" if not cnt else
+                  f"{'move together' if rho > 0.05 else ('pull apart' if rho < -0.05 else 'about unrelated')} ({rho:+.2f}, {cnt:,} player-games)"))
+    for l in legs:
+        print(f"  {l['label']:46s} fair chance {l['fair']:.1%} -> used {l['p']:.1%}")
+    price = float(str(a.price).replace("+", ""))
+    val = _sgp_value(joint, price, a.boost, a.fee)
+    tk = _sgp_take_if(joint, a.boost, a.fee, PROFIT["use"]); tk0 = _sgp_take_if(joint, a.boost, a.fee, 0.0)
+    print(f"  all legs together: {joint:.1%} (if unrelated it would be {ind:.1%}; lift x{joint / max(ind, 1e-9):.2f}) | fair price {decimal_to_american(1 / max(joint, 1e-6)):+d}")
+    print(f"  app price {int(price):+d}" + (f" with the {a.boost:g}% boost" if a.boost else " (no boost)") + (f", {a.fee:g}% fee" if a.fee else "")
+          + f" -> FAIR-PRICE VALUE {val:+.1%} of the stake | "
+          + ("USE IT" if val >= PROFIT["use"] else ("THIN: small plus, use only if the boost would expire unused" if val >= 0 else "SAVE IT / skip: the app's price is too short for these legs")))
+    print(f"  TAKE-IF: app price before the boost at least {tk:+d} for USE IT ({tk0:+d} to break even). Hits about {joint:.0%} of the time.")
+    print("  RATE-ONLY NOTE: first-TD, live and defensive legs are not scored. A same-game ticket usually carries a bigger cut than "
+          "separate legs, so many 30% same-game boosts come out THIN.")
+
+
+def cmd_sgpbuild(a):
+    """Suggest same-game builds for one game and say what the app's price has to be. --game KC@BUF --boost 30 --min-legs 3 --min-odds +300."""
+    d = _sgp_rows(a.all)
+    tm = [x.strip().upper() for x in a.game.replace("@", " ").replace("-", " ").split() if x.strip()]
+    g = d[d["team"].isin(tm) & d["opp"].isin(tm)].copy()
+    if g.empty:
+        sys.exit(f"SGPBUILD: no scored lines for {a.game}. Teams with lines: {', '.join(sorted(d['team'].dropna().unique()))}")
+    g = g[~g["market"].isin(["pass_int"])]
+    if "locked" in g:
+        g = g[~g["locked"].astype(str).str.lower().isin(["true", "1"])]
+    g["dec"] = g["odds"].map(american_to_decimal)
+    g = g[(g["dec"] >= american_to_decimal(-250)) & (g["dec"] <= american_to_decimal(250))]
+    g["p"] = [_sgp_leg_p(r) for _, r in g.iterrows()]
+    g["cost"] = 1 - g["market_prob"] * g["dec"]          # the book's cut on this leg
+    g = g.sort_values("cost").drop_duplicates(["player", "market", "side"]).head(26)
+    season = int(str(g["game_id"].iloc[0])[:4]) if str(g["game_id"].iloc[0])[:4].isdigit() else pd.Timestamp.now().year
+    tab = sgp_corr_table(season)
+    rows = [{"player": r["player"], "team": r["team"], "opp": r["opp"], "pos": {"FB": "RB"}.get(r["pos"], r["pos"]), "market": r["market"],
+             "side": r["side"], "line": float(r["line"]), "game_id": r["game_id"], "p": float(r["p"]), "fair": float(r["market_prob"]),
+             "dec": float(r["dec"]), "odds": int(r["odds"]), "label": f"{r['player']} {r['side']} {float(r['line']):g} {r['market']}"} for _, r in g.iterrows()]
+    lo, hi = max(2, a.min_legs), max(2, a.min_legs, a.max_legs or a.min_legs)
+    min_dec = american_to_decimal(float(str(a.min_odds).replace("+", ""))) if a.min_odds else 1.0
+    um = lambda n_: _under_max(n_)
+    cand = []
+    for n_ in range(lo, hi + 1):
+        for combo in itertools.combinations(rows, n_):
+            if len({(c["player"], c["market"]) for c in combo}) < n_:
+                continue
+            if sum(c["side"] == "Under" for c in combo) > um(n_):
+                continue
+            ind_dec = float(np.prod([c["dec"] for c in combo]))
+            rhos = [sgp_rho(tab, combo[i], combo[j])[0] for i in range(n_) for j in range(i + 1, n_)]
+            if min(rhos) < -0.02:      # legs that pull against each other: the app shortens nothing for them, skip
+                continue
+            cand.append((float(np.mean(rhos)), ind_dec, combo))
+    if not cand:
+        sys.exit("SGPBUILD: no leg set in this game moves together. Say exactly that; SAVE the boost.")
+    cand = sorted(cand, key=lambda x: -x[0])[:60]
+    out = []
+    for mr, ind_dec, combo in cand:
+        j_, i_, _ = sgp_joint(list(combo), tab)
+        fair_dec = 1 / max(j_, 1e-6)
+        if fair_dec < min_dec * 0.9:
+            continue
+        out.append((j_ / max(i_, 1e-9), j_, ind_dec, combo))
+    out = sorted(out, key=lambda x: -x[0])
+    seen, shown = set(), 0
+    print(f"\nSGP BUILDS for {a.game}" + (f" | {a.boost:g}% boost" if a.boost else "") + f" | {lo}" + ("" if lo == hi else f"-{hi}") + " legs"
+          + (f", app price must be {int(float(str(a.min_odds).replace('+', ''))):+d} or longer" if a.min_odds else "")
+          + f" | legs that hit TOGETHER more often than their separate prices say (measured on {len(tab)} position/market pairs)")
+    for lift, j_, ind_dec, combo in out:
+        key = frozenset(c["player"] for c in combo)
+        if key in seen:
+            continue
+        seen.add(key); shown += 1
+        tk = max(_sgp_take_if(j_, a.boost, a.fee, PROFIT["use"]), int(float(str(a.min_odds).replace("+", ""))) if a.min_odds else -100000)
+        print(f"\n  BUILD {shown}: hits together {j_:.1%} (unrelated: {j_ / lift:.1%}; lift x{lift:.2f}) | fair price {decimal_to_american(1 / j_):+d} | "
+              f"separate-leg price would be {decimal_to_american(ind_dec):+d}")
+        for c in combo:
+            print(f"    {c['label']} ({c['odds']:+d}) | fair chance {c['fair']:.1%}")
+        print(f"    ENTER THESE LEGS IN THE APP, READ ITS SAME-GAME PRICE: USE IT only at {tk:+d} or longer before the boost. "
+              f"Then run `sgp` with that price for the exact value.")
+        if shown >= 3:
+            break
+    if not shown:
+        sys.exit("SGPBUILD: nothing reaches the boost's minimum odds with legs that move together. Say exactly that; SAVE the boost.")
+    print("\n  These are candidates, not picks: the verdict depends on the price the app shows. No price, no verdict.")
+
+
 def cmd_links(a):
     """v2.33: one-tap bet-slip links (from the odds feed's links.csv) for every bet VPE suggests tonight: straight picks,
     the parlay's legs, leans and BOOK GAP takes. A link opens that book's bet slip with the line loaded."""
@@ -4884,6 +5104,11 @@ if __name__ == "__main__":
     mn.add_argument("--parlays", default="vpe_parlays.json"); mn.add_argument("--calib", default="calib_tab.json")
     nf_ = sub.add_parser("newsflash"); nf_.add_argument("--all", default="bets_all.csv"); nf_.add_argument("--prev"); nf_.add_argument("--runs", default="runs"); nf_.add_argument("--min-move", type=float, default=0.03); nf_.add_argument("--min-edge", type=float, default=0.0); nf_.add_argument("--top", type=int, default=12)
     sbp_ = sub.add_parser("scoreboard"); sbp_.add_argument("--log", default="pick_log.csv"); sbp_.add_argument("--shadow", nargs="*"); sbp_.add_argument("--calib", default="calib_tab.json"); sbp_.add_argument("--since"); sbp_.add_argument("--since-week")
+    sgp_ = sub.add_parser("sgp"); sgp_.add_argument("--all", default="bets_all.csv"); sgp_.add_argument("--leg", action="append", required=True)
+    sgp_.add_argument("--price", required=True); sgp_.add_argument("--boost", type=float, default=0.0); sgp_.add_argument("--fee", type=float, default=0.0)
+    sgb_ = sub.add_parser("sgpbuild"); sgb_.add_argument("--all", default="bets_all.csv"); sgb_.add_argument("--game", required=True)
+    sgb_.add_argument("--boost", type=float, default=0.0); sgb_.add_argument("--fee", type=float, default=0.0)
+    sgb_.add_argument("--min-legs", type=int, default=3); sgb_.add_argument("--max-legs", type=int, default=0); sgb_.add_argument("--min-odds")
     bgp_ = sub.add_parser("bookgap"); bgp_.add_argument("--a", required=True); bgp_.add_argument("--b", required=True)
     bgp_.add_argument("--book-a", default="fanduel"); bgp_.add_argument("--book-b", default="draftkings")
     bgp_.add_argument("--games-a"); bgp_.add_argument("--games-b"); bgp_.add_argument("--fair"); bgp_.add_argument("--all", default="bets_all.csv"); bgp_.add_argument("--date")
@@ -4945,6 +5170,6 @@ if __name__ == "__main__":
     f.add_argument("--profile"); f.add_argument("--week", type=int); f.add_argument("--season", type=int); f.add_argument("--date")
     a = ap.parse_args()
     {"check": cmd_check, "board": cmd_board, "grade": cmd_grade, "lines": cmd_lines, "log": cmd_log,
-     "parlay": cmd_parlay, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "bookgap": cmd_bookgap, "links": cmd_links, "scoreboard": cmd_scoreboard, "newsflash": cmd_newsflash, "close": cmd_close, "status": cmd_status,
+     "parlay": cmd_parlay, "sgp": cmd_sgp, "sgpbuild": cmd_sgpbuild, "final": cmd_final, "sheet": cmd_sheet, "shadow": cmd_shadow, "learn": cmd_learn, "menu": cmd_menu, "sweep": cmd_sweep, "exposure": cmd_exposure, "linediff": cmd_linediff, "bookgap": cmd_bookgap, "links": cmd_links, "scoreboard": cmd_scoreboard, "newsflash": cmd_newsflash, "close": cmd_close, "status": cmd_status,
      "takeif": cmd_takeif, "frames": cmd_frames, "explain": cmd_explain, "reprice": cmd_reprice, "crosscheck": cmd_crosscheck, "fetchpages": cmd_fetchpages}[a.cmd](a)
 
