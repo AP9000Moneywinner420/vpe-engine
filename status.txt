@@ -1,0 +1,8 @@
+nba/pts 200
+nba/reb 200
+nba/ast 200
+nba/fg3m 200
+nfl/pass_yds 200
+nfl/rush_yds 200
+nfl/rec_yds 200
+nfl/receptions 200
